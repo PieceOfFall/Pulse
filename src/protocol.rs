@@ -46,10 +46,14 @@ pub fn topic_matches(filter: &str, topic: &str) -> bool {
         return false;
     }
 
-    let mut filter_levels = filter.split('/').peekable();
+    if topic.starts_with('$') && !filter.starts_with('$') {
+        return false;
+    }
+
+    let filter_levels = filter.split('/');
     let mut topic_levels = topic.split('/').peekable();
 
-    while let Some(filter_level) = filter_levels.next() {
+    for filter_level in filter_levels {
         match filter_level {
             "#" => return true,
             "+" => {
@@ -90,6 +94,9 @@ mod tests {
         ));
         assert!(topic_matches("devices/#", "devices/a/state"));
         assert!(topic_matches("devices/#", "devices"));
+        assert!(topic_matches("$SYS/#", "$SYS/broker/uptime"));
+        assert!(!topic_matches("#", "$SYS/broker/uptime"));
+        assert!(!topic_matches("+/broker/uptime", "$SYS/broker/uptime"));
         assert!(!topic_matches(
             "sensors/+/temperature",
             "sensors/a/humidity"
