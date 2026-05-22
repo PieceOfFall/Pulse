@@ -94,23 +94,25 @@ impl Broker {
         };
 
         let mut state = self.inner.state.lock().expect("broker state lock poisoned");
-        if let Some(previous_connection_id) = state
+        let replaced_channel = if let Some(previous_connection_id) = state
             .connection_by_client_id
             .insert(client_id.clone(), connection_id)
         {
             if previous_connection_id != connection_id {
-                if let Some(previous) = state.clients_by_connection.remove(&previous_connection_id)
-                {
-                    let _ = previous.channel;
-                }
+                let previous = state.clients_by_connection.remove(&previous_connection_id);
                 state
                     .subscriptions
                     .retain(|sub| sub.connection_id != previous_connection_id);
                 state
                     .qos2_inflight
                     .retain(|(conn_id, _), _| *conn_id != previous_connection_id);
+                previous.map(|previous| previous.channel)
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
 
         state.clients_by_connection.insert(
             connection_id,
@@ -124,6 +126,7 @@ impl Broker {
         ConnectOutcome {
             client_id,
             session_present: false,
+            replaced_channel,
         }
     }
 
@@ -278,6 +281,7 @@ impl Broker {
 struct ConnectOutcome {
     client_id: String,
     session_present: bool,
+    replaced_channel: Option<Channel<MqttPacket>>,
 }
 
 pub struct MqttHandler {
@@ -319,6 +323,9 @@ impl Handler<MqttPacket> for MqttHandler {
                 let outcome =
                     self.broker
                         .connect(ctx.id(), packet.client_id, ctx.channel(), packet.will);
+                if let Some(replaced_channel) = outcome.replaced_channel {
+                    let _ = replaced_channel.close().await;
+                }
                 self.connected = true;
                 self.client_id = Some(outcome.client_id.clone());
 
@@ -533,4 +540,86 @@ fn should_publish_will(reason: CloseReason) -> bool {
         reason,
         CloseReason::HandlerClosed | CloseReason::LocalClosed
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use rs_netty::{TcpServer, codec::MqttCodec, pipeline};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+    };
+
+    use super::{Broker, BrokerLife, MqttHandler};
+
+    #[tokio::test]
+    async fn duplicate_client_id_closes_previous_connection() -> rs_netty::Result<()> {
+        let broker = Broker::new();
+        let server = TcpServer::bind("127.0.0.1:0")
+            .life(BrokerLife::new(broker.clone()))
+            .pipeline(move || {
+                pipeline()
+                    .codec(MqttCodec::with_max_packet_size(1024 * 1024))
+                    .handler(MqttHandler::new(broker.clone()))
+            })
+            .start()
+            .await?;
+
+        let mut first = TcpStream::connect(server.local_addr()).await?;
+        first.write_all(&connect_packet("same-client")).await?;
+        read_connack(&mut first).await?;
+
+        let mut second = TcpStream::connect(server.local_addr()).await?;
+        second.write_all(&connect_packet("same-client")).await?;
+        read_connack(&mut second).await?;
+
+        let mut buf = [0; 1];
+        let read = tokio::time::timeout(Duration::from_millis(200), first.read(&mut buf))
+            .await
+            .expect("previous connection should close")?;
+        assert_eq!(read, 0);
+
+        server.shutdown();
+        server.wait().await
+    }
+
+    fn connect_packet(client_id: &str) -> Vec<u8> {
+        let mut packet = Vec::new();
+        packet.push(0x10);
+        let remaining_len = 13 + client_id.len();
+        encode_remaining_len(remaining_len, &mut packet);
+        packet.extend_from_slice(&[0x00, 0x04]);
+        packet.extend_from_slice(b"MQTT");
+        packet.extend_from_slice(&[0x05, 0x02, 0x00, 0x3c, 0x00]);
+        packet.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+        packet.extend_from_slice(client_id.as_bytes());
+        packet
+    }
+
+    fn encode_remaining_len(mut len: usize, dst: &mut Vec<u8>) {
+        loop {
+            let mut byte = (len % 128) as u8;
+            len /= 128;
+            if len > 0 {
+                byte |= 0x80;
+            }
+            dst.push(byte);
+            if len == 0 {
+                break;
+            }
+        }
+    }
+
+    async fn read_connack(stream: &mut TcpStream) -> rs_netty::Result<()> {
+        let mut fixed = [0; 2];
+        stream.read_exact(&mut fixed).await?;
+        assert_eq!(fixed[0], 0x20);
+        let mut rest = vec![0; fixed[1] as usize];
+        stream.read_exact(&mut rest).await?;
+        assert_eq!(rest[0], 0);
+        assert_eq!(rest[1], 0);
+        Ok(())
+    }
 }
