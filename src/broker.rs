@@ -505,10 +505,10 @@ impl BrokerLife {
 impl Life for BrokerLife {
     async fn tcp_connection_closed(&self, info: ConnInfo, reason: CloseReason) -> Result<()> {
         let will = self.broker.remove_connection(info.id());
-        if let Some(will) = will {
-            if should_publish_will(reason) {
-                self.broker.publish_will(info.id(), will).await;
-            }
+        if let Some(will) = will
+            && should_publish_will(reason)
+        {
+            self.broker.publish_will(info.id(), will).await;
         }
         Ok(())
     }
