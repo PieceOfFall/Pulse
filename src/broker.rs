@@ -157,11 +157,9 @@ impl Broker {
                 continue;
             }
 
-            upsert_subscription(&mut state.subscriptions, connection_id, subscription);
-            let stored = state
-                .subscriptions
-                .last()
-                .expect("subscription was inserted");
+            let stored_index =
+                upsert_subscription(&mut state.subscriptions, connection_id, subscription);
+            let stored = &state.subscriptions[stored_index];
             reason_codes.push(protocol::granted_qos_code(stored.options.maximum_qos));
 
             if stored.options.retain_handling != 2 {
@@ -459,13 +457,12 @@ fn upsert_subscription(
     subscriptions: &mut Vec<SubscriptionEntry>,
     connection_id: u64,
     subscription: Subscription,
-) {
-    if let Some(existing) = subscriptions
-        .iter_mut()
-        .find(|sub| sub.connection_id == connection_id && sub.filter == subscription.topic_filter)
-    {
-        existing.options = subscription.options;
-        return;
+) -> usize {
+    if let Some(index) = subscriptions.iter_mut().position(|sub| {
+        sub.connection_id == connection_id && sub.filter == subscription.topic_filter
+    }) {
+        subscriptions[index].options = subscription.options;
+        return index;
     }
 
     subscriptions.push(SubscriptionEntry {
@@ -473,8 +470,8 @@ fn upsert_subscription(
         filter: subscription.topic_filter,
         options: subscription.options,
     });
+    subscriptions.len() - 1
 }
-
 fn deliveries_for_publish(
     state: &BrokerState,
     publisher_connection_id: u64,
@@ -546,13 +543,17 @@ fn should_publish_will(reason: CloseReason) -> bool {
 mod tests {
     use std::time::Duration;
 
-    use rs_netty::{TcpServer, codec::MqttCodec, pipeline};
+    use rs_netty::{
+        TcpServer,
+        codec::{MqttCodec, QoS, Subscription, SubscriptionOptions},
+        pipeline,
+    };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpStream,
     };
 
-    use super::{Broker, BrokerLife, MqttHandler};
+    use super::{Broker, BrokerLife, MqttHandler, SubscriptionEntry, upsert_subscription};
 
     #[tokio::test]
     async fn duplicate_client_id_closes_previous_connection() -> rs_netty::Result<()> {
@@ -583,6 +584,38 @@ mod tests {
 
         server.shutdown();
         server.wait().await
+    }
+
+    #[test]
+    fn upsert_subscription_returns_updated_subscription_index() {
+        let mut subscriptions = vec![
+            SubscriptionEntry {
+                connection_id: 1,
+                filter: "devices/one".to_string(),
+                options: SubscriptionOptions::default(),
+            },
+            SubscriptionEntry {
+                connection_id: 2,
+                filter: "devices/two".to_string(),
+                options: SubscriptionOptions::default(),
+            },
+        ];
+
+        let index = upsert_subscription(
+            &mut subscriptions,
+            1,
+            Subscription {
+                topic_filter: "devices/one".to_string(),
+                options: SubscriptionOptions {
+                    maximum_qos: QoS::ExactlyOnce,
+                    ..SubscriptionOptions::default()
+                },
+            },
+        );
+
+        assert_eq!(index, 0);
+        assert_eq!(subscriptions.len(), 2);
+        assert_eq!(subscriptions[index].options.maximum_qos, QoS::ExactlyOnce);
     }
 
     fn connect_packet(client_id: &str) -> Vec<u8> {
