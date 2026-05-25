@@ -23,16 +23,16 @@ items are marked with `[x]`.
 
 ## 1. Protocol Correctness Foundations
 
-- [ ] Enforce CONNECT validation rules
+- [x] Enforce CONNECT validation rules
   - [x] Reject invalid protocol name/version at the codec layer.
   - [x] Reject invalid client id rules with precise MQTT v5 reason codes.
   - [x] Reject invalid will fields with precise MQTT v5 reason codes.
   - [x] Reject malformed or unsupported auth fields with precise MQTT v5 reason codes.
-- [ ] Implement MQTT keep alive semantics
-  - Track per-client keep alive from CONNECT and close idle MQTT sessions according to the MQTT 5 timeout rule.
+- [x] Implement MQTT keep alive semantics
+  - [x] Track per-client keep alive from CONNECT and close idle MQTT sessions according to the MQTT 5 timeout rule.
 - [ ] Normalize DISCONNECT reason handling
   - Distinguish normal disconnect, protocol errors, admin/server close, and will-triggering closes.
-- [ ] Add packet identifier validation
+- [x] Add packet identifier validation
   - [x] Reject missing packet ids where required at the codec layer.
   - [x] Reject zero packet ids at the codec layer.
   - [x] Reject QoS 0 PUBLISH packet ids at the codec layer.

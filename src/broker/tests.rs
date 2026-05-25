@@ -144,6 +144,39 @@ async fn connect_rejects_username_password_until_auth_is_supported() -> rs_netty
 }
 
 #[tokio::test]
+async fn keep_alive_timeout_closes_idle_client() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut client = broker.open_client().await?;
+
+    client
+        .write(connect_with_keep_alive("idle-client", 1))
+        .await?;
+    client.expect_connack().await?;
+    client.expect_closed(Duration::from_millis(2_500)).await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn keep_alive_activity_resets_timeout() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut client = broker.open_client().await?;
+
+    client
+        .write(connect_with_keep_alive("active-client", 1))
+        .await?;
+    client.expect_connack().await?;
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    client.write(MqttPacket::PingReq).await?;
+    assert!(matches!(client.read().await?, MqttPacket::PingResp));
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    client.write(MqttPacket::PingReq).await?;
+    assert!(matches!(client.read().await?, MqttPacket::PingResp));
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
 async fn qos1_publish_is_delivered_with_qos1_and_acknowledged() -> rs_netty::Result<()> {
     let broker = TestBroker::start().await?;
     let mut subscriber = broker.connect("subscriber").await?;
@@ -395,6 +428,15 @@ impl TestClient {
         Ok(())
     }
 
+    async fn expect_closed(&mut self, timeout: Duration) -> rs_netty::Result<()> {
+        let mut byte = [0; 1];
+        let read = tokio::time::timeout(timeout, self.stream.read(&mut byte))
+            .await
+            .expect("connection should close before timeout")?;
+        assert_eq!(read, 0);
+        Ok(())
+    }
+
     async fn expect_disconnect_reason(&mut self, reason_code: u8) -> rs_netty::Result<()> {
         assert!(matches!(
             self.read().await?,
@@ -510,6 +552,18 @@ fn connect_with_clean_start(client_id: &str, clean_start: bool) -> MqttPacket {
     MqttPacket::Connect(ConnectPacket {
         clean_start,
         keep_alive: 60,
+        properties: Vec::new(),
+        client_id: client_id.to_string(),
+        will: None,
+        username: None,
+        password: None,
+    })
+}
+
+fn connect_with_keep_alive(client_id: &str, keep_alive: u16) -> MqttPacket {
+    MqttPacket::Connect(ConnectPacket {
+        clean_start: true,
+        keep_alive,
         properties: Vec::new(),
         client_id: client_id.to_string(),
         will: None,

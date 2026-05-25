@@ -1,7 +1,16 @@
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
 use rs_netty::{
-    Context, Handler, Result,
+    Channel, Context, Handler, Result,
     codec::{ConnAckPacket, DisconnectPacket, MqttPacket, MqttProperty, QoS, mqtt::AckPacket},
 };
+use tokio::task::JoinHandle;
 
 use crate::protocol;
 
@@ -11,6 +20,13 @@ pub struct MqttHandler {
     broker: Broker,
     connected: bool,
     client_id: Option<String>,
+    keep_alive: Option<KeepAliveHandle>,
+}
+
+struct KeepAliveHandle {
+    deadline_ms: Arc<AtomicU64>,
+    interval_ms: u64,
+    task: JoinHandle<()>,
 }
 
 impl MqttHandler {
@@ -19,6 +35,48 @@ impl MqttHandler {
             broker,
             connected: false,
             client_id: None,
+            keep_alive: None,
+        }
+    }
+
+    fn refresh_keep_alive(&self) {
+        if let Some(keep_alive) = &self.keep_alive {
+            keep_alive.deadline_ms.store(
+                now_ms().saturating_add(keep_alive.interval_ms),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    fn start_keep_alive(
+        &mut self,
+        connection_id: u64,
+        keep_alive_seconds: u16,
+        channel: Channel<MqttPacket>,
+    ) {
+        self.stop_keep_alive();
+        if keep_alive_seconds == 0 {
+            return;
+        }
+
+        let interval_ms = u64::from(keep_alive_seconds).saturating_mul(1500);
+        let deadline_ms = Arc::new(AtomicU64::new(now_ms().saturating_add(interval_ms)));
+        let task_deadline = deadline_ms.clone();
+        let broker = self.broker.clone();
+        let task = tokio::spawn(async move {
+            run_keep_alive_watchdog(broker, connection_id, channel, task_deadline).await;
+        });
+
+        self.keep_alive = Some(KeepAliveHandle {
+            deadline_ms,
+            interval_ms,
+            task,
+        });
+    }
+
+    fn stop_keep_alive(&mut self) {
+        if let Some(keep_alive) = self.keep_alive.take() {
+            keep_alive.task.abort();
         }
     }
 
@@ -50,6 +108,10 @@ impl Handler<MqttPacket> for MqttHandler {
     type Write = MqttPacket;
 
     async fn read(&mut self, ctx: &mut Context<Self::Write>, msg: MqttPacket) -> Result<()> {
+        if self.connected {
+            self.refresh_keep_alive();
+        }
+
         match msg {
             MqttPacket::Connect(packet) => {
                 if self.connected {
@@ -66,6 +128,7 @@ impl Handler<MqttPacket> for MqttHandler {
                 if let Some(replaced_channel) = outcome.replaced_channel {
                     let _ = replaced_channel.close().await;
                 }
+                self.start_keep_alive(ctx.id(), packet.keep_alive, ctx.channel());
                 self.connected = true;
                 self.client_id = Some(outcome.client_id.clone());
 
@@ -97,6 +160,7 @@ impl Handler<MqttPacket> for MqttHandler {
             }
             MqttPacket::PingReq => ctx.write(MqttPacket::PingResp).await,
             MqttPacket::Disconnect(_) => {
+                self.stop_keep_alive();
                 self.broker.remove_connection(ctx.id());
                 self.connected = false;
                 ctx.close().await
@@ -219,6 +283,12 @@ impl Handler<MqttPacket> for MqttHandler {
     }
 }
 
+impl Drop for MqttHandler {
+    fn drop(&mut self) {
+        self.stop_keep_alive();
+    }
+}
+
 fn validate_connect(packet: &rs_netty::codec::ConnectPacket) -> Option<u8> {
     if packet.client_id.is_empty() && !packet.clean_start {
         return Some(protocol::CLIENT_IDENTIFIER_NOT_VALID);
@@ -264,4 +334,35 @@ fn validate_connect(packet: &rs_netty::codec::ConnectPacket) -> Option<u8> {
 
 fn is_invalid_payload_format(property: &MqttProperty) -> bool {
     matches!(property, MqttProperty::PayloadFormatIndicator(value) if !matches!(*value, 0 | 1))
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+async fn run_keep_alive_watchdog(
+    broker: Broker,
+    connection_id: u64,
+    channel: Channel<MqttPacket>,
+    deadline_ms: Arc<AtomicU64>,
+) {
+    loop {
+        let deadline = deadline_ms.load(Ordering::Relaxed);
+        let now = now_ms();
+
+        if now >= deadline {
+            if let Some(will) = broker.remove_connection(connection_id) {
+                broker.publish_will(connection_id, will).await;
+            }
+            let _ = channel.close().await;
+            return;
+        }
+
+        tokio::time::sleep(Duration::from_millis(deadline - now)).await;
+    }
 }
