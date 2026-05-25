@@ -9,6 +9,7 @@ use super::{
     message::PendingPublish, retained_store::RetainedMessage, subscription_tree::SubscriptionEntry,
     time::now_ms,
 };
+use crate::observability::metrics;
 
 #[derive(Default)]
 pub(in crate::broker) struct BrokerState {
@@ -22,6 +23,25 @@ pub(in crate::broker) struct BrokerState {
 }
 
 impl BrokerState {
+    pub(in crate::broker) fn record_metrics(&self) {
+        let mut queue_size = 0;
+        let mut qos1_inflight = 0;
+        let mut qos2_inflight = self.qos2_inflight.len();
+
+        for session in self.sessions_by_client_id.values() {
+            queue_size += session.offline_queue.len();
+            qos1_inflight += session.outbound_qos1.len();
+            qos2_inflight +=
+                session.outbound_qos2_publish.len() + session.outbound_qos2_pubrel.len();
+        }
+
+        metrics::set_subscriptions_current(self.subscriptions.len());
+        metrics::set_session_queue_size(queue_size);
+        metrics::set_retained_messages_current(self.retained.len());
+        metrics::set_qos1_inflight_current(qos1_inflight);
+        metrics::set_qos2_inflight_current(qos2_inflight);
+    }
+
     pub(in crate::broker) fn expire_sessions(&mut self, now_ms: u64) {
         let expired: Vec<String> = self
             .sessions_by_client_id

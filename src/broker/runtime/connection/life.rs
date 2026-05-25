@@ -1,6 +1,7 @@
 use rs_netty::{CloseReason, ConnInfo, Life, Result};
+use tracing::debug;
 
-use crate::broker::Broker;
+use crate::{broker::Broker, observability::metrics};
 
 #[derive(Clone)]
 pub struct BrokerLife {
@@ -15,11 +16,17 @@ impl BrokerLife {
 
 impl Life for BrokerLife {
     async fn tcp_connection_closed(&self, info: ConnInfo, reason: CloseReason) -> Result<()> {
-        let will = self.broker.remove_connection(info.id());
-        if let Some(will) = will
-            && should_publish_will(reason)
-        {
-            self.broker.publish_will(info.id(), will).await;
+        debug!(connection_id = info.id(), ?reason, "tcp connection closed");
+        if is_packet_parse_error(reason) {
+            metrics::packet_parse_error(close_reason_label(reason));
+        }
+        if let Some(outcome) = self.broker.remove_connection(info.id()) {
+            metrics::connection_closed(close_reason_label(reason));
+            if let Some(will) = outcome.will
+                && should_publish_will(reason)
+            {
+                self.broker.publish_will(info.id(), will).await;
+            }
         }
         Ok(())
     }
@@ -30,4 +37,27 @@ fn should_publish_will(reason: CloseReason) -> bool {
         reason,
         CloseReason::HandlerClosed | CloseReason::LocalClosed
     )
+}
+
+fn is_packet_parse_error(reason: CloseReason) -> bool {
+    matches!(
+        reason,
+        CloseReason::DecodeError | CloseReason::FrameTooLarge
+    )
+}
+
+fn close_reason_label(reason: CloseReason) -> &'static str {
+    match reason {
+        CloseReason::HandlerClosed => "handler_closed",
+        CloseReason::LocalClosed => "local_closed",
+        CloseReason::PeerClosed => "peer_closed",
+        CloseReason::ChannelClosed => "channel_closed",
+        CloseReason::ServerShutdown => "server_shutdown",
+        CloseReason::IdleTimeout => "idle_timeout",
+        CloseReason::IoError => "io_error",
+        CloseReason::DecodeError => "decode_error",
+        CloseReason::EncodeError => "encode_error",
+        CloseReason::FrameTooLarge => "frame_too_large",
+        CloseReason::HandlerError => "handler_error",
+    }
 }

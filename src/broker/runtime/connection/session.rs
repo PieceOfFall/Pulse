@@ -20,6 +20,11 @@ pub(in crate::broker) struct ConnectOutcome {
     pub(in crate::broker) redeliveries: Vec<Delivery>,
 }
 
+pub(in crate::broker) struct RemoveConnectionOutcome {
+    pub(in crate::broker) client_id: String,
+    pub(in crate::broker) will: Option<Will>,
+}
+
 impl Broker {
     pub(in crate::broker) fn connect(
         &self,
@@ -87,11 +92,17 @@ impl Broker {
         })
     }
 
-    pub(in crate::broker) fn remove_connection(&self, connection_id: u64) -> Option<Will> {
+    pub(in crate::broker) fn remove_connection(
+        &self,
+        connection_id: u64,
+    ) -> Option<RemoveConnectionOutcome> {
         self.with_state(|state| {
             let client = state.remove_connection_state(connection_id, false)?;
             state.connection_by_client_id.remove(&client.client_id);
-            client.will
+            Some(RemoveConnectionOutcome {
+                client_id: client.client_id,
+                will: client.will,
+            })
         })
     }
 }

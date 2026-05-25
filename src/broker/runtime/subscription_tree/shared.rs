@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use super::SubscriptionEntry;
 use crate::broker::runtime::session_registry::BrokerState;
+use crate::observability::metrics;
 
 pub(in crate::broker) fn select_shared_subscriptions(
     state: &mut BrokerState,
@@ -35,6 +36,7 @@ pub(in crate::broker) fn select_shared_subscriptions(
         let cursor = state.shared_subscription_cursors.entry(key).or_default();
         let index = *cursor % group.len();
         *cursor = cursor.wrapping_add(1);
+        metrics::shared_subscription_dispatched();
         selected.push(group.swap_remove(index));
     }
 

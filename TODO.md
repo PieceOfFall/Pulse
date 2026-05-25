@@ -108,8 +108,8 @@ items are marked with `[x]`.
 
 ## 8. Operations
 
-- [ ] Replace `println!` startup output with structured tracing.
-- [ ] Add metrics for connections, sessions, subscriptions, retained messages, inflight messages, and publish rates.
+- [x] Replace `println!` startup output with structured tracing.
+- [x] Add metrics for connections, sessions, subscriptions, retained messages, inflight messages, and publish rates.
 - [ ] Add configuration file support.
 - [ ] Add graceful shutdown behavior for active sessions.
 - [ ] Add benchmark scenarios for QoS 0/1/2 and retained fanout.

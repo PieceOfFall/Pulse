@@ -60,6 +60,7 @@ impl Broker {
         self.inner.storage.with_state(&mut |state| {
             let operation = operation.take().expect("storage operation called once");
             result = Some(operation(state));
+            state.record_metrics();
         });
         result.expect("storage operation completed")
     }

@@ -1,13 +1,18 @@
 mod broker;
+mod observability;
 mod protocol;
 
 use broker::{Broker, BrokerLife, MqttHandler};
 use rs_netty::{Error, Result, TcpServer, codec::MqttCodec, pipeline};
+use tracing::info;
 
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:1883";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    observability::init_from_env()
+        .map_err(|error| Error::Pipeline(format!("initialize observability: {error}")))?;
+
     let bind_addr = std::env::var("MQTT_RS_BIND").unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_string());
     let broker = if let Ok(path) = std::env::var("MQTT_RS_SQLITE") {
         Broker::with_sqlite(path)
@@ -16,7 +21,7 @@ async fn main() -> Result<()> {
         Broker::new()
     };
 
-    println!("mqtt-rs listening on {bind_addr}");
+    info!(bind_addr, "mqtt-rs listening");
 
     TcpServer::bind(bind_addr)
         .outbound_queue_size(1024)
