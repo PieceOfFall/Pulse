@@ -43,7 +43,7 @@ items are marked with `[x]`.
   - [x] Detect unexpected ACK packets with correct reason codes.
 - [x] Add focused integration tests for CONNECT validation error paths.
 - [x] Add focused integration tests for protocol error will-handling paths.
-- [ ] Add focused integration tests for malformed packet paths.
+- [x] Add focused integration tests for malformed packet paths.
 
 ## 2. Session Model
 

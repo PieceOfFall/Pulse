@@ -144,6 +144,30 @@ async fn connect_rejects_username_password_until_auth_is_supported() -> rs_netty
 }
 
 #[tokio::test]
+async fn malformed_connect_protocol_name_closes_connection() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut client = broker.open_client().await?;
+
+    client
+        .write_raw(&connect_packet_with_protocol_name("MQIs"))
+        .await?;
+    client.expect_closed(Duration::from_millis(200)).await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn malformed_packet_after_connect_closes_connection() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut client = broker.connect("client").await?;
+
+    client.write_raw(&[0x40, 0x02, 0x00, 0x00]).await?;
+    client.expect_closed(Duration::from_millis(200)).await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
 async fn keep_alive_timeout_closes_idle_client() -> rs_netty::Result<()> {
     let broker = TestBroker::start().await?;
     let mut client = broker.open_client().await?;
@@ -464,6 +488,11 @@ impl TestClient {
         write_packet(&mut self.stream, packet).await
     }
 
+    async fn write_raw(&mut self, bytes: &[u8]) -> rs_netty::Result<()> {
+        self.stream.write_all(bytes).await?;
+        Ok(())
+    }
+
     async fn read(&mut self) -> rs_netty::Result<MqttPacket> {
         read_packet_with_buf(&mut self.stream, &mut self.buf).await
     }
@@ -580,13 +609,25 @@ impl TestClient {
 }
 
 fn connect_packet(client_id: &str) -> Vec<u8> {
+    connect_packet_with_protocol_name_and_level(client_id, "MQTT", 5)
+}
+
+fn connect_packet_with_protocol_name(protocol_name: &str) -> Vec<u8> {
+    connect_packet_with_protocol_name_and_level("client", protocol_name, 5)
+}
+
+fn connect_packet_with_protocol_name_and_level(
+    client_id: &str,
+    protocol_name: &str,
+    protocol_level: u8,
+) -> Vec<u8> {
     let mut packet = Vec::new();
     packet.push(0x10);
-    let remaining_len = 13 + client_id.len();
+    let remaining_len = 2 + protocol_name.len() + 1 + 1 + 2 + 1 + 2 + client_id.len();
     encode_remaining_len(remaining_len, &mut packet);
-    packet.extend_from_slice(&[0x00, 0x04]);
-    packet.extend_from_slice(b"MQTT");
-    packet.extend_from_slice(&[0x05, 0x02, 0x00, 0x3c, 0x00]);
+    packet.extend_from_slice(&(protocol_name.len() as u16).to_be_bytes());
+    packet.extend_from_slice(protocol_name.as_bytes());
+    packet.extend_from_slice(&[protocol_level, 0x02, 0x00, 0x3c, 0x00]);
     packet.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
     packet.extend_from_slice(client_id.as_bytes());
     packet
