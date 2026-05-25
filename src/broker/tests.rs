@@ -659,6 +659,177 @@ async fn persistent_session_does_not_queue_qos0_messages_while_offline() -> rs_n
 }
 
 #[tokio::test]
+async fn expired_offline_message_is_not_delivered_after_reconnect() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", true, 60))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+    subscriber
+        .subscribe(1, "devices/expiry/offline", QoS::AtLeastOnce)
+        .await?;
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish_with_message_expiry(
+            "devices/expiry/offline",
+            QoS::AtLeastOnce,
+            Some(7),
+            "expired",
+            false,
+            1,
+        ))
+        .await?;
+    publisher.expect_puback(7).await?;
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", false, 60))
+        .await?;
+    subscriber.expect_connack_session_present(true).await?;
+    subscriber
+        .expect_no_packet(Duration::from_millis(200))
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn offline_message_expiry_is_not_refreshed_when_delivered() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", true, 60))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+    subscriber
+        .subscribe(1, "devices/expiry/offline-inflight", QoS::AtLeastOnce)
+        .await?;
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish_with_message_expiry(
+            "devices/expiry/offline-inflight",
+            QoS::AtLeastOnce,
+            Some(7),
+            "expires-soon",
+            false,
+            2,
+        ))
+        .await?;
+    publisher.expect_puback(7).await?;
+
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", false, 60))
+        .await?;
+    subscriber.expect_connack_session_present(true).await?;
+    let packet = subscriber
+        .expect_publish("expected queued publish before expiry")
+        .await?;
+    assert_eq!(packet.payload, Bytes::from_static(b"expires-soon"));
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", false, 60))
+        .await?;
+    subscriber.expect_connack_session_present(true).await?;
+    subscriber
+        .expect_no_packet(Duration::from_millis(200))
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn expired_outbound_inflight_is_not_redelivered_after_reconnect() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", true, 60))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+    subscriber
+        .subscribe(1, "devices/expiry/inflight", QoS::AtLeastOnce)
+        .await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish_with_message_expiry(
+            "devices/expiry/inflight",
+            QoS::AtLeastOnce,
+            Some(8),
+            "expired",
+            false,
+            1,
+        ))
+        .await?;
+    publisher.expect_puback(8).await?;
+
+    let packet = subscriber
+        .expect_publish("expected first expiring qos1 delivery")
+        .await?;
+    assert_eq!(packet.packet_id, Some(1));
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", false, 60))
+        .await?;
+    subscriber.expect_connack_session_present(true).await?;
+    subscriber
+        .expect_no_packet(Duration::from_millis(200))
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn expired_inbound_qos2_publish_is_not_delivered_on_pubrel() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.connect("subscriber").await?;
+    subscriber
+        .subscribe(1, "devices/expiry/inbound-qos2", QoS::ExactlyOnce)
+        .await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish_with_message_expiry(
+            "devices/expiry/inbound-qos2",
+            QoS::ExactlyOnce,
+            Some(9),
+            "expired",
+            false,
+            1,
+        ))
+        .await?;
+    publisher.expect_pubrec(9).await?;
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    publisher
+        .write(MqttPacket::PubRel(AckPacket::new(9, protocol::SUCCESS)))
+        .await?;
+    publisher.expect_pubcomp(9).await?;
+    subscriber
+        .expect_no_packet(Duration::from_millis(200))
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
 async fn sqlite_broker_recovers_retained_messages_after_restart() -> rs_netty::Result<()> {
     let path = temp_sqlite_path("retained-restart");
     let _ = std::fs::remove_file(&path);
@@ -741,6 +912,55 @@ async fn sqlite_broker_recovers_offline_queue_after_restart() -> rs_netty::Resul
     assert_eq!(packet.qos, QoS::AtLeastOnce);
     assert_eq!(packet.packet_id, Some(1));
     assert_eq!(packet.payload, Bytes::from_static(b"durable-offline"));
+
+    broker.shutdown().await?;
+    cleanup_sqlite_path(&path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_broker_drops_expired_offline_queue_after_restart() -> rs_netty::Result<()> {
+    let path = temp_sqlite_path("offline-expiry-restart");
+    cleanup_sqlite_path(&path);
+
+    let broker =
+        TestBroker::start_with_broker(Broker::with_sqlite(&path).expect("sqlite broker")).await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", true, 60))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+    subscriber
+        .subscribe(1, "devices/sqlite-expiry", QoS::AtLeastOnce)
+        .await?;
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish_with_message_expiry(
+            "devices/sqlite-expiry",
+            QoS::AtLeastOnce,
+            Some(6),
+            "expired-durable",
+            false,
+            1,
+        ))
+        .await?;
+    publisher.expect_puback(6).await?;
+    broker.shutdown().await?;
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let broker =
+        TestBroker::start_with_broker(Broker::with_sqlite(&path).expect("sqlite broker")).await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", false, 60))
+        .await?;
+    subscriber.expect_connack_session_present(true).await?;
+    subscriber
+        .expect_no_packet(Duration::from_millis(200))
+        .await?;
 
     broker.shutdown().await?;
     cleanup_sqlite_path(&path);
@@ -1003,6 +1223,61 @@ async fn retain_handling_one_replays_only_for_new_subscription() -> rs_netty::Re
     subscriber
         .expect_no_packet(Duration::from_millis(200))
         .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn expired_retained_message_is_not_replayed() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish_with_message_expiry(
+            "devices/expiry/retained",
+            QoS::AtMostOnce,
+            None,
+            "expired",
+            true,
+            1,
+        ))
+        .await?;
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let mut subscriber = broker.connect("subscriber").await?;
+    subscriber
+        .subscribe(1, "devices/expiry/retained", QoS::AtMostOnce)
+        .await?;
+    subscriber
+        .expect_no_packet(Duration::from_millis(200))
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn non_expired_message_expiry_is_delivered() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.connect("subscriber").await?;
+    subscriber
+        .subscribe(1, "devices/expiry/live", QoS::AtMostOnce)
+        .await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish_with_message_expiry(
+            "devices/expiry/live",
+            QoS::AtMostOnce,
+            None,
+            "fresh",
+            false,
+            60,
+        ))
+        .await?;
+
+    let packet = subscriber
+        .expect_publish("expected non-expired publish")
+        .await?;
+    assert_eq!(packet.payload, Bytes::from_static(b"fresh"));
 
     broker.shutdown().await
 }
@@ -1374,6 +1649,25 @@ fn publish_with_retain(
         topic_name: topic_name.to_string(),
         packet_id,
         properties: Vec::new(),
+        payload: Bytes::copy_from_slice(payload.as_bytes()),
+    })
+}
+
+fn publish_with_message_expiry(
+    topic_name: &str,
+    qos: QoS,
+    packet_id: Option<u16>,
+    payload: &str,
+    retain: bool,
+    expiry_interval: u32,
+) -> MqttPacket {
+    MqttPacket::Publish(PublishPacket {
+        dup: false,
+        qos,
+        retain,
+        topic_name: topic_name.to_string(),
+        packet_id,
+        properties: vec![MqttProperty::MessageExpiryInterval(expiry_interval)],
         payload: Bytes::copy_from_slice(payload.as_bytes()),
     })
 }

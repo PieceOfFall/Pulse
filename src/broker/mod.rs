@@ -31,7 +31,8 @@ use self::delivery::{
     retained_for_subscription,
 };
 use self::state::{
-    BrokerState, ClientEntry, SessionEntry, now_ms, retain_publish, upsert_subscription,
+    BrokerState, ClientEntry, PendingPublish, SessionEntry, is_message_expired,
+    message_expires_at_ms, now_ms, retain_publish, upsert_subscription,
 };
 use self::storage::{BrokerStorage, InMemoryStorage, SqliteStorage};
 
@@ -237,19 +238,33 @@ impl Broker {
                 return false;
             }
 
-            state.qos2_inflight.insert(key, packet);
+            state.qos2_inflight.insert(
+                key,
+                PendingPublish {
+                    expires_at_ms: message_expires_at_ms(&packet, now_ms()),
+                    packet,
+                },
+            );
             true
         })
     }
 
     fn complete_qos2_publish(&self, connection_id: u64, packet_id: u16) -> Option<Vec<Delivery>> {
         self.with_state(|state| {
-            let packet = state.qos2_inflight.remove(&(connection_id, packet_id))?;
+            let pending = state.qos2_inflight.remove(&(connection_id, packet_id))?;
 
-            state.expire_sessions(now_ms());
-            retain_publish(state, &packet);
+            let now_ms = now_ms();
+            state.expire_sessions(now_ms);
+            if is_message_expired(pending.expires_at_ms, now_ms) {
+                return Some(Vec::new());
+            }
+            retain_publish(state, &pending.packet);
 
-            Some(deliveries_for_publish(state, connection_id, &packet))
+            Some(deliveries_for_publish(
+                state,
+                connection_id,
+                &pending.packet,
+            ))
         })
     }
 

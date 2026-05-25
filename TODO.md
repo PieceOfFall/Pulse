@@ -63,8 +63,8 @@ items are marked with `[x]`.
   - Respect client/server limits and return Packet Too Large where appropriate.
 - [ ] Enforce Receive Maximum
   - Limit concurrent QoS 1/2 inflight messages per client.
-- [ ] Implement Message Expiry Interval
-  - Expire queued, retained, and offline messages as required.
+- [x] Implement Message Expiry Interval
+  - [x] Expire queued, retained, and offline messages as required.
 - [ ] Implement Topic Alias and Topic Alias Maximum.
 - [ ] Preserve and forward User Property where MQTT v5 allows it.
 - [ ] Support Response Topic and Correlation Data forwarding.

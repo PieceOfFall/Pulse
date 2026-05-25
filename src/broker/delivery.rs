@@ -5,7 +5,10 @@ use rs_netty::{
 
 use crate::protocol;
 
-use super::state::{BrokerState, RetainedMessage, SessionEntry, SubscriptionEntry};
+use super::state::{
+    BrokerState, PendingPublish, RetainedMessage, SessionEntry, SubscriptionEntry,
+    is_message_expired, message_expires_at_ms, now_ms,
+};
 
 #[derive(Clone)]
 pub(super) struct Delivery {
@@ -18,6 +21,12 @@ pub(super) fn deliveries_for_publish(
     publisher_connection_id: u64,
     packet: &PublishPacket,
 ) -> Vec<Delivery> {
+    let now_ms = now_ms();
+    let expires_at_ms = message_expires_at_ms(packet, now_ms);
+    if is_message_expired(expires_at_ms, now_ms) {
+        return Vec::new();
+    }
+
     let publisher_client_id = state
         .clients_by_connection
         .get(&publisher_connection_id)
@@ -43,13 +52,14 @@ pub(super) fn deliveries_for_publish(
                         .channel
                         .clone();
                     let session = state.sessions_by_client_id.get_mut(&sub.client_id)?;
-                    Some(delivery_for_client(
+                    delivery_for_client(
                         session,
                         channel,
                         packet,
                         sub.options.maximum_qos,
                         sub.options.retain_as_published && packet.retain,
-                    ))
+                        expires_at_ms,
+                    )
                 }
                 None => {
                     queue_offline_publish(state, &sub, packet);
@@ -64,6 +74,11 @@ pub(super) fn retained_for_subscription(
     state: &mut BrokerState,
     subscription: &SubscriptionEntry,
 ) -> Vec<Delivery> {
+    let now_ms = now_ms();
+    state
+        .retained
+        .retain(|_, message| !is_message_expired(message.expires_at_ms, now_ms));
+
     let retained: Vec<RetainedMessage> = state
         .retained
         .values()
@@ -87,7 +102,7 @@ pub(super) fn retained_for_subscription(
 
     retained
         .into_iter()
-        .map(|message| {
+        .filter_map(|message| {
             delivery_for_client(
                 session,
                 channel.clone(),
@@ -102,6 +117,7 @@ pub(super) fn retained_for_subscription(
                 },
                 subscription.options.maximum_qos,
                 true,
+                message.expires_at_ms,
             )
         })
         .collect()
@@ -122,12 +138,20 @@ pub(super) fn redeliveries_for_client(state: &mut BrokerState, client_id: &str) 
         return Vec::new();
     };
 
+    let now_ms = now_ms();
+    session
+        .outbound_qos1
+        .retain(|_, pending| !is_message_expired(pending.expires_at_ms, now_ms));
+    session
+        .outbound_qos2_publish
+        .retain(|_, pending| !is_message_expired(pending.expires_at_ms, now_ms));
+
     let mut redeliveries: Vec<Delivery> = session
         .outbound_qos1
         .iter()
         .chain(session.outbound_qos2_publish.iter())
-        .map(|(packet_id, packet)| {
-            let mut packet = packet.clone();
+        .map(|(packet_id, pending)| {
+            let mut packet = pending.packet.clone();
             packet.dup = true;
             packet.packet_id = Some(*packet_id);
             Delivery {
@@ -137,14 +161,20 @@ pub(super) fn redeliveries_for_client(state: &mut BrokerState, client_id: &str) 
         })
         .collect();
 
-    while let Some(packet) = session.offline_queue.pop_front() {
-        redeliveries.push(delivery_for_client(
+    while let Some(pending) = session.offline_queue.pop_front() {
+        if is_message_expired(pending.expires_at_ms, now_ms) {
+            continue;
+        }
+        if let Some(delivery) = delivery_for_client(
             session,
             channel.clone(),
-            &packet,
-            packet.qos,
-            packet.retain,
-        ));
+            &pending.packet,
+            pending.packet.qos,
+            pending.packet.retain,
+            pending.expires_at_ms,
+        ) {
+            redeliveries.push(delivery);
+        }
     }
 
     redeliveries
@@ -156,7 +186,13 @@ fn delivery_for_client(
     packet: &PublishPacket,
     maximum_qos: QoS,
     retain: bool,
-) -> Delivery {
+    expires_at_ms: Option<u64>,
+) -> Option<Delivery> {
+    let now_ms = now_ms();
+    if is_message_expired(expires_at_ms, now_ms) {
+        return None;
+    }
+
     let qos = effective_qos(packet.qos, maximum_qos);
     let packet_id = match qos {
         QoS::AtMostOnce => None,
@@ -164,7 +200,10 @@ fn delivery_for_client(
             let packet_id = next_packet_id(session);
             session.outbound_qos1.insert(
                 packet_id,
-                pending_publish(packet, qos, retain, Some(packet_id), false),
+                PendingPublish {
+                    packet: pending_publish(packet, qos, retain, Some(packet_id), false),
+                    expires_at_ms,
+                },
             );
             Some(packet_id)
         }
@@ -172,16 +211,19 @@ fn delivery_for_client(
             let packet_id = next_packet_id(session);
             session.outbound_qos2_publish.insert(
                 packet_id,
-                pending_publish(packet, qos, retain, Some(packet_id), false),
+                PendingPublish {
+                    packet: pending_publish(packet, qos, retain, Some(packet_id), false),
+                    expires_at_ms,
+                },
             );
             Some(packet_id)
         }
     };
 
-    Delivery {
+    Some(Delivery {
         channel,
         packet: MqttPacket::Publish(pending_publish(packet, qos, retain, packet_id, false)),
-    }
+    })
 }
 
 fn pending_publish(
@@ -219,13 +261,22 @@ fn queue_offline_publish(
         return;
     }
 
-    session.offline_queue.push_back(pending_publish(
-        packet,
-        qos,
-        subscription.options.retain_as_published && packet.retain,
-        None,
-        false,
-    ));
+    let now_ms = now_ms();
+    let expires_at_ms = message_expires_at_ms(packet, now_ms);
+    if is_message_expired(expires_at_ms, now_ms) {
+        return;
+    }
+
+    session.offline_queue.push_back(PendingPublish {
+        packet: pending_publish(
+            packet,
+            qos,
+            subscription.options.retain_as_published && packet.retain,
+            None,
+            false,
+        ),
+        expires_at_ms,
+    });
 }
 
 fn effective_qos(publish_qos: QoS, maximum_qos: QoS) -> QoS {

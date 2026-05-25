@@ -10,7 +10,9 @@ use rs_netty::codec::{
 use rusqlite::{Connection, params};
 
 use super::BrokerStorage;
-use crate::broker::state::{BrokerState, RetainedMessage, SessionEntry, SubscriptionEntry};
+use crate::broker::state::{
+    BrokerState, PendingPublish, RetainedMessage, SessionEntry, SubscriptionEntry,
+};
 
 pub(crate) struct SqliteStorage {
     connection: Mutex<Connection>,
@@ -72,7 +74,8 @@ fn migrate(connection: &Connection) -> rusqlite::Result<()> {
 
         CREATE TABLE IF NOT EXISTS retained_messages (
             topic_name TEXT PRIMARY KEY,
-            packet BLOB NOT NULL
+            packet BLOB NOT NULL,
+            expires_at_ms INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS outbound_inflight (
@@ -80,6 +83,7 @@ fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             packet_id INTEGER NOT NULL,
             qos INTEGER NOT NULL,
             packet BLOB NOT NULL,
+            expires_at_ms INTEGER,
             PRIMARY KEY (client_id, packet_id, qos),
             FOREIGN KEY (client_id) REFERENCES sessions(client_id) ON DELETE CASCADE
         );
@@ -95,6 +99,7 @@ fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             client_id TEXT NOT NULL,
             sequence INTEGER NOT NULL,
             packet BLOB NOT NULL,
+            expires_at_ms INTEGER,
             PRIMARY KEY (client_id, sequence),
             FOREIGN KEY (client_id) REFERENCES sessions(client_id) ON DELETE CASCADE
         );
@@ -105,7 +110,10 @@ fn migrate(connection: &Connection) -> rusqlite::Result<()> {
         "sessions",
         "next_packet_id",
         "INTEGER NOT NULL DEFAULT 1",
-    )
+    )?;
+    add_column_if_missing(connection, "retained_messages", "expires_at_ms", "INTEGER")?;
+    add_column_if_missing(connection, "outbound_inflight", "expires_at_ms", "INTEGER")?;
+    add_column_if_missing(connection, "offline_queue", "expires_at_ms", "INTEGER")
 }
 
 fn load_state(connection: &Connection) -> rusqlite::Result<BrokerState> {
@@ -147,18 +155,26 @@ fn load_outbound_inflight(
     connection: &Connection,
     state: &mut BrokerState,
 ) -> rusqlite::Result<()> {
-    let mut statement =
-        connection.prepare("SELECT client_id, packet_id, qos, packet FROM outbound_inflight")?;
+    let mut statement = connection.prepare(
+        "SELECT client_id, packet_id, qos, packet, expires_at_ms FROM outbound_inflight",
+    )?;
     let rows = statement.query_map([], |row| {
         let client_id: String = row.get(0)?;
         let packet_id: u16 = row.get(1)?;
         let qos: u8 = row.get(2)?;
         let packet: Vec<u8> = row.get(3)?;
-        Ok((client_id, packet_id, qos, packet))
+        let expires_at_ms: Option<i64> = row.get(4)?;
+        Ok((
+            client_id,
+            packet_id,
+            qos,
+            packet,
+            expires_at_ms.map(|value| value as u64),
+        ))
     })?;
 
     for row in rows {
-        let (client_id, packet_id, qos, packet) = row?;
+        let (client_id, packet_id, qos, packet, expires_at_ms) = row?;
         let Some(packet) = decode_publish(&packet) else {
             continue;
         };
@@ -167,10 +183,22 @@ fn load_outbound_inflight(
         };
         match qos_from_u8(qos) {
             QoS::AtLeastOnce => {
-                session.outbound_qos1.insert(packet_id, packet);
+                session.outbound_qos1.insert(
+                    packet_id,
+                    PendingPublish {
+                        packet,
+                        expires_at_ms,
+                    },
+                );
             }
             QoS::ExactlyOnce => {
-                session.outbound_qos2_publish.insert(packet_id, packet);
+                session.outbound_qos2_publish.insert(
+                    packet_id,
+                    PendingPublish {
+                        packet,
+                        expires_at_ms,
+                    },
+                );
             }
             QoS::AtMostOnce => {}
         }
@@ -196,22 +224,27 @@ fn load_outbound_pubrel(connection: &Connection, state: &mut BrokerState) -> rus
 }
 
 fn load_offline_queue(connection: &Connection, state: &mut BrokerState) -> rusqlite::Result<()> {
-    let mut statement = connection
-        .prepare("SELECT client_id, packet FROM offline_queue ORDER BY client_id, sequence")?;
+    let mut statement = connection.prepare(
+        "SELECT client_id, packet, expires_at_ms FROM offline_queue ORDER BY client_id, sequence",
+    )?;
     let rows = statement.query_map([], |row| {
         let client_id: String = row.get(0)?;
         let packet: Vec<u8> = row.get(1)?;
-        Ok((client_id, packet))
+        let expires_at_ms: Option<i64> = row.get(2)?;
+        Ok((client_id, packet, expires_at_ms.map(|value| value as u64)))
     })?;
 
     for row in rows {
-        let (client_id, packet) = row?;
+        let (client_id, packet, expires_at_ms) = row?;
         let Some(mut packet) = decode_publish(&packet) else {
             continue;
         };
         packet.packet_id = None;
         if let Some(session) = state.sessions_by_client_id.get_mut(&client_id) {
-            session.offline_queue.push_back(packet);
+            session.offline_queue.push_back(PendingPublish {
+                packet,
+                expires_at_ms,
+            });
         }
     }
     Ok(())
@@ -247,16 +280,19 @@ fn load_subscriptions(connection: &Connection, state: &mut BrokerState) -> rusql
 }
 
 fn load_retained(connection: &Connection, state: &mut BrokerState) -> rusqlite::Result<()> {
-    let mut statement = connection.prepare("SELECT topic_name, packet FROM retained_messages")?;
+    let mut statement =
+        connection.prepare("SELECT topic_name, packet, expires_at_ms FROM retained_messages")?;
     let rows = statement.query_map([], |row| {
         let topic_name: String = row.get(0)?;
         let packet: Vec<u8> = row.get(1)?;
-        Ok((topic_name, packet))
+        let expires_at_ms: Option<i64> = row.get(2)?;
+        Ok((topic_name, packet, expires_at_ms.map(|value| value as u64)))
     })?;
 
     for row in rows {
-        let (topic_name, packet) = row?;
-        if let Some(message) = decode_retained(&packet) {
+        let (topic_name, packet, expires_at_ms) = row?;
+        if let Some(mut message) = decode_retained(&packet) {
+            message.expires_at_ms = expires_at_ms;
             state.retained.insert(topic_name, message);
         }
     }
@@ -315,45 +351,57 @@ fn persist_state(
     }
 
     {
-        let mut statement = transaction
-            .prepare("INSERT INTO retained_messages (topic_name, packet) VALUES (?1, ?2)")?;
+        let mut statement = transaction.prepare(
+            "INSERT INTO retained_messages (topic_name, packet, expires_at_ms) VALUES (?1, ?2, ?3)",
+        )?;
         for (topic_name, message) in &state.retained {
-            statement.execute(params![topic_name, encode_retained(message)])?;
+            statement.execute(params![
+                topic_name,
+                encode_retained(message),
+                message.expires_at_ms.map(|value| value as i64)
+            ])?;
         }
     }
 
     {
         let mut inflight = transaction.prepare(
-            "INSERT INTO outbound_inflight (client_id, packet_id, qos, packet) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO outbound_inflight (client_id, packet_id, qos, packet, expires_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
         )?;
         let mut pubrel = transaction
             .prepare("INSERT INTO outbound_pubrel (client_id, packet_id) VALUES (?1, ?2)")?;
         let mut offline = transaction.prepare(
-            "INSERT INTO offline_queue (client_id, sequence, packet) VALUES (?1, ?2, ?3)",
+            "INSERT INTO offline_queue (client_id, sequence, packet, expires_at_ms) VALUES (?1, ?2, ?3, ?4)",
         )?;
 
         for (client_id, session) in &state.sessions_by_client_id {
-            for (packet_id, packet) in &session.outbound_qos1 {
+            for (packet_id, pending) in &session.outbound_qos1 {
                 inflight.execute(params![
                     client_id,
                     packet_id,
                     qos_to_u8(QoS::AtLeastOnce),
-                    encode_publish(packet)
+                    encode_publish(&pending.packet),
+                    pending.expires_at_ms.map(|value| value as i64)
                 ])?;
             }
-            for (packet_id, packet) in &session.outbound_qos2_publish {
+            for (packet_id, pending) in &session.outbound_qos2_publish {
                 inflight.execute(params![
                     client_id,
                     packet_id,
                     qos_to_u8(QoS::ExactlyOnce),
-                    encode_publish(packet)
+                    encode_publish(&pending.packet),
+                    pending.expires_at_ms.map(|value| value as i64)
                 ])?;
             }
             for packet_id in &session.outbound_qos2_pubrel {
                 pubrel.execute(params![client_id, packet_id])?;
             }
-            for (sequence, packet) in session.offline_queue.iter().enumerate() {
-                offline.execute(params![client_id, sequence as i64, encode_publish(packet)])?;
+            for (sequence, pending) in session.offline_queue.iter().enumerate() {
+                offline.execute(params![
+                    client_id,
+                    sequence as i64,
+                    encode_publish(&pending.packet),
+                    pending.expires_at_ms.map(|value| value as i64)
+                ])?;
             }
         }
     }
@@ -433,6 +481,7 @@ fn decode_retained(packet: &[u8]) -> Option<RetainedMessage> {
         topic_name: packet.topic_name,
         properties: packet.properties,
         payload: Bytes::copy_from_slice(&packet.payload),
+        expires_at_ms: None,
     })
 }
 
@@ -489,24 +538,30 @@ mod tests {
             session.next_packet_id = 7;
             session.outbound_qos1.insert(
                 1,
-                PublishPacket {
+                PendingPublish {
+                    packet: PublishPacket {
+                        dup: false,
+                        qos: QoS::AtLeastOnce,
+                        retain: false,
+                        topic_name: "devices/inflight".to_string(),
+                        packet_id: Some(1),
+                        properties: Vec::new(),
+                        payload: Bytes::from_static(b"inflight"),
+                    },
+                    expires_at_ms: Some(456),
+                },
+            );
+            session.offline_queue.push_back(PendingPublish {
+                packet: PublishPacket {
                     dup: false,
                     qos: QoS::AtLeastOnce,
                     retain: false,
-                    topic_name: "devices/inflight".to_string(),
-                    packet_id: Some(1),
+                    topic_name: "devices/offline".to_string(),
+                    packet_id: None,
                     properties: Vec::new(),
-                    payload: Bytes::from_static(b"inflight"),
+                    payload: Bytes::from_static(b"offline"),
                 },
-            );
-            session.offline_queue.push_back(PublishPacket {
-                dup: false,
-                qos: QoS::AtLeastOnce,
-                retain: false,
-                topic_name: "devices/offline".to_string(),
-                packet_id: None,
-                properties: Vec::new(),
-                payload: Bytes::from_static(b"offline"),
+                expires_at_ms: Some(789),
             });
             state.subscriptions.push(SubscriptionEntry {
                 client_id: "client".to_string(),
@@ -525,6 +580,7 @@ mod tests {
                     topic_name: "devices/one".to_string(),
                     properties: Vec::new(),
                     payload: Bytes::from_static(b"hello"),
+                    expires_at_ms: Some(999),
                 },
             );
         });
@@ -540,10 +596,12 @@ mod tests {
             assert_eq!(session.expires_at_ms, Some(123));
             assert_eq!(session.next_packet_id, 7);
             let inflight = session.outbound_qos1.get(&1).expect("persisted inflight");
-            assert_eq!(inflight.payload, Bytes::from_static(b"inflight"));
+            assert_eq!(inflight.packet.payload, Bytes::from_static(b"inflight"));
+            assert_eq!(inflight.expires_at_ms, Some(456));
             let offline = session.offline_queue.front().expect("persisted offline");
-            assert_eq!(offline.payload, Bytes::from_static(b"offline"));
-            assert_eq!(offline.packet_id, None);
+            assert_eq!(offline.packet.payload, Bytes::from_static(b"offline"));
+            assert_eq!(offline.packet.packet_id, None);
+            assert_eq!(offline.expires_at_ms, Some(789));
 
             let subscription = state
                 .subscriptions
@@ -562,6 +620,7 @@ mod tests {
                 .expect("persisted retained");
             assert_eq!(retained.qos, QoS::AtLeastOnce);
             assert_eq!(retained.payload, Bytes::from_static(b"hello"));
+            assert_eq!(retained.expires_at_ms, Some(999));
         });
 
         let _ = std::fs::remove_file(&path);

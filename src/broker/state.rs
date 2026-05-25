@@ -17,7 +17,7 @@ pub(super) struct BrokerState {
     pub(super) sessions_by_client_id: HashMap<String, SessionEntry>,
     pub(super) subscriptions: Vec<SubscriptionEntry>,
     pub(super) retained: HashMap<String, RetainedMessage>,
-    pub(super) qos2_inflight: HashMap<(u64, u16), PublishPacket>,
+    pub(super) qos2_inflight: HashMap<(u64, u16), PendingPublish>,
 }
 
 impl BrokerState {
@@ -77,10 +77,10 @@ pub(super) struct SessionEntry {
     pub(super) expires_at_ms: Option<u64>,
     pub(super) session_expiry_interval: u32,
     pub(super) next_packet_id: u16,
-    pub(super) outbound_qos1: HashMap<u16, PublishPacket>,
-    pub(super) outbound_qos2_publish: HashMap<u16, PublishPacket>,
+    pub(super) outbound_qos1: HashMap<u16, PendingPublish>,
+    pub(super) outbound_qos2_publish: HashMap<u16, PendingPublish>,
     pub(super) outbound_qos2_pubrel: HashSet<u16>,
-    pub(super) offline_queue: VecDeque<PublishPacket>,
+    pub(super) offline_queue: VecDeque<PendingPublish>,
 }
 
 impl SessionEntry {
@@ -145,6 +145,13 @@ pub(super) struct RetainedMessage {
     pub(super) topic_name: String,
     pub(super) properties: Vec<MqttProperty>,
     pub(super) payload: bytes::Bytes,
+    pub(super) expires_at_ms: Option<u64>,
+}
+
+#[derive(Clone)]
+pub(super) struct PendingPublish {
+    pub(super) packet: PublishPacket,
+    pub(super) expires_at_ms: Option<u64>,
 }
 
 pub(super) fn retain_publish(state: &mut BrokerState, packet: &PublishPacket) {
@@ -152,7 +159,9 @@ pub(super) fn retain_publish(state: &mut BrokerState, packet: &PublishPacket) {
         return;
     }
 
-    if packet.payload.is_empty() {
+    let now_ms = now_ms();
+    let expires_at_ms = message_expires_at_ms(packet, now_ms);
+    if packet.payload.is_empty() || is_message_expired(expires_at_ms, now_ms) {
         state.retained.remove(&packet.topic_name);
     } else {
         state.retained.insert(
@@ -162,6 +171,7 @@ pub(super) fn retain_publish(state: &mut BrokerState, packet: &PublishPacket) {
                 topic_name: packet.topic_name.clone(),
                 properties: packet.properties.clone(),
                 payload: packet.payload.clone(),
+                expires_at_ms,
             },
         );
     }
@@ -214,4 +224,20 @@ pub(super) fn now_ms() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+pub(super) fn message_expires_at_ms(packet: &PublishPacket, now_ms: u64) -> Option<u64> {
+    packet
+        .properties
+        .iter()
+        .find_map(|property| match property {
+            MqttProperty::MessageExpiryInterval(seconds) => {
+                Some(now_ms.saturating_add(u64::from(*seconds) * 1_000))
+            }
+            _ => None,
+        })
+}
+
+pub(super) fn is_message_expired(expires_at_ms: Option<u64>, now_ms: u64) -> bool {
+    expires_at_ms.is_some_and(|expires_at_ms| expires_at_ms <= now_ms)
 }
