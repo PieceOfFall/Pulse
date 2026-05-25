@@ -2,7 +2,14 @@
 name = "Pulse"
 version = "0.1.0"
 edition = "2024"
+authors = ["FAll"]
 repository = "https://github.com/PieceOfFall/Pulse"
+
+[package.metadata.wix]
+upgrade-guid = "843208C9-19E0-4573-B63B-EF0F7AA040EE"
+path-guid = "574F7137-703D-42E2-860C-107E5161752A"
+license = false
+eula = false
 
 [dependencies]
 bytes = "1"
