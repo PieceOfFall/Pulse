@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -14,13 +15,14 @@ use tokio::task::JoinHandle;
 
 use crate::protocol;
 
-use super::{Broker, delivery::flush_deliveries, now_ms};
+use super::{Broker, ack_packet, delivery::flush_deliveries, now_ms, reason_properties};
 
 pub struct MqttHandler {
     broker: Broker,
     connected: bool,
     client_id: Option<String>,
     keep_alive: Option<KeepAliveHandle>,
+    topic_aliases: HashMap<u16, String>,
 }
 
 struct KeepAliveHandle {
@@ -36,6 +38,7 @@ impl MqttHandler {
             connected: false,
             client_id: None,
             keep_alive: None,
+            topic_aliases: HashMap::new(),
         }
     }
 
@@ -88,7 +91,7 @@ impl MqttHandler {
         ctx.write(MqttPacket::ConnAck(ConnAckPacket {
             session_present: false,
             reason_code,
-            properties: Vec::new(),
+            properties: reason_properties(reason_code),
         }))
         .await?;
         ctx.close().await
@@ -97,7 +100,7 @@ impl MqttHandler {
     async fn disconnect(&mut self, ctx: &mut Context<MqttPacket>, reason_code: u8) -> Result<()> {
         ctx.write(MqttPacket::Disconnect(DisconnectPacket {
             reason_code,
-            properties: Vec::new(),
+            properties: reason_properties(reason_code),
         }))
         .await?;
 
@@ -153,11 +156,12 @@ impl Handler<MqttPacket> for MqttHandler {
                 let mut properties = vec![
                     MqttProperty::ReceiveMaximum(protocol::SERVER_RECEIVE_MAXIMUM),
                     MqttProperty::MaximumPacketSize(protocol::SERVER_MAXIMUM_PACKET_SIZE),
+                    MqttProperty::TopicAliasMaximum(protocol::SERVER_TOPIC_ALIAS_MAXIMUM),
                     MqttProperty::MaximumQoS(2),
                     MqttProperty::RetainAvailable(1),
                     MqttProperty::WildcardSubscriptionAvailable(1),
                     MqttProperty::SubscriptionIdentifierAvailable(1),
-                    MqttProperty::SharedSubscriptionAvailable(0),
+                    MqttProperty::SharedSubscriptionAvailable(1),
                 ];
                 if assigned_client_id {
                     properties.push(MqttProperty::AssignedClientIdentifier(outcome.client_id));
@@ -196,7 +200,10 @@ impl Handler<MqttPacket> for MqttHandler {
                 let unsuback = self.broker.unsubscribe(ctx.id(), packet);
                 ctx.write(MqttPacket::UnsubAck(unsuback)).await
             }
-            MqttPacket::Publish(packet) => {
+            MqttPacket::Publish(mut packet) => {
+                if !self.resolve_topic_alias(&mut packet) {
+                    return self.disconnect(ctx, protocol::TOPIC_ALIAS_INVALID).await;
+                }
                 if !protocol::is_valid_topic_name(&packet.topic_name) {
                     return self.disconnect(ctx, protocol::TOPIC_NAME_INVALID).await;
                 }
@@ -224,7 +231,7 @@ impl Handler<MqttPacket> for MqttHandler {
                         return if let Some(packet_id) = packet.packet_id {
                             let reason_code =
                                 self.broker.store_qos2_publish(ctx.id(), packet_id, packet);
-                            ctx.write(MqttPacket::PubRec(AckPacket::new(packet_id, reason_code)))
+                            ctx.write(MqttPacket::PubRec(ack_packet(packet_id, reason_code)))
                                 .await?;
                             Ok(())
                         } else {
@@ -243,7 +250,7 @@ impl Handler<MqttPacket> for MqttHandler {
                     .complete_qos2_publish(ctx.id(), packet.packet_id)
                 else {
                     return ctx
-                        .write(MqttPacket::PubComp(AckPacket::new(
+                        .write(MqttPacket::PubComp(ack_packet(
                             packet.packet_id,
                             protocol::PACKET_IDENTIFIER_NOT_FOUND,
                         )))
@@ -251,7 +258,7 @@ impl Handler<MqttPacket> for MqttHandler {
                 };
 
                 flush_deliveries(deliveries).await;
-                ctx.write(MqttPacket::PubComp(AckPacket::new(
+                ctx.write(MqttPacket::PubComp(ack_packet(
                     packet.packet_id,
                     protocol::SUCCESS,
                 )))
@@ -306,6 +313,35 @@ impl Handler<MqttPacket> for MqttHandler {
             | MqttPacket::UnsubAck(_)
             | MqttPacket::PingResp => self.disconnect(ctx, protocol::PROTOCOL_ERROR).await,
         }
+    }
+}
+
+impl MqttHandler {
+    fn resolve_topic_alias(&mut self, packet: &mut rs_netty::codec::PublishPacket) -> bool {
+        let alias = packet
+            .properties
+            .iter()
+            .find_map(|property| match property {
+                MqttProperty::TopicAlias(alias) => Some(*alias),
+                _ => None,
+            });
+
+        let Some(alias) = alias else {
+            return true;
+        };
+        if alias == 0 || alias > protocol::SERVER_TOPIC_ALIAS_MAXIMUM {
+            return false;
+        }
+
+        if packet.topic_name.is_empty() {
+            let Some(topic_name) = self.topic_aliases.get(&alias) else {
+                return false;
+            };
+            packet.topic_name = topic_name.clone();
+        } else {
+            self.topic_aliases.insert(alias, packet.topic_name.clone());
+        }
+        true
     }
 }
 

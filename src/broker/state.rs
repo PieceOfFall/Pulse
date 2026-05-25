@@ -22,6 +22,7 @@ pub(super) struct BrokerState {
     pub(super) subscriptions: Vec<SubscriptionEntry>,
     pub(super) retained: HashMap<String, RetainedMessage>,
     pub(super) qos2_inflight: HashMap<(u64, u16), PendingPublish>,
+    pub(super) shared_subscription_cursors: HashMap<String, usize>,
 }
 
 impl BrokerState {
@@ -146,6 +147,8 @@ impl ClientEntry {
 pub(super) struct SubscriptionEntry {
     pub(super) client_id: String,
     pub(super) filter: String,
+    pub(super) match_filter: String,
+    pub(super) shared_group: Option<String>,
     pub(super) options: SubscriptionOptions,
     pub(super) subscription_identifier: Option<u32>,
 }
@@ -194,12 +197,20 @@ pub(super) fn upsert_subscription(
     subscription: Subscription,
     subscription_identifier: Option<u32>,
 ) -> UpsertSubscriptionResult {
+    let match_filter = crate::protocol::shared_subscription_filter(&subscription.topic_filter)
+        .unwrap_or(&subscription.topic_filter)
+        .to_string();
+    let shared_group =
+        crate::protocol::shared_subscription_group(&subscription.topic_filter).map(str::to_string);
+
     if let Some(index) = subscriptions
         .iter_mut()
         .position(|sub| sub.client_id == client_id && sub.filter == subscription.topic_filter)
     {
         subscriptions[index].options = subscription.options;
         subscriptions[index].subscription_identifier = subscription_identifier;
+        subscriptions[index].match_filter = match_filter;
+        subscriptions[index].shared_group = shared_group;
         return UpsertSubscriptionResult {
             index,
             inserted: false,
@@ -209,6 +220,8 @@ pub(super) fn upsert_subscription(
     subscriptions.push(SubscriptionEntry {
         client_id: client_id.to_string(),
         filter: subscription.topic_filter,
+        match_filter,
+        shared_group,
         options: subscription.options,
         subscription_identifier,
     });

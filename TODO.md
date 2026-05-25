@@ -65,10 +65,10 @@ items are marked with `[x]`.
   - [x] Limit concurrent QoS 1/2 inflight messages per client.
 - [x] Implement Message Expiry Interval
   - [x] Expire queued, retained, and offline messages as required.
-- [ ] Implement Topic Alias and Topic Alias Maximum.
-- [ ] Preserve and forward User Property where MQTT v5 allows it.
-- [ ] Support Response Topic and Correlation Data forwarding.
-- [ ] Support Reason String and richer reason properties on ACK/DISCONNECT packets.
+- [x] Implement Topic Alias and Topic Alias Maximum.
+- [x] Preserve and forward User Property where MQTT v5 allows it.
+- [x] Support Response Topic and Correlation Data forwarding.
+- [x] Support Reason String and richer reason properties on ACK/DISCONNECT packets.
 
 ## 4. Subscription Features
 
@@ -76,9 +76,9 @@ items are marked with `[x]`.
   - Send retained messages only when a subscription is newly created, not when an existing subscription is updated.
 - [x] Implement Subscription Identifier
   - [x] Store subscription identifiers and attach them to matching PUBLISH packets.
-- [ ] Implement shared subscriptions: `$share/{group}/{filter}`.
+- [x] Implement shared subscriptions: `$share/{group}/{filter}`.
 - [ ] Add stricter topic filter validation tests, including edge cases around `$`, empty levels, and shared subscription syntax.
-- [ ] Add subscription quotas and clear error paths for quota exceeded.
+- [x] Add subscription quotas and clear error paths for quota exceeded.
 
 ## 5. Authentication And Authorization
 
@@ -94,7 +94,7 @@ items are marked with `[x]`.
 - [x] Add queue limits and slow-consumer policy.
 - [x] Add retained message limits.
 - [ ] Add inflight retransmission timers for QoS 1/2.
-- [ ] Add duplicate inbound QoS 2 handling that avoids double delivery.
+- [x] Add duplicate inbound QoS 2 handling that avoids double delivery.
 - [ ] Decide and document ordering guarantees per client and per topic.
 
 ## 7. Persistence

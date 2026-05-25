@@ -16,7 +16,7 @@ use std::sync::{
 use rs_netty::{
     Channel, CloseReason,
     codec::{
-        MqttPacket, PublishPacket, SubAckPacket, SubscribePacket, UnsubAckPacket,
+        MqttPacket, MqttProperty, PublishPacket, SubAckPacket, SubscribePacket, UnsubAckPacket,
         UnsubscribePacket, Will,
     },
 };
@@ -171,10 +171,23 @@ impl Broker {
 
             let mut reason_codes = Vec::with_capacity(packet.subscriptions.len());
             let mut retained_deliveries = Vec::new();
+            let current_subscription_count = state
+                .subscriptions
+                .iter()
+                .filter(|subscription| subscription.client_id == client_id)
+                .count();
+            let mut inserted_count = 0;
 
             for subscription in packet.subscriptions {
                 if !protocol::is_valid_topic_filter(&subscription.topic_filter) {
                     reason_codes.push(protocol::TOPIC_FILTER_INVALID);
+                    continue;
+                }
+                if is_new_subscription(&state.subscriptions, &client_id, &subscription.topic_filter)
+                    && current_subscription_count + inserted_count
+                        >= protocol::MAX_SUBSCRIPTIONS_PER_CLIENT
+                {
+                    reason_codes.push(protocol::QUOTA_EXCEEDED);
                     continue;
                 }
 
@@ -186,6 +199,9 @@ impl Broker {
                 );
                 let stored = state.subscriptions[upsert.index].clone();
                 reason_codes.push(protocol::granted_qos_code(stored.options.maximum_qos));
+                if upsert.inserted {
+                    inserted_count += 1;
+                }
 
                 if should_send_retained_on_subscribe(
                     stored.options.retain_handling,
@@ -198,7 +214,11 @@ impl Broker {
             (
                 SubAckPacket {
                     packet_id: packet.packet_id,
-                    properties: Vec::new(),
+                    properties: reason_codes
+                        .iter()
+                        .find_map(|reason_code| reason_string(*reason_code))
+                        .into_iter()
+                        .collect(),
                     reason_codes,
                 },
                 retained_deliveries,
@@ -238,6 +258,11 @@ impl Broker {
 
     fn store_qos2_publish(&self, connection_id: u64, packet_id: u16, packet: PublishPacket) -> u8 {
         self.with_state(|state| {
+            let key = (connection_id, packet_id);
+            if state.qos2_inflight.contains_key(&key) {
+                return protocol::SUCCESS;
+            }
+
             if state
                 .qos2_inflight
                 .keys()
@@ -246,11 +271,6 @@ impl Broker {
                 >= usize::from(protocol::SERVER_RECEIVE_MAXIMUM)
             {
                 return protocol::RECEIVE_MAXIMUM_EXCEEDED;
-            }
-
-            let key = (connection_id, packet_id);
-            if state.qos2_inflight.contains_key(&key) {
-                return protocol::PACKET_IDENTIFIER_IN_USE;
             }
 
             state.qos2_inflight.insert(
@@ -395,4 +415,47 @@ fn subscription_identifier(properties: &[rs_netty::codec::MqttProperty]) -> Opti
         rs_netty::codec::MqttProperty::SubscriptionIdentifier(value) => Some(*value),
         _ => None,
     })
+}
+
+fn is_new_subscription(
+    subscriptions: &[self::state::SubscriptionEntry],
+    client_id: &str,
+    topic_filter: &str,
+) -> bool {
+    !subscriptions.iter().any(|subscription| {
+        subscription.client_id == client_id && subscription.filter == topic_filter
+    })
+}
+
+fn reason_string(reason_code: u8) -> Option<MqttProperty> {
+    let reason = match reason_code {
+        protocol::MALFORMED_PACKET => "malformed packet",
+        protocol::PROTOCOL_ERROR => "protocol error",
+        protocol::CLIENT_IDENTIFIER_NOT_VALID => "client identifier not valid",
+        protocol::BAD_USER_NAME_OR_PASSWORD => "bad user name or password",
+        protocol::BAD_AUTHENTICATION_METHOD => "bad authentication method",
+        protocol::TOPIC_FILTER_INVALID => "topic filter invalid",
+        protocol::TOPIC_NAME_INVALID => "topic name invalid",
+        protocol::PACKET_IDENTIFIER_IN_USE => "packet identifier in use",
+        protocol::PACKET_IDENTIFIER_NOT_FOUND => "packet identifier not found",
+        protocol::RECEIVE_MAXIMUM_EXCEEDED => "receive maximum exceeded",
+        protocol::TOPIC_ALIAS_INVALID => "topic alias invalid",
+        protocol::PACKET_TOO_LARGE => "packet too large",
+        protocol::QUOTA_EXCEEDED => "quota exceeded",
+        protocol::PAYLOAD_FORMAT_INVALID => "payload format invalid",
+        _ => return None,
+    };
+    Some(MqttProperty::ReasonString(reason.to_string()))
+}
+
+fn reason_properties(reason_code: u8) -> Vec<MqttProperty> {
+    reason_string(reason_code).into_iter().collect()
+}
+
+fn ack_packet(packet_id: u16, reason_code: u8) -> rs_netty::codec::mqtt::AckPacket {
+    rs_netty::codec::mqtt::AckPacket {
+        packet_id,
+        reason_code,
+        properties: reason_properties(reason_code),
+    }
 }

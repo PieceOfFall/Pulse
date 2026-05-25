@@ -64,6 +64,8 @@ fn migrate(connection: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS subscriptions (
             client_id TEXT NOT NULL,
             topic_filter TEXT NOT NULL,
+            match_filter TEXT NOT NULL DEFAULT '',
+            shared_group TEXT,
             maximum_qos INTEGER NOT NULL,
             no_local INTEGER NOT NULL,
             retain_as_published INTEGER NOT NULL,
@@ -118,6 +120,13 @@ fn migrate(connection: &Connection) -> rusqlite::Result<()> {
         "subscription_identifier",
         "INTEGER",
     )?;
+    add_column_if_missing(
+        connection,
+        "subscriptions",
+        "match_filter",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column_if_missing(connection, "subscriptions", "shared_group", "TEXT")?;
     add_column_if_missing(connection, "retained_messages", "expires_at_ms", "INTEGER")?;
     add_column_if_missing(connection, "outbound_inflight", "expires_at_ms", "INTEGER")?;
     add_column_if_missing(connection, "offline_queue", "expires_at_ms", "INTEGER")
@@ -260,7 +269,7 @@ fn load_offline_queue(connection: &Connection, state: &mut BrokerState) -> rusql
 fn load_subscriptions(connection: &Connection, state: &mut BrokerState) -> rusqlite::Result<()> {
     let mut statement = connection.prepare(
         r#"
-        SELECT client_id, topic_filter, maximum_qos, no_local, retain_as_published, retain_handling, subscription_identifier
+        SELECT client_id, topic_filter, maximum_qos, no_local, retain_as_published, retain_handling, subscription_identifier, match_filter, shared_group
         FROM subscriptions
         "#,
     )?;
@@ -268,9 +277,20 @@ fn load_subscriptions(connection: &Connection, state: &mut BrokerState) -> rusql
         let maximum_qos: u8 = row.get(2)?;
         let no_local: u8 = row.get(3)?;
         let retain_as_published: u8 = row.get(4)?;
+        let filter: String = row.get(1)?;
+        let persisted_match_filter: String = row.get(7)?;
+        let match_filter = if persisted_match_filter.is_empty() {
+            crate::protocol::shared_subscription_filter(&filter)
+                .unwrap_or(&filter)
+                .to_string()
+        } else {
+            persisted_match_filter
+        };
         Ok(SubscriptionEntry {
             client_id: row.get(0)?,
-            filter: row.get(1)?,
+            filter,
+            match_filter,
+            shared_group: row.get(8)?,
             options: SubscriptionOptions {
                 maximum_qos: qos_from_u8(maximum_qos),
                 no_local: no_local != 0,
@@ -339,18 +359,22 @@ fn persist_state(
             INSERT INTO subscriptions (
                 client_id,
                 topic_filter,
+                match_filter,
+                shared_group,
                 maximum_qos,
                 no_local,
                 retain_as_published,
                 retain_handling,
                 subscription_identifier
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             "#,
         )?;
         for subscription in &state.subscriptions {
             statement.execute(params![
                 subscription.client_id,
                 subscription.filter,
+                subscription.match_filter,
+                subscription.shared_group,
                 qos_to_u8(subscription.options.maximum_qos),
                 bool_to_u8(subscription.options.no_local),
                 bool_to_u8(subscription.options.retain_as_published),
@@ -576,6 +600,8 @@ mod tests {
             state.subscriptions.push(SubscriptionEntry {
                 client_id: "client".to_string(),
                 filter: "devices/one".to_string(),
+                match_filter: "devices/one".to_string(),
+                shared_group: None,
                 options: SubscriptionOptions {
                     maximum_qos: QoS::ExactlyOnce,
                     no_local: true,
@@ -620,6 +646,8 @@ mod tests {
                 .find(|subscription| subscription.client_id == "client")
                 .expect("persisted subscription");
             assert_eq!(subscription.filter, "devices/one");
+            assert_eq!(subscription.match_filter, "devices/one");
+            assert_eq!(subscription.shared_group, None);
             assert_eq!(subscription.options.maximum_qos, QoS::ExactlyOnce);
             assert!(subscription.options.no_local);
             assert!(subscription.options.retain_as_published);

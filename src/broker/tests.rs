@@ -41,12 +41,16 @@ fn upsert_subscription_returns_updated_subscription_index() {
         SubscriptionEntry {
             client_id: "client-one".to_string(),
             filter: "devices/one".to_string(),
+            match_filter: "devices/one".to_string(),
+            shared_group: None,
             options: SubscriptionOptions::default(),
             subscription_identifier: None,
         },
         SubscriptionEntry {
             client_id: "client-two".to_string(),
             filter: "devices/two".to_string(),
+            match_filter: "devices/two".to_string(),
+            shared_group: None,
             options: SubscriptionOptions::default(),
             subscription_identifier: None,
         },
@@ -784,6 +788,173 @@ async fn subscription_identifier_is_forwarded_on_matching_publish() -> rs_netty:
 }
 
 #[tokio::test]
+async fn publish_properties_are_forwarded() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.connect("subscriber").await?;
+    subscriber
+        .subscribe(1, "devices/properties", QoS::AtMostOnce)
+        .await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish_with_properties(
+            "devices/properties",
+            QoS::AtMostOnce,
+            None,
+            "props",
+            vec![
+                MqttProperty::UserProperty("trace".to_string(), "abc".to_string()),
+                MqttProperty::ResponseTopic("devices/reply".to_string()),
+                MqttProperty::CorrelationData(Bytes::from_static(b"corr")),
+            ],
+        ))
+        .await?;
+
+    let packet = subscriber
+        .expect_publish("expected forwarded properties")
+        .await?;
+    assert!(packet.properties.contains(&MqttProperty::UserProperty(
+        "trace".to_string(),
+        "abc".to_string()
+    )));
+    assert!(
+        packet
+            .properties
+            .contains(&MqttProperty::ResponseTopic("devices/reply".to_string()))
+    );
+    assert!(
+        packet
+            .properties
+            .contains(&MqttProperty::CorrelationData(Bytes::from_static(b"corr")))
+    );
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn topic_alias_resolves_subsequent_empty_topic_publish() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.connect("subscriber").await?;
+    subscriber
+        .subscribe(1, "devices/alias", QoS::AtMostOnce)
+        .await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish_with_properties(
+            "devices/alias",
+            QoS::AtMostOnce,
+            None,
+            "first",
+            vec![MqttProperty::TopicAlias(1)],
+        ))
+        .await?;
+    let first = subscriber.expect_publish("expected aliased seed").await?;
+    assert_eq!(first.payload, Bytes::from_static(b"first"));
+
+    publisher
+        .write(publish_with_properties(
+            "",
+            QoS::AtMostOnce,
+            None,
+            "second",
+            vec![MqttProperty::TopicAlias(1)],
+        ))
+        .await?;
+    let second = subscriber
+        .expect_publish("expected resolved topic alias")
+        .await?;
+    assert_eq!(second.topic_name, "devices/alias");
+    assert_eq!(second.payload, Bytes::from_static(b"second"));
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn invalid_topic_alias_disconnects_with_reason_string() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish_with_properties(
+            "",
+            QoS::AtMostOnce,
+            None,
+            "invalid",
+            vec![MqttProperty::TopicAlias(1)],
+        ))
+        .await?;
+    publisher
+        .expect_disconnect_reason_string(protocol::TOPIC_ALIAS_INVALID, "topic alias invalid")
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn shared_subscription_round_robins_online_group_members() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut first = broker.connect("shared-a").await?;
+    let mut second = broker.connect("shared-b").await?;
+    first
+        .subscribe(1, "$share/group/devices/shared", QoS::AtMostOnce)
+        .await?;
+    second
+        .subscribe(1, "$share/group/devices/shared", QoS::AtMostOnce)
+        .await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish("devices/shared", QoS::AtMostOnce, None, "one"))
+        .await?;
+    publisher
+        .write(publish("devices/shared", QoS::AtMostOnce, None, "two"))
+        .await?;
+
+    let first_packet = first
+        .expect_publish("expected first shared publish")
+        .await?;
+    let second_packet = second
+        .expect_publish("expected second shared publish")
+        .await?;
+    assert_eq!(first_packet.payload, Bytes::from_static(b"one"));
+    assert_eq!(second_packet.payload, Bytes::from_static(b"two"));
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn subscription_quota_returns_quota_exceeded() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut client = broker.connect("subscriber").await?;
+
+    for index in 0..protocol::MAX_SUBSCRIPTIONS_PER_CLIENT {
+        client
+            .write(subscribe(
+                (index + 1) as u16,
+                &format!("devices/quota/{index}"),
+                QoS::AtMostOnce,
+            ))
+            .await?;
+        assert!(matches!(
+            client.read().await?,
+            MqttPacket::SubAck(packet) if packet.reason_codes == vec![protocol::QOS_0_GRANTED]
+        ));
+    }
+
+    client
+        .write(subscribe(65_000, "devices/quota/overflow", QoS::AtMostOnce))
+        .await?;
+    assert!(matches!(
+        client.read().await?,
+        MqttPacket::SubAck(packet)
+            if packet.reason_codes == vec![protocol::QUOTA_EXCEEDED]
+                && packet.properties.contains(&MqttProperty::ReasonString("quota exceeded".to_string()))
+    ));
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
 async fn offline_queue_limit_drops_new_messages_after_capacity() -> rs_netty::Result<()> {
     let broker = TestBroker::start().await?;
     let mut subscriber = broker.open_client().await?;
@@ -1297,7 +1468,8 @@ async fn qos2_publish_completes_both_handshakes() -> rs_netty::Result<()> {
 }
 
 #[tokio::test]
-async fn qos2_duplicate_packet_id_is_rejected_without_replacing_original() -> rs_netty::Result<()> {
+async fn qos2_duplicate_packet_id_is_acknowledged_without_replacing_original()
+-> rs_netty::Result<()> {
     let broker = TestBroker::start().await?;
     let mut subscriber = broker.connect("subscriber").await?;
     subscriber
@@ -1312,9 +1484,7 @@ async fn qos2_duplicate_packet_id_is_rejected_without_replacing_original() -> rs
     publisher
         .write(publish("devices/dup", QoS::ExactlyOnce, Some(9), "second"))
         .await?;
-    publisher
-        .expect_pubrec_reason(9, protocol::PACKET_IDENTIFIER_IN_USE)
-        .await?;
+    publisher.expect_pubrec(9).await?;
     publisher
         .write(MqttPacket::PubRel(AckPacket::new(9, protocol::SUCCESS)))
         .await?;
@@ -1638,6 +1808,20 @@ impl TestClient {
         Ok(())
     }
 
+    async fn expect_disconnect_reason_string(
+        &mut self,
+        reason_code: u8,
+        reason_string: &str,
+    ) -> rs_netty::Result<()> {
+        assert!(matches!(
+            self.read().await?,
+            MqttPacket::Disconnect(packet)
+                if packet.reason_code == reason_code
+                    && packet.properties.contains(&MqttProperty::ReasonString(reason_string.to_string()))
+        ));
+        Ok(())
+    }
+
     async fn expect_publish(&mut self, message: &str) -> rs_netty::Result<PublishPacket> {
         let delivered = self.read().await?;
         let MqttPacket::Publish(packet) = delivered else {
@@ -1912,6 +2096,24 @@ fn publish_with_message_expiry(
         topic_name: topic_name.to_string(),
         packet_id,
         properties: vec![MqttProperty::MessageExpiryInterval(expiry_interval)],
+        payload: Bytes::copy_from_slice(payload.as_bytes()),
+    })
+}
+
+fn publish_with_properties(
+    topic_name: &str,
+    qos: QoS,
+    packet_id: Option<u16>,
+    payload: &str,
+    properties: Vec<MqttProperty>,
+) -> MqttPacket {
+    MqttPacket::Publish(PublishPacket {
+        dup: false,
+        qos,
+        retain: false,
+        topic_name: topic_name.to_string(),
+        packet_id,
+        properties,
         payload: Bytes::copy_from_slice(payload.as_bytes()),
     })
 }

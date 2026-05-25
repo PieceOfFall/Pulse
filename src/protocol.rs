@@ -15,11 +15,15 @@ pub const TOPIC_NAME_INVALID: u8 = 0x90;
 pub const PACKET_IDENTIFIER_IN_USE: u8 = 0x91;
 pub const PACKET_IDENTIFIER_NOT_FOUND: u8 = 0x92;
 pub const RECEIVE_MAXIMUM_EXCEEDED: u8 = 0x93;
+pub const TOPIC_ALIAS_INVALID: u8 = 0x94;
 pub const PACKET_TOO_LARGE: u8 = 0x95;
+pub const QUOTA_EXCEEDED: u8 = 0x97;
 pub const PAYLOAD_FORMAT_INVALID: u8 = 0x99;
 
 pub const SERVER_RECEIVE_MAXIMUM: u16 = 1024;
 pub const SERVER_MAXIMUM_PACKET_SIZE: u32 = 16 * 1024 * 1024;
+pub const SERVER_TOPIC_ALIAS_MAXIMUM: u16 = 1024;
+pub const MAX_SUBSCRIPTIONS_PER_CLIENT: usize = 1024;
 
 pub fn granted_qos_code(qos: QoS) -> u8 {
     match qos {
@@ -34,6 +38,14 @@ pub fn is_valid_topic_name(topic: &str) -> bool {
 }
 
 pub fn is_valid_topic_filter(filter: &str) -> bool {
+    let filter = if filter.starts_with("$share/") {
+        let Some(filter) = shared_subscription_filter(filter) else {
+            return false;
+        };
+        filter
+    } else {
+        filter
+    };
     if filter.is_empty() {
         return false;
     }
@@ -52,6 +64,7 @@ pub fn is_valid_topic_filter(filter: &str) -> bool {
 }
 
 pub fn topic_matches(filter: &str, topic: &str) -> bool {
+    let filter = shared_subscription_filter(filter).unwrap_or(filter);
     if !is_valid_topic_filter(filter) || !is_valid_topic_name(topic) {
         return false;
     }
@@ -82,6 +95,24 @@ pub fn topic_matches(filter: &str, topic: &str) -> bool {
     topic_levels.next().is_none()
 }
 
+pub fn shared_subscription_filter(filter: &str) -> Option<&str> {
+    let rest = filter.strip_prefix("$share/")?;
+    let (group, topic_filter) = rest.split_once('/')?;
+    if group.is_empty() || topic_filter.is_empty() {
+        return None;
+    }
+    Some(topic_filter)
+}
+
+pub fn shared_subscription_group(filter: &str) -> Option<&str> {
+    let rest = filter.strip_prefix("$share/")?;
+    let (group, topic_filter) = rest.split_once('/')?;
+    if group.is_empty() || topic_filter.is_empty() {
+        return None;
+    }
+    Some(group)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{is_valid_topic_filter, topic_matches};
@@ -90,10 +121,13 @@ mod tests {
     fn validates_topic_filters() {
         assert!(is_valid_topic_filter("sensors/+/temperature"));
         assert!(is_valid_topic_filter("devices/#"));
+        assert!(is_valid_topic_filter("$share/group/devices/+"));
         assert!(is_valid_topic_filter("#"));
         assert!(!is_valid_topic_filter("devices/#/state"));
         assert!(!is_valid_topic_filter("devices/foo#"));
         assert!(!is_valid_topic_filter("devices/+foo"));
+        assert!(!is_valid_topic_filter("$share//devices/+"));
+        assert!(!is_valid_topic_filter("$share/group/"));
     }
 
     #[test]
@@ -105,6 +139,7 @@ mod tests {
         assert!(topic_matches("devices/#", "devices/a/state"));
         assert!(topic_matches("devices/#", "devices"));
         assert!(topic_matches("$SYS/#", "$SYS/broker/uptime"));
+        assert!(topic_matches("$share/group/devices/+", "devices/a"));
         assert!(!topic_matches("#", "$SYS/broker/uptime"));
         assert!(!topic_matches("+/broker/uptime", "$SYS/broker/uptime"));
         assert!(!topic_matches(
