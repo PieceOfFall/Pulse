@@ -1,24 +1,21 @@
 mod delivery;
 mod handler;
 mod life;
+mod state;
 
 #[cfg(test)]
 mod tests;
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{SystemTime, UNIX_EPOCH},
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
 };
 
 use rs_netty::{
     Channel, CloseReason,
     codec::{
-        MqttPacket, MqttProperty, PublishPacket, QoS, SubAckPacket, SubscribePacket, Subscription,
-        UnsubAckPacket, UnsubscribePacket, Will,
+        MqttPacket, PublishPacket, SubAckPacket, SubscribePacket, UnsubAckPacket,
+        UnsubscribePacket, Will,
     },
 };
 
@@ -30,6 +27,9 @@ use crate::protocol;
 use self::delivery::{
     Delivery, deliveries_for_publish, flush_deliveries, retained_for_subscription,
 };
+use self::state::{
+    BrokerState, ClientEntry, SessionEntry, now_ms, retain_publish, upsert_subscription,
+};
 
 #[derive(Clone)]
 pub struct Broker {
@@ -39,98 +39,6 @@ pub struct Broker {
 struct BrokerInner {
     next_generated_client_id: AtomicU64,
     state: Mutex<BrokerState>,
-}
-
-#[derive(Default)]
-struct BrokerState {
-    clients_by_connection: HashMap<u64, ClientEntry>,
-    connection_by_client_id: HashMap<String, u64>,
-    sessions_by_client_id: HashMap<String, SessionEntry>,
-    subscriptions: Vec<SubscriptionEntry>,
-    retained: HashMap<String, RetainedMessage>,
-    qos2_inflight: HashMap<(u64, u16), PublishPacket>,
-}
-
-impl BrokerState {
-    fn expire_sessions(&mut self, now_ms: u64) {
-        let expired: Vec<String> = self
-            .sessions_by_client_id
-            .iter()
-            .filter_map(|(client_id, session)| {
-                if session
-                    .expires_at_ms
-                    .is_some_and(|expires_at| expires_at <= now_ms)
-                    && !self.connection_by_client_id.contains_key(client_id)
-                {
-                    Some(client_id.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        for client_id in expired {
-            self.sessions_by_client_id.remove(&client_id);
-            self.subscriptions
-                .retain(|subscription| subscription.client_id != client_id);
-        }
-    }
-
-    fn remove_connection_state(
-        &mut self,
-        connection_id: u64,
-        preserve_session: bool,
-    ) -> Option<ClientEntry> {
-        let client = self.clients_by_connection.remove(&connection_id)?;
-        self.qos2_inflight
-            .retain(|(conn_id, _), _| *conn_id != connection_id);
-        if !preserve_session && client.session_expiry_interval == 0 {
-            self.sessions_by_client_id.remove(&client.client_id);
-            self.subscriptions
-                .retain(|sub| sub.client_id != client.client_id);
-        } else if !preserve_session {
-            let expires_at_ms = session_expires_at_ms(client.session_expiry_interval);
-            self.sessions_by_client_id.insert(
-                client.client_id.clone(),
-                SessionEntry {
-                    expires_at_ms,
-                    _expiry_interval: client.session_expiry_interval,
-                },
-            );
-        }
-        Some(client)
-    }
-}
-
-struct SessionEntry {
-    expires_at_ms: Option<u64>,
-    _expiry_interval: u32,
-}
-
-struct ClientEntry {
-    client_id: String,
-    channel: Channel<MqttPacket>,
-    will: Option<Will>,
-    session_expiry_interval: u32,
-    next_packet_id: u16,
-    outbound_qos1: HashSet<u16>,
-    outbound_qos2_publish: HashSet<u16>,
-    outbound_qos2_pubrel: HashSet<u16>,
-}
-
-#[derive(Clone)]
-struct SubscriptionEntry {
-    client_id: String,
-    filter: String,
-    options: rs_netty::codec::SubscriptionOptions,
-}
-
-#[derive(Clone)]
-struct RetainedMessage {
-    qos: QoS,
-    topic_name: String,
-    properties: Vec<MqttProperty>,
-    payload: bytes::Bytes,
 }
 
 impl Broker {
@@ -190,23 +98,11 @@ impl Broker {
 
         state.sessions_by_client_id.insert(
             client_id.clone(),
-            SessionEntry {
-                expires_at_ms: None,
-                _expiry_interval: session_expiry_interval,
-            },
+            SessionEntry::connected(session_expiry_interval),
         );
         state.clients_by_connection.insert(
             connection_id,
-            ClientEntry {
-                client_id: client_id.clone(),
-                channel,
-                will,
-                session_expiry_interval,
-                next_packet_id: 1,
-                outbound_qos1: HashSet::new(),
-                outbound_qos2_publish: HashSet::new(),
-                outbound_qos2_pubrel: HashSet::new(),
-            },
+            ClientEntry::new(client_id.clone(), channel, will, session_expiry_interval),
         );
 
         ConnectOutcome {
@@ -380,64 +276,6 @@ struct ConnectOutcome {
     client_id: String,
     session_present: bool,
     replaced_channel: Option<Channel<MqttPacket>>,
-}
-
-fn retain_publish(state: &mut BrokerState, packet: &PublishPacket) {
-    if !packet.retain {
-        return;
-    }
-
-    if packet.payload.is_empty() {
-        state.retained.remove(&packet.topic_name);
-    } else {
-        state.retained.insert(
-            packet.topic_name.clone(),
-            RetainedMessage {
-                qos: packet.qos,
-                topic_name: packet.topic_name.clone(),
-                properties: packet.properties.clone(),
-                payload: packet.payload.clone(),
-            },
-        );
-    }
-}
-
-fn upsert_subscription(
-    subscriptions: &mut Vec<SubscriptionEntry>,
-    client_id: &str,
-    subscription: Subscription,
-) -> usize {
-    if let Some(index) = subscriptions
-        .iter_mut()
-        .position(|sub| sub.client_id == client_id && sub.filter == subscription.topic_filter)
-    {
-        subscriptions[index].options = subscription.options;
-        return index;
-    }
-
-    subscriptions.push(SubscriptionEntry {
-        client_id: client_id.to_string(),
-        filter: subscription.topic_filter,
-        options: subscription.options,
-    });
-    subscriptions.len() - 1
-}
-
-fn session_expires_at_ms(session_expiry_interval: u32) -> Option<u64> {
-    if session_expiry_interval == u32::MAX {
-        None
-    } else {
-        Some(now_ms().saturating_add(u64::from(session_expiry_interval) * 1_000))
-    }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
 }
 
 fn should_publish_will(reason: CloseReason) -> bool {

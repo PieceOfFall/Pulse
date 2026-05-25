@@ -5,7 +5,7 @@ use rs_netty::{
 
 use crate::protocol;
 
-use super::{BrokerState, ClientEntry, RetainedMessage, SubscriptionEntry};
+use super::state::{BrokerState, ClientEntry, RetainedMessage, SubscriptionEntry};
 
 #[derive(Clone)]
 pub(super) struct Delivery {

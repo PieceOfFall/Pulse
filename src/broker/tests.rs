@@ -15,7 +15,10 @@ use tokio::{
     net::TcpStream,
 };
 
-use super::{Broker, BrokerLife, MqttHandler, SubscriptionEntry, protocol, upsert_subscription};
+use super::{
+    Broker, BrokerLife, MqttHandler, protocol,
+    state::{SubscriptionEntry, upsert_subscription},
+};
 
 #[tokio::test]
 async fn duplicate_client_id_closes_previous_connection() -> rs_netty::Result<()> {
