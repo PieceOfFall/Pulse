@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::broker::runtime::config::BrokerConfig;
 
-const CONFIG_FILE_NAME: &str = "broker.toml";
+const CONFIG_FILE_NAME: &str = "Broker.toml";
 
 #[derive(Clone, Debug)]
 pub(crate) struct AppConfig {
