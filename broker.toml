@@ -1,0 +1,54 @@
+# mqtt-rs broker example configuration.
+# Values shown here match the built-in defaults unless noted otherwise.
+
+[server]
+# Broker TCP listen address. Use 127.0.0.1:1883 for local-only access.
+bind = "0.0.0.0:1883"
+
+# Per-connection outbound channel capacity used by the TCP server.
+# Must be greater than 0.
+outbound_queue_size = 1024
+
+[storage]
+# Optional SQLite database path for persistent sessions, subscriptions,
+# retained messages, outbound inflight packets, and offline queues.
+# Leave commented to use in-memory storage.
+# sqlite = "broker.db"
+
+# Optional MySQL connection URL for persistent broker state.
+# Do not set both sqlite and mysql at the same time.
+# mysql = "mysql://user:password@localhost:3306/mqtt"
+
+[limits]
+# Maximum number of QoS 1/2 packets the server allows in-flight per client.
+# Sent to clients in CONNACK as Receive Maximum. Must be greater than 0.
+server_receive_maximum = 1024
+
+# Maximum MQTT packet size accepted by the server, in bytes.
+# Sent to clients in CONNACK as Maximum Packet Size. Must be greater than 0.
+server_maximum_packet_size = 16777216
+
+# Maximum topic aliases the server accepts from each client.
+# Sent to clients in CONNACK as Topic Alias Maximum.
+server_topic_alias_maximum = 1024
+
+# Maximum stored subscriptions allowed for one client.
+max_subscriptions_per_client = 1024
+
+# Maximum queued QoS 1/2 offline messages retained per persistent session.
+max_offline_queue_len = 1024
+
+# Maximum number of retained messages stored by the broker.
+max_retained_messages = 1024
+
+# Maximum total retained payload bytes stored by the broker.
+max_retained_payload_bytes = 16777216
+
+[observability]
+# Tracing log filter. Examples: "info", "debug", "mqtt_rs=debug,rs_netty=info".
+# If omitted, MQTT_RS_LOG or RUST_LOG can also provide the filter.
+# log = "info"
+
+# Optional Prometheus metrics HTTP listener bind address.
+# Leave commented to disable the metrics exporter.
+# metrics_bind = "127.0.0.1:9000"

@@ -14,7 +14,7 @@ pub use runtime::connection::{BrokerLife, MqttHandler};
 
 use self::runtime::config::BrokerConfig;
 use self::runtime::session_registry::BrokerState;
-use self::storage::{BrokerStorage, InMemoryStorage, SqliteStorage};
+use self::storage::{BrokerStorage, InMemoryStorage, MysqlStorage, SqliteStorage};
 
 #[derive(Clone)]
 pub struct Broker {
@@ -48,6 +48,13 @@ impl Broker {
     ) -> rusqlite::Result<Self> {
         Ok(Self::with_storage(
             Arc::new(SqliteStorage::open(path)?),
+            config,
+        ))
+    }
+
+    pub(crate) fn with_mysql_and_config(url: &str, config: BrokerConfig) -> mysql::Result<Self> {
+        Ok(Self::with_storage(
+            Arc::new(MysqlStorage::open(url)?),
             config,
         ))
     }

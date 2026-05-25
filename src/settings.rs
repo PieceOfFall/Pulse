@@ -29,6 +29,7 @@ pub(crate) struct ServerConfig {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct StorageConfig {
     pub(crate) sqlite: Option<String>,
+    pub(crate) mysql: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -54,6 +55,7 @@ struct ServerFileConfig {
 #[derive(Default, Deserialize)]
 struct StorageFileConfig {
     sqlite: Option<String>,
+    mysql: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -140,6 +142,7 @@ impl AppConfig {
         });
         self.apply_storage(StorageFileConfig {
             sqlite: env_string("MQTT_RS_SQLITE"),
+            mysql: env_string("MQTT_RS_MYSQL"),
         });
         self.apply_limits(LimitsFileConfig {
             server_receive_maximum: env_parse("MQTT_RS_SERVER_RECEIVE_MAXIMUM")?,
@@ -176,6 +179,9 @@ impl AppConfig {
     fn apply_storage(&mut self, storage: StorageFileConfig) {
         if let Some(sqlite) = storage.sqlite {
             self.storage.sqlite = Some(sqlite);
+        }
+        if let Some(mysql) = storage.mysql {
+            self.storage.mysql = Some(mysql);
         }
     }
 
@@ -221,6 +227,9 @@ impl AppConfig {
         }
         if self.limits.server_maximum_packet_size == 0 {
             return Err("limits.server_maximum_packet_size must be greater than 0".into());
+        }
+        if self.storage.sqlite.is_some() && self.storage.mysql.is_some() {
+            return Err("storage.sqlite and storage.mysql are mutually exclusive".into());
         }
         Ok(())
     }
@@ -273,6 +282,7 @@ fn parse_cli(
             "-c" | "--config" => config.config_path = Some(next_path(&mut args, arg.as_ref())?),
             "--bind" => config.server.bind = Some(next_string(&mut args, arg.as_ref())?),
             "--sqlite" => config.storage.sqlite = Some(next_string(&mut args, arg.as_ref())?),
+            "--mysql" => config.storage.mysql = Some(next_string(&mut args, arg.as_ref())?),
             "--outbound-queue-size" => {
                 config.server.outbound_queue_size = Some(next_parse(&mut args, arg.as_ref())?)
             }
@@ -409,5 +419,25 @@ mod tests {
         let error = AppConfig::load_from_args(args).expect_err("invalid config");
 
         assert!(error.to_string().contains("limits.server_receive_maximum"));
+    }
+
+    #[test]
+    fn rejects_multiple_storage_backends() {
+        let args = [
+            "mqtt-rs",
+            "--sqlite",
+            "broker.db",
+            "--mysql",
+            "mysql://user:password@localhost/mqtt",
+        ]
+        .into_iter()
+        .map(OsString::from);
+        let error = AppConfig::load_from_args(args).expect_err("invalid config");
+
+        assert!(
+            error
+                .to_string()
+                .contains("storage.sqlite and storage.mysql")
+        );
     }
 }

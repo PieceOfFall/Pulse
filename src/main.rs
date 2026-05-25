@@ -15,7 +15,10 @@ async fn main() -> Result<()> {
     observability::init(&config.observability)
         .map_err(|error| Error::Pipeline(format!("initialize observability: {error}")))?;
 
-    let broker = if let Some(path) = &config.storage.sqlite {
+    let broker = if let Some(url) = &config.storage.mysql {
+        Broker::with_mysql_and_config(url, config.limits)
+            .map_err(|error| Error::Pipeline(format!("open mysql storage: {error}")))?
+    } else if let Some(path) = &config.storage.sqlite {
         Broker::with_sqlite_and_config(path, config.limits)
             .map_err(|error| Error::Pipeline(format!("open sqlite storage: {error}")))?
     } else {
