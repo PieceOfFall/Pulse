@@ -90,7 +90,7 @@ items are marked with `[x]`.
 
 ## 6. Reliability And Backpressure
 
-- [ ] Add per-client offline queues for persistent sessions.
+- [x] Add per-client offline queues for persistent sessions.
 - [ ] Add queue limits and slow-consumer policy.
 - [ ] Add retained message limits.
 - [ ] Add inflight retransmission timers for QoS 1/2.
@@ -102,9 +102,9 @@ items are marked with `[x]`.
 - [x] Define storage traits for sessions, subscriptions, retained messages, and inflight messages.
 - [x] Implement an in-memory storage backend as the default.
 - [x] Add an optional durable backend for sessions, subscriptions, and retained messages.
-- [ ] Persist QoS inflight and offline queue state in the durable backend.
+- [x] Persist QoS inflight and offline queue state in the durable backend.
 - [x] Add restart recovery tests for retained messages.
-- [ ] Add restart recovery tests for persistent sessions after durable offline queues are implemented.
+- [x] Add restart recovery tests for persistent sessions after durable offline queues are implemented.
 
 ## 8. Operations
 

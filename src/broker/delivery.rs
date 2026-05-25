@@ -34,22 +34,29 @@ pub(super) fn deliveries_for_publish(
 
     matches
         .into_iter()
-        .filter_map(|sub| {
-            let connection_id = state.connection_by_client_id.get(&sub.client_id)?;
-            let channel = state
-                .clients_by_connection
-                .get(connection_id)?
-                .channel
-                .clone();
-            let session = state.sessions_by_client_id.get_mut(&sub.client_id)?;
-            Some(delivery_for_client(
-                session,
-                channel,
-                packet,
-                sub.options.maximum_qos,
-                sub.options.retain_as_published && packet.retain,
-            ))
-        })
+        .filter_map(
+            |sub| match state.connection_by_client_id.get(&sub.client_id) {
+                Some(connection_id) => {
+                    let channel = state
+                        .clients_by_connection
+                        .get(connection_id)?
+                        .channel
+                        .clone();
+                    let session = state.sessions_by_client_id.get_mut(&sub.client_id)?;
+                    Some(delivery_for_client(
+                        session,
+                        channel,
+                        packet,
+                        sub.options.maximum_qos,
+                        sub.options.retain_as_published && packet.retain,
+                    ))
+                }
+                None => {
+                    queue_offline_publish(state, &sub, packet);
+                    None
+                }
+            },
+        )
         .collect()
 }
 
@@ -111,11 +118,11 @@ pub(super) fn redeliveries_for_client(state: &mut BrokerState, client_id: &str) 
     else {
         return Vec::new();
     };
-    let Some(session) = state.sessions_by_client_id.get(client_id) else {
+    let Some(session) = state.sessions_by_client_id.get_mut(client_id) else {
         return Vec::new();
     };
 
-    session
+    let mut redeliveries: Vec<Delivery> = session
         .outbound_qos1
         .iter()
         .chain(session.outbound_qos2_publish.iter())
@@ -128,7 +135,19 @@ pub(super) fn redeliveries_for_client(state: &mut BrokerState, client_id: &str) 
                 packet: MqttPacket::Publish(packet),
             }
         })
-        .collect()
+        .collect();
+
+    while let Some(packet) = session.offline_queue.pop_front() {
+        redeliveries.push(delivery_for_client(
+            session,
+            channel.clone(),
+            &packet,
+            packet.qos,
+            packet.retain,
+        ));
+    }
+
+    redeliveries
 }
 
 fn delivery_for_client(
@@ -181,6 +200,32 @@ fn pending_publish(
         properties: packet.properties.clone(),
         payload: packet.payload.clone(),
     }
+}
+
+fn queue_offline_publish(
+    state: &mut BrokerState,
+    subscription: &SubscriptionEntry,
+    packet: &PublishPacket,
+) {
+    let Some(session) = state.sessions_by_client_id.get_mut(&subscription.client_id) else {
+        return;
+    };
+    if session.session_expiry_interval == 0 {
+        return;
+    }
+
+    let qos = effective_qos(packet.qos, subscription.options.maximum_qos);
+    if qos == QoS::AtMostOnce {
+        return;
+    }
+
+    session.offline_queue.push_back(pending_publish(
+        packet,
+        qos,
+        subscription.options.retain_as_published && packet.retain,
+        None,
+        false,
+    ));
 }
 
 fn effective_qos(publish_qos: QoS, maximum_qos: QoS) -> QoS {

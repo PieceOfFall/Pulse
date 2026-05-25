@@ -532,6 +532,133 @@ async fn clean_start_does_not_redeliver_outbound_inflight() -> rs_netty::Result<
 }
 
 #[tokio::test]
+async fn persistent_session_queues_qos1_messages_while_offline() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", true, 60))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+    subscriber
+        .subscribe(1, "devices/offline", QoS::AtLeastOnce)
+        .await?;
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish(
+            "devices/offline",
+            QoS::AtLeastOnce,
+            Some(7),
+            "queued",
+        ))
+        .await?;
+    publisher.expect_puback(7).await?;
+
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", false, 60))
+        .await?;
+    subscriber.expect_connack_session_present(true).await?;
+    let packet = subscriber
+        .expect_publish("expected queued qos1 publish")
+        .await?;
+    assert!(!packet.dup);
+    assert_eq!(packet.qos, QoS::AtLeastOnce);
+    assert_eq!(packet.packet_id, Some(1));
+    assert_eq!(packet.payload, Bytes::from_static(b"queued"));
+    subscriber
+        .write(MqttPacket::PubAck(AckPacket::new(1, protocol::SUCCESS)))
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn persistent_session_queues_qos2_messages_while_offline() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", true, 60))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+    subscriber
+        .subscribe(1, "devices/offline", QoS::ExactlyOnce)
+        .await?;
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish(
+            "devices/offline",
+            QoS::ExactlyOnce,
+            Some(9),
+            "queued",
+        ))
+        .await?;
+    publisher.expect_pubrec(9).await?;
+    publisher
+        .write(MqttPacket::PubRel(AckPacket::new(9, protocol::SUCCESS)))
+        .await?;
+    publisher.expect_pubcomp(9).await?;
+
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", false, 60))
+        .await?;
+    subscriber.expect_connack_session_present(true).await?;
+    let packet = subscriber
+        .expect_publish("expected queued qos2 publish")
+        .await?;
+    assert!(!packet.dup);
+    assert_eq!(packet.qos, QoS::ExactlyOnce);
+    assert_eq!(packet.packet_id, Some(1));
+    assert_eq!(packet.payload, Bytes::from_static(b"queued"));
+    subscriber
+        .write(MqttPacket::PubRec(AckPacket::new(1, protocol::SUCCESS)))
+        .await?;
+    subscriber.expect_pubrel(1).await?;
+    subscriber
+        .write(MqttPacket::PubComp(AckPacket::new(1, protocol::SUCCESS)))
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn persistent_session_does_not_queue_qos0_messages_while_offline() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", true, 60))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+    subscriber
+        .subscribe(1, "devices/offline", QoS::AtMostOnce)
+        .await?;
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish("devices/offline", QoS::AtMostOnce, None, "dropped"))
+        .await?;
+
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", false, 60))
+        .await?;
+    subscriber.expect_connack_session_present(true).await?;
+    subscriber
+        .expect_no_packet(Duration::from_millis(200))
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
 async fn sqlite_broker_recovers_retained_messages_after_restart() -> rs_netty::Result<()> {
     let path = temp_sqlite_path("retained-restart");
     let _ = std::fs::remove_file(&path);
@@ -564,6 +691,110 @@ async fn sqlite_broker_recovers_retained_messages_after_restart() -> rs_netty::R
     assert_eq!(packet.qos, QoS::AtMostOnce);
     assert!(packet.retain);
     assert_eq!(packet.payload, Bytes::from_static(b"durable"));
+
+    broker.shutdown().await?;
+    cleanup_sqlite_path(&path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_broker_recovers_offline_queue_after_restart() -> rs_netty::Result<()> {
+    let path = temp_sqlite_path("offline-restart");
+    cleanup_sqlite_path(&path);
+
+    let broker =
+        TestBroker::start_with_broker(Broker::with_sqlite(&path).expect("sqlite broker")).await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", true, 60))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+    subscriber
+        .subscribe(1, "devices/sqlite-offline", QoS::AtLeastOnce)
+        .await?;
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish(
+            "devices/sqlite-offline",
+            QoS::AtLeastOnce,
+            Some(4),
+            "durable-offline",
+        ))
+        .await?;
+    publisher.expect_puback(4).await?;
+    broker.shutdown().await?;
+
+    let broker =
+        TestBroker::start_with_broker(Broker::with_sqlite(&path).expect("sqlite broker")).await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", false, 60))
+        .await?;
+    subscriber.expect_connack_session_present(true).await?;
+    let packet = subscriber
+        .expect_publish("expected recovered offline publish")
+        .await?;
+    assert!(!packet.dup);
+    assert_eq!(packet.qos, QoS::AtLeastOnce);
+    assert_eq!(packet.packet_id, Some(1));
+    assert_eq!(packet.payload, Bytes::from_static(b"durable-offline"));
+
+    broker.shutdown().await?;
+    cleanup_sqlite_path(&path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_broker_recovers_outbound_inflight_after_restart() -> rs_netty::Result<()> {
+    let path = temp_sqlite_path("inflight-restart");
+    cleanup_sqlite_path(&path);
+
+    let broker =
+        TestBroker::start_with_broker(Broker::with_sqlite(&path).expect("sqlite broker")).await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", true, 60))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+    subscriber
+        .subscribe(1, "devices/sqlite-inflight", QoS::AtLeastOnce)
+        .await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish(
+            "devices/sqlite-inflight",
+            QoS::AtLeastOnce,
+            Some(5),
+            "durable-inflight",
+        ))
+        .await?;
+    publisher.expect_puback(5).await?;
+    let packet = subscriber
+        .expect_publish("expected first sqlite inflight publish")
+        .await?;
+    assert_eq!(packet.packet_id, Some(1));
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+    broker.shutdown().await?;
+
+    let broker =
+        TestBroker::start_with_broker(Broker::with_sqlite(&path).expect("sqlite broker")).await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", false, 60))
+        .await?;
+    subscriber.expect_connack_session_present(true).await?;
+    let packet = subscriber
+        .expect_publish("expected recovered inflight publish")
+        .await?;
+    assert!(packet.dup);
+    assert_eq!(packet.qos, QoS::AtLeastOnce);
+    assert_eq!(packet.packet_id, Some(1));
+    assert_eq!(packet.payload, Bytes::from_static(b"durable-inflight"));
 
     broker.shutdown().await?;
     cleanup_sqlite_path(&path);

@@ -219,6 +219,7 @@ impl Broker {
 
     fn publish(&self, publisher_connection_id: u64, packet: &PublishPacket) -> Vec<Delivery> {
         self.with_state(|state| {
+            state.expire_sessions(now_ms());
             retain_publish(state, packet);
             deliveries_for_publish(state, publisher_connection_id, packet)
         })
@@ -245,6 +246,7 @@ impl Broker {
         self.with_state(|state| {
             let packet = state.qos2_inflight.remove(&(connection_id, packet_id))?;
 
+            state.expire_sessions(now_ms());
             retain_publish(state, &packet);
 
             Some(deliveries_for_publish(state, connection_id, &packet))

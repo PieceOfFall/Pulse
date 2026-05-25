@@ -55,7 +55,8 @@ fn migrate(connection: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS sessions (
             client_id TEXT PRIMARY KEY,
             session_expiry_interval INTEGER NOT NULL,
-            expires_at_ms INTEGER
+            expires_at_ms INTEGER,
+            next_packet_id INTEGER NOT NULL DEFAULT 1
         );
 
         CREATE TABLE IF NOT EXISTS subscriptions (
@@ -73,7 +74,37 @@ fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             topic_name TEXT PRIMARY KEY,
             packet BLOB NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS outbound_inflight (
+            client_id TEXT NOT NULL,
+            packet_id INTEGER NOT NULL,
+            qos INTEGER NOT NULL,
+            packet BLOB NOT NULL,
+            PRIMARY KEY (client_id, packet_id, qos),
+            FOREIGN KEY (client_id) REFERENCES sessions(client_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS outbound_pubrel (
+            client_id TEXT NOT NULL,
+            packet_id INTEGER NOT NULL,
+            PRIMARY KEY (client_id, packet_id),
+            FOREIGN KEY (client_id) REFERENCES sessions(client_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS offline_queue (
+            client_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            packet BLOB NOT NULL,
+            PRIMARY KEY (client_id, sequence),
+            FOREIGN KEY (client_id) REFERENCES sessions(client_id) ON DELETE CASCADE
+        );
         "#,
+    )?;
+    add_column_if_missing(
+        connection,
+        "sessions",
+        "next_packet_id",
+        "INTEGER NOT NULL DEFAULT 1",
     )
 }
 
@@ -82,28 +113,106 @@ fn load_state(connection: &Connection) -> rusqlite::Result<BrokerState> {
     load_sessions(connection, &mut state)?;
     load_subscriptions(connection, &mut state)?;
     load_retained(connection, &mut state)?;
+    load_outbound_inflight(connection, &mut state)?;
+    load_outbound_pubrel(connection, &mut state)?;
+    load_offline_queue(connection, &mut state)?;
     Ok(state)
 }
 
 fn load_sessions(connection: &Connection, state: &mut BrokerState) -> rusqlite::Result<()> {
-    let mut statement = connection
-        .prepare("SELECT client_id, session_expiry_interval, expires_at_ms FROM sessions")?;
+    let mut statement = connection.prepare(
+        "SELECT client_id, session_expiry_interval, expires_at_ms, next_packet_id FROM sessions",
+    )?;
     let rows = statement.query_map([], |row| {
         let client_id: String = row.get(0)?;
         let session_expiry_interval: u32 = row.get(1)?;
         let expires_at_ms: Option<i64> = row.get(2)?;
-        Ok((
-            client_id,
-            SessionEntry::disconnected(
-                session_expiry_interval,
-                expires_at_ms.map(|value| value as u64),
-            ),
-        ))
+        let next_packet_id: u16 = row.get(3)?;
+        let mut session = SessionEntry::disconnected(
+            session_expiry_interval,
+            expires_at_ms.map(|value| value as u64),
+        );
+        session.next_packet_id = next_packet_id;
+        Ok((client_id, session))
     })?;
 
     for row in rows {
         let (client_id, session) = row?;
         state.sessions_by_client_id.insert(client_id, session);
+    }
+    Ok(())
+}
+
+fn load_outbound_inflight(
+    connection: &Connection,
+    state: &mut BrokerState,
+) -> rusqlite::Result<()> {
+    let mut statement =
+        connection.prepare("SELECT client_id, packet_id, qos, packet FROM outbound_inflight")?;
+    let rows = statement.query_map([], |row| {
+        let client_id: String = row.get(0)?;
+        let packet_id: u16 = row.get(1)?;
+        let qos: u8 = row.get(2)?;
+        let packet: Vec<u8> = row.get(3)?;
+        Ok((client_id, packet_id, qos, packet))
+    })?;
+
+    for row in rows {
+        let (client_id, packet_id, qos, packet) = row?;
+        let Some(packet) = decode_publish(&packet) else {
+            continue;
+        };
+        let Some(session) = state.sessions_by_client_id.get_mut(&client_id) else {
+            continue;
+        };
+        match qos_from_u8(qos) {
+            QoS::AtLeastOnce => {
+                session.outbound_qos1.insert(packet_id, packet);
+            }
+            QoS::ExactlyOnce => {
+                session.outbound_qos2_publish.insert(packet_id, packet);
+            }
+            QoS::AtMostOnce => {}
+        }
+    }
+    Ok(())
+}
+
+fn load_outbound_pubrel(connection: &Connection, state: &mut BrokerState) -> rusqlite::Result<()> {
+    let mut statement = connection.prepare("SELECT client_id, packet_id FROM outbound_pubrel")?;
+    let rows = statement.query_map([], |row| {
+        let client_id: String = row.get(0)?;
+        let packet_id: u16 = row.get(1)?;
+        Ok((client_id, packet_id))
+    })?;
+
+    for row in rows {
+        let (client_id, packet_id) = row?;
+        if let Some(session) = state.sessions_by_client_id.get_mut(&client_id) {
+            session.outbound_qos2_pubrel.insert(packet_id);
+        }
+    }
+    Ok(())
+}
+
+fn load_offline_queue(connection: &Connection, state: &mut BrokerState) -> rusqlite::Result<()> {
+    let mut statement = connection
+        .prepare("SELECT client_id, packet FROM offline_queue ORDER BY client_id, sequence")?;
+    let rows = statement.query_map([], |row| {
+        let client_id: String = row.get(0)?;
+        let packet: Vec<u8> = row.get(1)?;
+        Ok((client_id, packet))
+    })?;
+
+    for row in rows {
+        let (client_id, packet) = row?;
+        let Some(mut packet) = decode_publish(&packet) else {
+            continue;
+        };
+        packet.packet_id = None;
+        if let Some(session) = state.sessions_by_client_id.get_mut(&client_id) {
+            session.offline_queue.push_back(packet);
+        }
     }
     Ok(())
 }
@@ -162,16 +271,20 @@ fn persist_state(
     transaction.execute("DELETE FROM subscriptions", [])?;
     transaction.execute("DELETE FROM sessions", [])?;
     transaction.execute("DELETE FROM retained_messages", [])?;
+    transaction.execute("DELETE FROM outbound_inflight", [])?;
+    transaction.execute("DELETE FROM outbound_pubrel", [])?;
+    transaction.execute("DELETE FROM offline_queue", [])?;
 
     {
         let mut statement = transaction.prepare(
-            "INSERT INTO sessions (client_id, session_expiry_interval, expires_at_ms) VALUES (?1, ?2, ?3)",
+            "INSERT INTO sessions (client_id, session_expiry_interval, expires_at_ms, next_packet_id) VALUES (?1, ?2, ?3, ?4)",
         )?;
         for (client_id, session) in &state.sessions_by_client_id {
             statement.execute(params![
                 client_id,
                 session.session_expiry_interval,
-                session.expires_at_ms.map(|value| value as i64)
+                session.expires_at_ms.map(|value| value as i64),
+                session.next_packet_id
             ])?;
         }
     }
@@ -209,7 +322,64 @@ fn persist_state(
         }
     }
 
+    {
+        let mut inflight = transaction.prepare(
+            "INSERT INTO outbound_inflight (client_id, packet_id, qos, packet) VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        let mut pubrel = transaction
+            .prepare("INSERT INTO outbound_pubrel (client_id, packet_id) VALUES (?1, ?2)")?;
+        let mut offline = transaction.prepare(
+            "INSERT INTO offline_queue (client_id, sequence, packet) VALUES (?1, ?2, ?3)",
+        )?;
+
+        for (client_id, session) in &state.sessions_by_client_id {
+            for (packet_id, packet) in &session.outbound_qos1 {
+                inflight.execute(params![
+                    client_id,
+                    packet_id,
+                    qos_to_u8(QoS::AtLeastOnce),
+                    encode_publish(packet)
+                ])?;
+            }
+            for (packet_id, packet) in &session.outbound_qos2_publish {
+                inflight.execute(params![
+                    client_id,
+                    packet_id,
+                    qos_to_u8(QoS::ExactlyOnce),
+                    encode_publish(packet)
+                ])?;
+            }
+            for packet_id in &session.outbound_qos2_pubrel {
+                pubrel.execute(params![client_id, packet_id])?;
+            }
+            for (sequence, packet) in session.offline_queue.iter().enumerate() {
+                offline.execute(params![client_id, sequence as i64, encode_publish(packet)])?;
+            }
+        }
+    }
+
     transaction.commit()
+}
+
+fn add_column_if_missing(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> rusqlite::Result<()> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for existing in columns {
+        if existing? == column {
+            return Ok(());
+        }
+    }
+
+    connection.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+        [],
+    )?;
+    Ok(())
 }
 
 fn encode_retained(message: &RetainedMessage) -> Vec<u8> {
@@ -237,6 +407,19 @@ fn encode_retained(message: &RetainedMessage) -> Vec<u8> {
     buffer.to_vec()
 }
 
+fn encode_publish(packet: &PublishPacket) -> Vec<u8> {
+    let mut codec = MqttCodec::new();
+    let mut buffer = BytesMut::new();
+    let mut packet = packet.clone();
+    if packet.qos != QoS::AtMostOnce && packet.packet_id.is_none() {
+        packet.packet_id = Some(1);
+    }
+    codec
+        .encode(MqttPacket::Publish(packet), &mut buffer)
+        .expect("encode publish");
+    buffer.to_vec()
+}
+
 fn decode_retained(packet: &[u8]) -> Option<RetainedMessage> {
     let mut codec = MqttCodec::new();
     let mut buffer = BytesMut::from(packet);
@@ -251,6 +434,16 @@ fn decode_retained(packet: &[u8]) -> Option<RetainedMessage> {
         properties: packet.properties,
         payload: Bytes::copy_from_slice(&packet.payload),
     })
+}
+
+fn decode_publish(packet: &[u8]) -> Option<PublishPacket> {
+    let mut codec = MqttCodec::new();
+    let mut buffer = BytesMut::from(packet);
+    let packet = codec.decode(&mut buffer).ok().flatten()?;
+    let MqttPacket::Publish(packet) = packet else {
+        return None;
+    };
+    Some(packet)
 }
 
 fn qos_to_u8(qos: QoS) -> u8 {
@@ -289,6 +482,32 @@ mod tests {
                 "client".to_string(),
                 SessionEntry::disconnected(60, Some(123)),
             );
+            let session = state
+                .sessions_by_client_id
+                .get_mut("client")
+                .expect("session");
+            session.next_packet_id = 7;
+            session.outbound_qos1.insert(
+                1,
+                PublishPacket {
+                    dup: false,
+                    qos: QoS::AtLeastOnce,
+                    retain: false,
+                    topic_name: "devices/inflight".to_string(),
+                    packet_id: Some(1),
+                    properties: Vec::new(),
+                    payload: Bytes::from_static(b"inflight"),
+                },
+            );
+            session.offline_queue.push_back(PublishPacket {
+                dup: false,
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                topic_name: "devices/offline".to_string(),
+                packet_id: None,
+                properties: Vec::new(),
+                payload: Bytes::from_static(b"offline"),
+            });
             state.subscriptions.push(SubscriptionEntry {
                 client_id: "client".to_string(),
                 filter: "devices/one".to_string(),
@@ -319,6 +538,12 @@ mod tests {
                 .expect("persisted session");
             assert_eq!(session.session_expiry_interval, 60);
             assert_eq!(session.expires_at_ms, Some(123));
+            assert_eq!(session.next_packet_id, 7);
+            let inflight = session.outbound_qos1.get(&1).expect("persisted inflight");
+            assert_eq!(inflight.payload, Bytes::from_static(b"inflight"));
+            let offline = session.offline_queue.front().expect("persisted offline");
+            assert_eq!(offline.payload, Bytes::from_static(b"offline"));
+            assert_eq!(offline.packet_id, None);
 
             let subscription = state
                 .subscriptions

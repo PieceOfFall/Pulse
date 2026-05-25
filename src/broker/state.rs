@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -80,6 +80,7 @@ pub(super) struct SessionEntry {
     pub(super) outbound_qos1: HashMap<u16, PublishPacket>,
     pub(super) outbound_qos2_publish: HashMap<u16, PublishPacket>,
     pub(super) outbound_qos2_pubrel: HashSet<u16>,
+    pub(super) offline_queue: VecDeque<PublishPacket>,
 }
 
 impl SessionEntry {
@@ -91,6 +92,7 @@ impl SessionEntry {
             outbound_qos1: HashMap::new(),
             outbound_qos2_publish: HashMap::new(),
             outbound_qos2_pubrel: HashSet::new(),
+            offline_queue: VecDeque::new(),
         }
     }
 
@@ -102,6 +104,7 @@ impl SessionEntry {
             outbound_qos1: HashMap::new(),
             outbound_qos2_publish: HashMap::new(),
             outbound_qos2_pubrel: HashSet::new(),
+            offline_queue: VecDeque::new(),
         }
     }
 }
