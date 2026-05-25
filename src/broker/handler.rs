@@ -22,6 +22,20 @@ impl MqttHandler {
         }
     }
 
+    async fn reject_connect(
+        &mut self,
+        ctx: &mut Context<MqttPacket>,
+        reason_code: u8,
+    ) -> Result<()> {
+        ctx.write(MqttPacket::ConnAck(ConnAckPacket {
+            session_present: false,
+            reason_code,
+            properties: Vec::new(),
+        }))
+        .await?;
+        ctx.close().await
+    }
+
     async fn disconnect(&mut self, ctx: &mut Context<MqttPacket>, reason_code: u8) -> Result<()> {
         ctx.write(MqttPacket::Disconnect(DisconnectPacket {
             reason_code,
@@ -40,6 +54,9 @@ impl Handler<MqttPacket> for MqttHandler {
             MqttPacket::Connect(packet) => {
                 if self.connected {
                     return self.disconnect(ctx, protocol::PROTOCOL_ERROR).await;
+                }
+                if let Some(reason_code) = validate_connect(&packet) {
+                    return self.reject_connect(ctx, reason_code).await;
                 }
 
                 let assigned_client_id = packet.client_id.is_empty();
@@ -119,11 +136,11 @@ impl Handler<MqttPacket> for MqttHandler {
                                 packet_id,
                                 protocol::SUCCESS,
                             )))
-                                .await?;
+                            .await?;
                             Ok(())
                         } else {
                             self.disconnect(ctx, protocol::MALFORMED_PACKET).await
-                        }
+                        };
                     }
                 }
 
@@ -176,4 +193,51 @@ impl Handler<MqttPacket> for MqttHandler {
             | MqttPacket::PingResp => self.disconnect(ctx, protocol::PROTOCOL_ERROR).await,
         }
     }
+}
+
+fn validate_connect(packet: &rs_netty::codec::ConnectPacket) -> Option<u8> {
+    if packet.client_id.is_empty() && !packet.clean_start {
+        return Some(protocol::CLIENT_IDENTIFIER_NOT_VALID);
+    }
+    if packet.client_id.as_bytes().contains(&0) {
+        return Some(protocol::MALFORMED_PACKET);
+    }
+
+    if let Some(will) = &packet.will {
+        if !protocol::is_valid_topic_name(&will.topic) {
+            return Some(protocol::TOPIC_NAME_INVALID);
+        }
+        if will.properties.iter().any(is_invalid_payload_format) {
+            return Some(protocol::PAYLOAD_FORMAT_INVALID);
+        }
+    }
+
+    let mut has_authentication_method = false;
+    let mut has_authentication_data = false;
+    for property in &packet.properties {
+        match property {
+            MqttProperty::AuthenticationMethod(_) => has_authentication_method = true,
+            MqttProperty::AuthenticationData(_) => has_authentication_data = true,
+            MqttProperty::RequestProblemInformation(value)
+            | MqttProperty::RequestResponseInformation(value) => {
+                if !matches!(*value, 0 | 1) {
+                    return Some(protocol::MALFORMED_PACKET);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if has_authentication_method || has_authentication_data {
+        return Some(protocol::BAD_AUTHENTICATION_METHOD);
+    }
+    if packet.username.is_some() || packet.password.is_some() {
+        return Some(protocol::BAD_USER_NAME_OR_PASSWORD);
+    }
+
+    None
+}
+
+fn is_invalid_payload_format(property: &MqttProperty) -> bool {
+    matches!(property, MqttProperty::PayloadFormatIndicator(value) if !matches!(*value, 0 | 1))
 }

@@ -4,8 +4,8 @@ use bytes::{Bytes, BytesMut};
 use rs_netty::{
     TcpServer,
     codec::{
-        ConnectPacket, Decoder, Encoder, MqttCodec, MqttPacket, PublishPacket, QoS,
-        SubscribePacket, Subscription, SubscriptionOptions, mqtt::AckPacket,
+        ConnectPacket, Decoder, Encoder, MqttCodec, MqttPacket, MqttProperty, PublishPacket, QoS,
+        SubscribePacket, Subscription, SubscriptionOptions, Will, mqtt::AckPacket,
     },
     pipeline,
     transport::tcp::server::TcpServerHandle,
@@ -62,6 +62,85 @@ fn upsert_subscription_returns_updated_subscription_index() {
     assert_eq!(index, 0);
     assert_eq!(subscriptions.len(), 2);
     assert_eq!(subscriptions[index].options.maximum_qos, QoS::ExactlyOnce);
+}
+
+#[tokio::test]
+async fn connect_rejects_empty_client_id_without_clean_start() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut client = broker.open_client().await?;
+
+    client.write(connect_with_clean_start("", false)).await?;
+    client
+        .expect_connack_reason(protocol::CLIENT_IDENTIFIER_NOT_VALID)
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn connect_rejects_invalid_will_topic() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut client = broker.open_client().await?;
+
+    let mut packet = connect("publisher");
+    let MqttPacket::Connect(connect) = &mut packet else {
+        unreachable!();
+    };
+    connect.will = Some(Will {
+        qos: QoS::AtMostOnce,
+        retain: false,
+        properties: Vec::new(),
+        topic: "devices/+/state".to_string(),
+        payload: Bytes::from_static(b"offline"),
+    });
+
+    client.write(packet).await?;
+    client
+        .expect_connack_reason(protocol::TOPIC_NAME_INVALID)
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn connect_rejects_unsupported_authentication_method() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut client = broker.open_client().await?;
+
+    let mut packet = connect("auth-client");
+    let MqttPacket::Connect(connect) = &mut packet else {
+        unreachable!();
+    };
+    connect
+        .properties
+        .push(MqttProperty::AuthenticationMethod("token".to_string()));
+
+    client.write(packet).await?;
+    client
+        .expect_connack_reason(protocol::BAD_AUTHENTICATION_METHOD)
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn connect_rejects_username_password_until_auth_is_supported() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut client = broker.open_client().await?;
+
+    let mut packet = connect("auth-client");
+    let MqttPacket::Connect(connect) = &mut packet else {
+        unreachable!();
+    };
+    connect.username = Some("alice".to_string());
+    connect.password = Some(Bytes::from_static(b"secret"));
+
+    client.write(packet).await?;
+    client
+        .expect_connack_reason(protocol::BAD_USER_NAME_OR_PASSWORD)
+        .await?;
+
+    broker.shutdown().await
 }
 
 #[tokio::test]
@@ -184,11 +263,15 @@ impl TestBroker {
     }
 
     async fn connect(&self, client_id: &str) -> rs_netty::Result<TestClient> {
-        let stream = TcpStream::connect(self.server.local_addr()).await?;
-        let mut client = TestClient::new(stream);
+        let mut client = self.open_client().await?;
         client.write(connect(client_id)).await?;
         client.expect_connack().await?;
         Ok(client)
+    }
+
+    async fn open_client(&self) -> rs_netty::Result<TestClient> {
+        let stream = TcpStream::connect(self.server.local_addr()).await?;
+        Ok(TestClient::new(stream))
     }
 
     async fn connect_raw(&self, client_id: &str) -> rs_netty::Result<TcpStream> {
@@ -239,6 +322,14 @@ impl TestClient {
 
     async fn expect_connack(&mut self) -> rs_netty::Result<()> {
         assert!(matches!(self.read().await?, MqttPacket::ConnAck(_)));
+        Ok(())
+    }
+
+    async fn expect_connack_reason(&mut self, reason_code: u8) -> rs_netty::Result<()> {
+        assert!(matches!(
+            self.read().await?,
+            MqttPacket::ConnAck(packet) if packet.reason_code == reason_code
+        ));
         Ok(())
     }
 
@@ -322,8 +413,12 @@ async fn read_connack(stream: &mut TcpStream) -> rs_netty::Result<()> {
 }
 
 fn connect(client_id: &str) -> MqttPacket {
+    connect_with_clean_start(client_id, true)
+}
+
+fn connect_with_clean_start(client_id: &str, clean_start: bool) -> MqttPacket {
     MqttPacket::Connect(ConnectPacket {
-        clean_start: true,
+        clean_start,
         keep_alive: 60,
         properties: Vec::new(),
         client_id: client_id.to_string(),

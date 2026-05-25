@@ -7,9 +7,12 @@ pub const QOS_2_GRANTED: u8 = 0x02;
 pub const UNSPECIFIED_ERROR: u8 = 0x80;
 pub const MALFORMED_PACKET: u8 = 0x81;
 pub const PROTOCOL_ERROR: u8 = 0x82;
+pub const CLIENT_IDENTIFIER_NOT_VALID: u8 = 0x85;
+pub const BAD_USER_NAME_OR_PASSWORD: u8 = 0x86;
 pub const BAD_AUTHENTICATION_METHOD: u8 = 0x8c;
 pub const TOPIC_FILTER_INVALID: u8 = 0x8f;
 pub const TOPIC_NAME_INVALID: u8 = 0x90;
+pub const PAYLOAD_FORMAT_INVALID: u8 = 0x99;
 
 pub fn granted_qos_code(qos: QoS) -> u8 {
     match qos {

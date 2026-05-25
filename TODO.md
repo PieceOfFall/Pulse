@@ -24,13 +24,21 @@ items are marked with `[x]`.
 ## 1. Protocol Correctness Foundations
 
 - [ ] Enforce CONNECT validation rules
-  - Reject invalid protocol name/version, invalid client id rules, invalid will fields, and malformed auth fields with precise MQTT v5 reason codes.
+  - [x] Reject invalid protocol name/version at the codec layer.
+  - [x] Reject invalid client id rules with precise MQTT v5 reason codes.
+  - [x] Reject invalid will fields with precise MQTT v5 reason codes.
+  - [x] Reject malformed or unsupported auth fields with precise MQTT v5 reason codes.
 - [ ] Implement MQTT keep alive semantics
   - Track per-client keep alive from CONNECT and close idle MQTT sessions according to the MQTT 5 timeout rule.
 - [ ] Normalize DISCONNECT reason handling
   - Distinguish normal disconnect, protocol errors, admin/server close, and will-triggering closes.
 - [ ] Add packet identifier validation
-  - Detect missing packet ids, zero packet ids, packet id reuse, and unexpected ACK packets with correct reason codes.
+  - [x] Reject missing packet ids where required at the codec layer.
+  - [x] Reject zero packet ids at the codec layer.
+  - [x] Reject QoS 0 PUBLISH packet ids at the codec layer.
+  - [ ] Detect packet id reuse in broker state.
+  - [ ] Detect unexpected ACK packets with correct reason codes.
+- [x] Add focused integration tests for CONNECT validation error paths.
 - [ ] Add focused integration tests for malformed packet and protocol error paths.
 
 ## 2. Session Model
