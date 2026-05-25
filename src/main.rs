@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
         .start()
         .await?;
 
-    info!(bind_addr = %server.local_addr(), "mqtt-rs listening");
+    info!(bind_addr = %server.local_addr(), "Pulse listening");
 
     tokio::signal::ctrl_c()
         .await

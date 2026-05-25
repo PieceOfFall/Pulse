@@ -81,7 +81,7 @@ impl Broker {
             .inner
             .next_generated_client_id
             .fetch_add(1, Ordering::Relaxed);
-        format!("mqtt-rs-{id}")
+        format!("pulse-{id}")
     }
 
     pub(in crate::broker) fn with_state<R>(

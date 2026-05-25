@@ -4,7 +4,7 @@ pub(crate) fn init(log: &Option<String>) -> Result<(), Box<dyn std::error::Error
     let filter = log
         .as_deref()
         .map(EnvFilter::new)
-        .unwrap_or_else(|| EnvFilter::new("mqtt_rs=info,rs_netty=info"));
+        .unwrap_or_else(|| EnvFilter::new("info"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)

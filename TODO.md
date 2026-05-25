@@ -1,4 +1,4 @@
-# mqtt-rs Feature TODO
+# Pulse Feature TODO
 
 This list orders the remaining MQTT v5 work by dependency and risk. Completed
 items are marked with `[x]`.

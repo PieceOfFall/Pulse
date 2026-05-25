@@ -373,7 +373,7 @@ mod tests {
     #[test]
     fn cli_overrides_config_file_values() {
         let args = [
-            "mqtt-rs",
+            "Pulse",
             "--bind",
             "127.0.0.1:1884",
             "--server-receive-maximum",
@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_zero_receive_maximum() {
-        let args = ["mqtt-rs", "--server-receive-maximum", "0"]
+        let args = ["Pulse", "--server-receive-maximum", "0"]
             .into_iter()
             .map(OsString::from);
         let error = AppConfig::load_from_args(args).expect_err("invalid config");
@@ -424,7 +424,7 @@ mod tests {
     #[test]
     fn rejects_multiple_storage_backends() {
         let args = [
-            "mqtt-rs",
+            "Pulse",
             "--sqlite",
             "broker.db",
             "--mysql",

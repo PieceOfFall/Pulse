@@ -1,4 +1,4 @@
-# mqtt-rs broker example configuration.
+# Pulse broker example configuration.
 # Values shown here match the built-in defaults unless noted otherwise.
 
 [server]
@@ -45,7 +45,7 @@ max_retained_messages = 1024
 max_retained_payload_bytes = 16777216
 
 [observability]
-# Tracing log filter. Examples: "info", "debug", "mqtt_rs=debug,rs_netty=info".
+# Tracing log filter. Examples: "info", "debug", "Pulse=debug,rs_netty=info".
 # If omitted, MQTT_RS_LOG or RUST_LOG can also provide the filter.
 # log = "info"
 

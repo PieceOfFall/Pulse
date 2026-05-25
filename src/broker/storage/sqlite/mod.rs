@@ -374,7 +374,7 @@ mod tests {
     #[test]
     fn sqlite_storage_loads_persisted_sessions_subscriptions_and_retained_messages() {
         let path =
-            std::env::temp_dir().join(format!("mqtt-rs-sqlite-storage-{}.db", std::process::id()));
+            std::env::temp_dir().join(format!("pulse-sqlite-storage-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
         let storage = SqliteStorage::open(&path).expect("open sqlite storage");

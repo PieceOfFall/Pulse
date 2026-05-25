@@ -1716,7 +1716,7 @@ impl TestBroker {
 }
 
 fn temp_sqlite_path(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("mqtt-rs-{name}-{}.db", std::process::id()))
+    std::env::temp_dir().join(format!("pulse-{name}-{}.db", std::process::id()))
 }
 
 fn cleanup_sqlite_path(path: &std::path::Path) {
