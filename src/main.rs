@@ -25,7 +25,7 @@ async fn main() -> Result<()> {
         .pipeline(move || {
             pipeline()
                 .codec(MqttCodec::with_max_packet_size(
-                    protocol::SERVER_MAXIMUM_PACKET_SIZE as usize,
+                    broker::runtime::config::SERVER_MAXIMUM_PACKET_SIZE as usize,
                 ))
                 .handler(MqttHandler::new(broker.clone()))
         })

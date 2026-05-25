@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
 use super::BrokerStorage;
-use crate::broker::state::BrokerState;
+use crate::broker::runtime::session_registry::BrokerState;
 
 #[derive(Default)]
 pub(crate) struct InMemoryStorage {

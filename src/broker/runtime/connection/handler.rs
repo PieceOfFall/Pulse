@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -15,14 +14,22 @@ use tokio::task::JoinHandle;
 
 use crate::protocol;
 
-use super::{Broker, ack_packet, delivery::flush_deliveries, now_ms, reason_properties};
+use super::{ConnectOptions, connack_capabilities, topic_alias::TopicAliases};
+use crate::broker::{
+    Broker,
+    runtime::{
+        delivery::flush_deliveries,
+        reason::{ack_packet, reason_properties},
+        time::now_ms,
+    },
+};
 
 pub struct MqttHandler {
     broker: Broker,
     connected: bool,
     client_id: Option<String>,
     keep_alive: Option<KeepAliveHandle>,
-    topic_aliases: HashMap<u16, String>,
+    topic_aliases: TopicAliases,
 }
 
 struct KeepAliveHandle {
@@ -38,7 +45,7 @@ impl MqttHandler {
             connected: false,
             client_id: None,
             keep_alive: None,
-            topic_aliases: HashMap::new(),
+            topic_aliases: TopicAliases::default(),
         }
     }
 
@@ -139,12 +146,7 @@ impl Handler<MqttPacket> for MqttHandler {
                     packet.client_id,
                     ctx.channel(),
                     packet.will,
-                    super::ConnectOptions {
-                        clean_start: packet.clean_start,
-                        session_expiry_interval: session_expiry_interval(&packet.properties),
-                        receive_maximum: receive_maximum(&packet.properties),
-                        maximum_packet_size: maximum_packet_size(&packet.properties),
-                    },
+                    ConnectOptions::from_properties(packet.clean_start, &packet.properties),
                 );
                 if let Some(replaced_channel) = outcome.replaced_channel {
                     let _ = replaced_channel.close().await;
@@ -153,16 +155,7 @@ impl Handler<MqttPacket> for MqttHandler {
                 self.connected = true;
                 self.client_id = Some(outcome.client_id.clone());
 
-                let mut properties = vec![
-                    MqttProperty::ReceiveMaximum(protocol::SERVER_RECEIVE_MAXIMUM),
-                    MqttProperty::MaximumPacketSize(protocol::SERVER_MAXIMUM_PACKET_SIZE),
-                    MqttProperty::TopicAliasMaximum(protocol::SERVER_TOPIC_ALIAS_MAXIMUM),
-                    MqttProperty::MaximumQoS(2),
-                    MqttProperty::RetainAvailable(1),
-                    MqttProperty::WildcardSubscriptionAvailable(1),
-                    MqttProperty::SubscriptionIdentifierAvailable(1),
-                    MqttProperty::SharedSubscriptionAvailable(1),
-                ];
+                let mut properties = connack_capabilities();
                 if assigned_client_id {
                     properties.push(MqttProperty::AssignedClientIdentifier(outcome.client_id));
                 }
@@ -201,7 +194,7 @@ impl Handler<MqttPacket> for MqttHandler {
                 ctx.write(MqttPacket::UnsubAck(unsuback)).await
             }
             MqttPacket::Publish(mut packet) => {
-                if !self.resolve_topic_alias(&mut packet) {
+                if !self.topic_aliases.resolve_publish(&mut packet) {
                     return self.disconnect(ctx, protocol::TOPIC_ALIAS_INVALID).await;
                 }
                 if !protocol::is_valid_topic_name(&packet.topic_name) {
@@ -316,35 +309,6 @@ impl Handler<MqttPacket> for MqttHandler {
     }
 }
 
-impl MqttHandler {
-    fn resolve_topic_alias(&mut self, packet: &mut rs_netty::codec::PublishPacket) -> bool {
-        let alias = packet
-            .properties
-            .iter()
-            .find_map(|property| match property {
-                MqttProperty::TopicAlias(alias) => Some(*alias),
-                _ => None,
-            });
-
-        let Some(alias) = alias else {
-            return true;
-        };
-        if alias == 0 || alias > protocol::SERVER_TOPIC_ALIAS_MAXIMUM {
-            return false;
-        }
-
-        if packet.topic_name.is_empty() {
-            let Some(topic_name) = self.topic_aliases.get(&alias) else {
-                return false;
-            };
-            packet.topic_name = topic_name.clone();
-        } else {
-            self.topic_aliases.insert(alias, packet.topic_name.clone());
-        }
-        true
-    }
-}
-
 impl Drop for MqttHandler {
     fn drop(&mut self) {
         self.stop_keep_alive();
@@ -395,36 +359,6 @@ fn validate_connect(packet: &rs_netty::codec::ConnectPacket) -> Option<u8> {
     }
 
     None
-}
-
-fn session_expiry_interval(properties: &[MqttProperty]) -> u32 {
-    properties
-        .iter()
-        .find_map(|property| match property {
-            MqttProperty::SessionExpiryInterval(value) => Some(*value),
-            _ => None,
-        })
-        .unwrap_or(0)
-}
-
-fn receive_maximum(properties: &[MqttProperty]) -> u16 {
-    properties
-        .iter()
-        .find_map(|property| match property {
-            MqttProperty::ReceiveMaximum(value) => Some(*value),
-            _ => None,
-        })
-        .unwrap_or(u16::MAX)
-}
-
-fn maximum_packet_size(properties: &[MqttProperty]) -> u32 {
-    properties
-        .iter()
-        .find_map(|property| match property {
-            MqttProperty::MaximumPacketSize(value) => Some(*value),
-            _ => None,
-        })
-        .unwrap_or(u32::MAX)
 }
 
 fn is_invalid_payload_format(property: &MqttProperty) -> bool {

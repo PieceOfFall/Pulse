@@ -1,6 +1,6 @@
 use rs_netty::{CloseReason, ConnInfo, Life, Result};
 
-use super::{Broker, should_publish_will};
+use crate::broker::Broker;
 
 #[derive(Clone)]
 pub struct BrokerLife {
@@ -23,4 +23,11 @@ impl Life for BrokerLife {
         }
         Ok(())
     }
+}
+
+fn should_publish_will(reason: CloseReason) -> bool {
+    !matches!(
+        reason,
+        CloseReason::HandlerClosed | CloseReason::LocalClosed
+    )
 }

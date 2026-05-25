@@ -16,9 +16,13 @@ use tokio::{
 };
 
 use super::{
-    Broker, BrokerLife, MqttHandler, protocol,
-    state::{MAX_OFFLINE_QUEUE_LEN, MAX_RETAINED_MESSAGES, SubscriptionEntry, upsert_subscription},
+    Broker, BrokerLife, MqttHandler,
+    runtime::{
+        config::{MAX_OFFLINE_QUEUE_LEN, MAX_RETAINED_MESSAGES, MAX_SUBSCRIPTIONS_PER_CLIENT},
+        subscription_tree::{SubscriptionEntry, upsert_subscription},
+    },
 };
+use crate::protocol;
 
 #[tokio::test]
 async fn duplicate_client_id_closes_previous_connection() -> rs_netty::Result<()> {
@@ -927,7 +931,7 @@ async fn subscription_quota_returns_quota_exceeded() -> rs_netty::Result<()> {
     let broker = TestBroker::start().await?;
     let mut client = broker.connect("subscriber").await?;
 
-    for index in 0..protocol::MAX_SUBSCRIPTIONS_PER_CLIENT {
+    for index in 0..MAX_SUBSCRIPTIONS_PER_CLIENT {
         client
             .write(subscribe(
                 (index + 1) as u16,

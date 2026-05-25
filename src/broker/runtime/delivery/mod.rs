@@ -1,0 +1,28 @@
+mod flush;
+mod inflight;
+mod offline_queue;
+mod packet;
+mod retained;
+mod router;
+mod service;
+
+use rs_netty::{Channel, codec::MqttPacket};
+
+pub(in crate::broker) use flush::flush_deliveries;
+pub(in crate::broker) use inflight::{queued_deliveries_for_client, redeliveries_for_client};
+pub(in crate::broker) use packet::packet_size;
+pub(in crate::broker) use retained::retained_for_subscription;
+pub(in crate::broker) use router::deliveries_for_publish;
+
+#[derive(Clone)]
+pub(in crate::broker) struct Delivery {
+    pub(super) channel: Channel<MqttPacket>,
+    pub(super) packet: MqttPacket,
+}
+
+#[derive(Clone)]
+pub(super) struct DeliveryTarget {
+    pub(super) channel: Channel<MqttPacket>,
+    pub(super) receive_maximum: u16,
+    pub(super) maximum_packet_size: u32,
+}

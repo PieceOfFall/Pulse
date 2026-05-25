@@ -20,11 +20,6 @@ pub const PACKET_TOO_LARGE: u8 = 0x95;
 pub const QUOTA_EXCEEDED: u8 = 0x97;
 pub const PAYLOAD_FORMAT_INVALID: u8 = 0x99;
 
-pub const SERVER_RECEIVE_MAXIMUM: u16 = 1024;
-pub const SERVER_MAXIMUM_PACKET_SIZE: u32 = 16 * 1024 * 1024;
-pub const SERVER_TOPIC_ALIAS_MAXIMUM: u16 = 1024;
-pub const MAX_SUBSCRIPTIONS_PER_CLIENT: usize = 1024;
-
 pub fn granted_qos_code(qos: QoS) -> u8 {
     match qos {
         QoS::AtMostOnce => QOS_0_GRANTED,
