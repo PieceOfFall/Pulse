@@ -24,7 +24,9 @@ async fn main() -> Result<()> {
         .life(BrokerLife::new(broker.clone()))
         .pipeline(move || {
             pipeline()
-                .codec(MqttCodec::with_max_packet_size(16 * 1024 * 1024))
+                .codec(MqttCodec::with_max_packet_size(
+                    protocol::SERVER_MAXIMUM_PACKET_SIZE as usize,
+                ))
                 .handler(MqttHandler::new(broker.clone()))
         })
         .run()

@@ -14,7 +14,12 @@ pub const TOPIC_FILTER_INVALID: u8 = 0x8f;
 pub const TOPIC_NAME_INVALID: u8 = 0x90;
 pub const PACKET_IDENTIFIER_IN_USE: u8 = 0x91;
 pub const PACKET_IDENTIFIER_NOT_FOUND: u8 = 0x92;
+pub const RECEIVE_MAXIMUM_EXCEEDED: u8 = 0x93;
+pub const PACKET_TOO_LARGE: u8 = 0x95;
 pub const PAYLOAD_FORMAT_INVALID: u8 = 0x99;
+
+pub const SERVER_RECEIVE_MAXIMUM: u16 = 1024;
+pub const SERVER_MAXIMUM_PACKET_SIZE: u32 = 16 * 1024 * 1024;
 
 pub fn granted_qos_code(qos: QoS) -> u8 {
     match qos {

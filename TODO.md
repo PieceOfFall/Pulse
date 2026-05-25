@@ -59,10 +59,10 @@ items are marked with `[x]`.
 
 ## 3. MQTT v5 Properties
 
-- [ ] Enforce Maximum Packet Size
-  - Respect client/server limits and return Packet Too Large where appropriate.
-- [ ] Enforce Receive Maximum
-  - Limit concurrent QoS 1/2 inflight messages per client.
+- [x] Enforce Maximum Packet Size
+  - [x] Respect client/server limits and return Packet Too Large where appropriate.
+- [x] Enforce Receive Maximum
+  - [x] Limit concurrent QoS 1/2 inflight messages per client.
 - [x] Implement Message Expiry Interval
   - [x] Expire queued, retained, and offline messages as required.
 - [ ] Implement Topic Alias and Topic Alias Maximum.
@@ -74,8 +74,8 @@ items are marked with `[x]`.
 
 - [x] Implement retain handling mode `1` precisely
   - Send retained messages only when a subscription is newly created, not when an existing subscription is updated.
-- [ ] Implement Subscription Identifier
-  - Store subscription identifiers and attach them to matching PUBLISH packets.
+- [x] Implement Subscription Identifier
+  - [x] Store subscription identifiers and attach them to matching PUBLISH packets.
 - [ ] Implement shared subscriptions: `$share/{group}/{filter}`.
 - [ ] Add stricter topic filter validation tests, including edge cases around `$`, empty levels, and shared subscription syntax.
 - [ ] Add subscription quotas and clear error paths for quota exceeded.
@@ -91,8 +91,8 @@ items are marked with `[x]`.
 ## 6. Reliability And Backpressure
 
 - [x] Add per-client offline queues for persistent sessions.
-- [ ] Add queue limits and slow-consumer policy.
-- [ ] Add retained message limits.
+- [x] Add queue limits and slow-consumer policy.
+- [x] Add retained message limits.
 - [ ] Add inflight retransmission timers for QoS 1/2.
 - [ ] Add duplicate inbound QoS 2 handling that avoids double delivery.
 - [ ] Decide and document ordering guarantees per client and per topic.

@@ -68,6 +68,7 @@ fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             no_local INTEGER NOT NULL,
             retain_as_published INTEGER NOT NULL,
             retain_handling INTEGER NOT NULL,
+            subscription_identifier INTEGER,
             PRIMARY KEY (client_id, topic_filter),
             FOREIGN KEY (client_id) REFERENCES sessions(client_id) ON DELETE CASCADE
         );
@@ -110,6 +111,12 @@ fn migrate(connection: &Connection) -> rusqlite::Result<()> {
         "sessions",
         "next_packet_id",
         "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    add_column_if_missing(
+        connection,
+        "subscriptions",
+        "subscription_identifier",
+        "INTEGER",
     )?;
     add_column_if_missing(connection, "retained_messages", "expires_at_ms", "INTEGER")?;
     add_column_if_missing(connection, "outbound_inflight", "expires_at_ms", "INTEGER")?;
@@ -253,7 +260,7 @@ fn load_offline_queue(connection: &Connection, state: &mut BrokerState) -> rusql
 fn load_subscriptions(connection: &Connection, state: &mut BrokerState) -> rusqlite::Result<()> {
     let mut statement = connection.prepare(
         r#"
-        SELECT client_id, topic_filter, maximum_qos, no_local, retain_as_published, retain_handling
+        SELECT client_id, topic_filter, maximum_qos, no_local, retain_as_published, retain_handling, subscription_identifier
         FROM subscriptions
         "#,
     )?;
@@ -270,6 +277,7 @@ fn load_subscriptions(connection: &Connection, state: &mut BrokerState) -> rusql
                 retain_as_published: retain_as_published != 0,
                 retain_handling: row.get(5)?,
             },
+            subscription_identifier: row.get::<_, Option<u32>>(6)?,
         })
     })?;
 
@@ -334,8 +342,9 @@ fn persist_state(
                 maximum_qos,
                 no_local,
                 retain_as_published,
-                retain_handling
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                retain_handling,
+                subscription_identifier
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             "#,
         )?;
         for subscription in &state.subscriptions {
@@ -346,6 +355,7 @@ fn persist_state(
                 bool_to_u8(subscription.options.no_local),
                 bool_to_u8(subscription.options.retain_as_published),
                 subscription.options.retain_handling,
+                subscription.subscription_identifier,
             ])?;
         }
     }
@@ -572,6 +582,7 @@ mod tests {
                     retain_as_published: true,
                     retain_handling: 1,
                 },
+                subscription_identifier: Some(42),
             });
             state.retained.insert(
                 "devices/one".to_string(),
@@ -613,6 +624,7 @@ mod tests {
             assert!(subscription.options.no_local);
             assert!(subscription.options.retain_as_published);
             assert_eq!(subscription.options.retain_handling, 1);
+            assert_eq!(subscription.subscription_identifier, Some(42));
 
             let retained = state
                 .retained

@@ -17,7 +17,7 @@ use tokio::{
 
 use super::{
     Broker, BrokerLife, MqttHandler, protocol,
-    state::{SubscriptionEntry, upsert_subscription},
+    state::{MAX_OFFLINE_QUEUE_LEN, MAX_RETAINED_MESSAGES, SubscriptionEntry, upsert_subscription},
 };
 
 #[tokio::test]
@@ -42,11 +42,13 @@ fn upsert_subscription_returns_updated_subscription_index() {
             client_id: "client-one".to_string(),
             filter: "devices/one".to_string(),
             options: SubscriptionOptions::default(),
+            subscription_identifier: None,
         },
         SubscriptionEntry {
             client_id: "client-two".to_string(),
             filter: "devices/two".to_string(),
             options: SubscriptionOptions::default(),
+            subscription_identifier: None,
         },
     ];
 
@@ -60,6 +62,7 @@ fn upsert_subscription_returns_updated_subscription_index() {
                 ..SubscriptionOptions::default()
             },
         },
+        Some(7),
     );
 
     assert_eq!(upsert.index, 0);
@@ -69,6 +72,7 @@ fn upsert_subscription_returns_updated_subscription_index() {
         subscriptions[upsert.index].options.maximum_qos,
         QoS::ExactlyOnce
     );
+    assert_eq!(subscriptions[upsert.index].subscription_identifier, Some(7));
 }
 
 #[tokio::test]
@@ -651,6 +655,213 @@ async fn persistent_session_does_not_queue_qos0_messages_while_offline() -> rs_n
         .write(connect_with_session_expiry("subscriber", false, 60))
         .await?;
     subscriber.expect_connack_session_present(true).await?;
+    subscriber
+        .expect_no_packet(Duration::from_millis(200))
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn receive_maximum_queues_online_qos1_until_ack() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_properties(
+            "subscriber",
+            true,
+            vec![MqttProperty::ReceiveMaximum(1)],
+        ))
+        .await?;
+    subscriber.expect_connack().await?;
+    subscriber
+        .subscribe(1, "devices/receive-maximum", QoS::AtLeastOnce)
+        .await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish(
+            "devices/receive-maximum",
+            QoS::AtLeastOnce,
+            Some(7),
+            "first",
+        ))
+        .await?;
+    publisher.expect_puback(7).await?;
+    publisher
+        .write(publish(
+            "devices/receive-maximum",
+            QoS::AtLeastOnce,
+            Some(8),
+            "second",
+        ))
+        .await?;
+    publisher.expect_puback(8).await?;
+
+    let first = subscriber
+        .expect_publish("expected first receive-maximum publish")
+        .await?;
+    assert_eq!(first.payload, Bytes::from_static(b"first"));
+    subscriber
+        .expect_no_packet(Duration::from_millis(200))
+        .await?;
+
+    subscriber
+        .write(MqttPacket::PubAck(AckPacket::new(
+            first.packet_id.unwrap(),
+            protocol::SUCCESS,
+        )))
+        .await?;
+    let second = subscriber
+        .expect_publish("expected queued publish after ack")
+        .await?;
+    assert_eq!(second.payload, Bytes::from_static(b"second"));
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn maximum_packet_size_drops_oversized_outbound_publish() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_properties(
+            "subscriber",
+            true,
+            vec![MqttProperty::MaximumPacketSize(40)],
+        ))
+        .await?;
+    subscriber.expect_connack().await?;
+    subscriber
+        .subscribe(1, "devices/max-packet", QoS::AtMostOnce)
+        .await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish(
+            "devices/max-packet",
+            QoS::AtMostOnce,
+            None,
+            "this payload is intentionally too large for the subscriber",
+        ))
+        .await?;
+    subscriber
+        .expect_no_packet(Duration::from_millis(200))
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn subscription_identifier_is_forwarded_on_matching_publish() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.connect("subscriber").await?;
+    subscriber
+        .write(subscribe_with_subscription_identifier(
+            1,
+            "devices/sub-id",
+            QoS::AtMostOnce,
+            42,
+        ))
+        .await?;
+    assert!(matches!(subscriber.read().await?, MqttPacket::SubAck(_)));
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish("devices/sub-id", QoS::AtMostOnce, None, "tagged"))
+        .await?;
+
+    let packet = subscriber
+        .expect_publish("expected subscription identifier publish")
+        .await?;
+    assert!(
+        packet
+            .properties
+            .contains(&MqttProperty::SubscriptionIdentifier(42))
+    );
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn offline_queue_limit_drops_new_messages_after_capacity() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", true, 60))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+    subscriber
+        .subscribe(1, "devices/offline-limit", QoS::AtLeastOnce)
+        .await?;
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    for index in 0..=MAX_OFFLINE_QUEUE_LEN {
+        publisher
+            .write(publish(
+                "devices/offline-limit",
+                QoS::AtLeastOnce,
+                Some((index + 1) as u16),
+                &format!("queued-{index}"),
+            ))
+            .await?;
+        publisher.expect_puback((index + 1) as u16).await?;
+    }
+
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", false, 60))
+        .await?;
+    subscriber.expect_connack_session_present(true).await?;
+    for index in 0..MAX_OFFLINE_QUEUE_LEN {
+        let packet = subscriber
+            .expect_publish("expected capped offline publish")
+            .await?;
+        assert_eq!(
+            packet.payload,
+            Bytes::copy_from_slice(format!("queued-{index}").as_bytes())
+        );
+        subscriber
+            .write(MqttPacket::PubAck(AckPacket::new(
+                packet.packet_id.unwrap(),
+                protocol::SUCCESS,
+            )))
+            .await?;
+    }
+    subscriber
+        .expect_no_packet(Duration::from_millis(200))
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn retained_message_limit_drops_new_retained_messages_after_capacity() -> rs_netty::Result<()>
+{
+    let broker = TestBroker::start().await?;
+    let mut publisher = broker.connect("publisher").await?;
+    for index in 0..=MAX_RETAINED_MESSAGES {
+        publisher
+            .write(publish_with_retain(
+                &format!("devices/retained-limit/{index}"),
+                QoS::AtMostOnce,
+                None,
+                "retained",
+                true,
+            ))
+            .await?;
+    }
+
+    let mut subscriber = broker.connect("subscriber").await?;
+    subscriber
+        .subscribe(
+            1,
+            &format!("devices/retained-limit/{MAX_RETAINED_MESSAGES}"),
+            QoS::AtMostOnce,
+        )
+        .await?;
     subscriber
         .expect_no_packet(Duration::from_millis(200))
         .await?;
@@ -1559,10 +1770,22 @@ fn connect_with_session_expiry(
     clean_start: bool,
     session_expiry_interval: u32,
 ) -> MqttPacket {
+    connect_with_properties(
+        client_id,
+        clean_start,
+        vec![MqttProperty::SessionExpiryInterval(session_expiry_interval)],
+    )
+}
+
+fn connect_with_properties(
+    client_id: &str,
+    clean_start: bool,
+    properties: Vec<MqttProperty>,
+) -> MqttPacket {
     MqttPacket::Connect(ConnectPacket {
         clean_start,
         keep_alive: 60,
-        properties: vec![MqttProperty::SessionExpiryInterval(session_expiry_interval)],
+        properties,
         client_id: client_id.to_string(),
         will: None,
         username: None,
@@ -1625,6 +1848,27 @@ fn subscribe_with_retain_handling(
             options: SubscriptionOptions {
                 maximum_qos,
                 retain_handling,
+                ..SubscriptionOptions::default()
+            },
+        }],
+    })
+}
+
+fn subscribe_with_subscription_identifier(
+    packet_id: u16,
+    topic_filter: &str,
+    maximum_qos: QoS,
+    subscription_identifier: u32,
+) -> MqttPacket {
+    MqttPacket::Subscribe(SubscribePacket {
+        packet_id,
+        properties: vec![MqttProperty::SubscriptionIdentifier(
+            subscription_identifier,
+        )],
+        subscriptions: vec![Subscription {
+            topic_filter: topic_filter.to_string(),
+            options: SubscriptionOptions {
+                maximum_qos,
                 ..SubscriptionOptions::default()
             },
         }],

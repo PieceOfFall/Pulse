@@ -1,19 +1,27 @@
+use bytes::BytesMut;
 use rs_netty::{
     Channel,
-    codec::{MqttPacket, PublishPacket, QoS},
+    codec::{Encoder, MqttCodec, MqttPacket, MqttProperty, PublishPacket, QoS},
 };
 
 use crate::protocol;
 
 use super::state::{
-    BrokerState, PendingPublish, RetainedMessage, SessionEntry, SubscriptionEntry,
-    is_message_expired, message_expires_at_ms, now_ms,
+    BrokerState, MAX_OFFLINE_QUEUE_LEN, PendingPublish, RetainedMessage, SessionEntry,
+    SubscriptionEntry, is_message_expired, message_expires_at_ms, now_ms,
 };
 
 #[derive(Clone)]
 pub(super) struct Delivery {
     channel: Channel<MqttPacket>,
     packet: MqttPacket,
+}
+
+#[derive(Clone)]
+struct DeliveryTarget {
+    channel: Channel<MqttPacket>,
+    receive_maximum: u16,
+    maximum_packet_size: u32,
 }
 
 pub(super) fn deliveries_for_publish(
@@ -46,19 +54,21 @@ pub(super) fn deliveries_for_publish(
         .filter_map(
             |sub| match state.connection_by_client_id.get(&sub.client_id) {
                 Some(connection_id) => {
-                    let channel = state
-                        .clients_by_connection
-                        .get(connection_id)?
-                        .channel
-                        .clone();
+                    let client = state.clients_by_connection.get(connection_id)?;
+                    let target = DeliveryTarget {
+                        channel: client.channel.clone(),
+                        receive_maximum: client.receive_maximum,
+                        maximum_packet_size: client.maximum_packet_size,
+                    };
                     let session = state.sessions_by_client_id.get_mut(&sub.client_id)?;
                     delivery_for_client(
                         session,
-                        channel,
+                        target,
                         packet,
                         sub.options.maximum_qos,
                         sub.options.retain_as_published && packet.retain,
                         expires_at_ms,
+                        sub.subscription_identifier,
                     )
                 }
                 None => {
@@ -89,12 +99,13 @@ pub(super) fn retained_for_subscription(
     let Some(connection_id) = state.connection_by_client_id.get(&subscription.client_id) else {
         return Vec::new();
     };
-    let Some(channel) = state
-        .clients_by_connection
-        .get(connection_id)
-        .map(|client| client.channel.clone())
-    else {
+    let Some(client) = state.clients_by_connection.get(connection_id) else {
         return Vec::new();
+    };
+    let target = DeliveryTarget {
+        channel: client.channel.clone(),
+        receive_maximum: client.receive_maximum,
+        maximum_packet_size: client.maximum_packet_size,
     };
     let Some(session) = state.sessions_by_client_id.get_mut(&subscription.client_id) else {
         return Vec::new();
@@ -105,7 +116,7 @@ pub(super) fn retained_for_subscription(
         .filter_map(|message| {
             delivery_for_client(
                 session,
-                channel.clone(),
+                target.clone(),
                 &PublishPacket {
                     dup: false,
                     qos: message.qos,
@@ -118,6 +129,7 @@ pub(super) fn retained_for_subscription(
                 subscription.options.maximum_qos,
                 true,
                 message.expires_at_ms,
+                subscription.subscription_identifier,
             )
         })
         .collect()
@@ -127,13 +139,12 @@ pub(super) fn redeliveries_for_client(state: &mut BrokerState, client_id: &str) 
     let Some(connection_id) = state.connection_by_client_id.get(client_id) else {
         return Vec::new();
     };
-    let Some(channel) = state
-        .clients_by_connection
-        .get(connection_id)
-        .map(|client| client.channel.clone())
-    else {
+    let Some(client) = state.clients_by_connection.get(connection_id) else {
         return Vec::new();
     };
+    let channel = client.channel.clone();
+    let receive_maximum = client.receive_maximum;
+    let maximum_packet_size = client.maximum_packet_size;
     let Some(session) = state.sessions_by_client_id.get_mut(client_id) else {
         return Vec::new();
     };
@@ -150,43 +161,56 @@ pub(super) fn redeliveries_for_client(state: &mut BrokerState, client_id: &str) 
         .outbound_qos1
         .iter()
         .chain(session.outbound_qos2_publish.iter())
-        .map(|(packet_id, pending)| {
+        .take(usize::from(receive_maximum))
+        .filter_map(|(packet_id, pending)| {
             let mut packet = pending.packet.clone();
             packet.dup = true;
             packet.packet_id = Some(*packet_id);
-            Delivery {
+            fits_maximum_packet_size(&packet, maximum_packet_size).then(|| Delivery {
                 channel: channel.clone(),
                 packet: MqttPacket::Publish(packet),
-            }
+            })
         })
         .collect();
 
-    while let Some(pending) = session.offline_queue.pop_front() {
-        if is_message_expired(pending.expires_at_ms, now_ms) {
-            continue;
-        }
-        if let Some(delivery) = delivery_for_client(
-            session,
-            channel.clone(),
-            &pending.packet,
-            pending.packet.qos,
-            pending.packet.retain,
-            pending.expires_at_ms,
-        ) {
-            redeliveries.push(delivery);
-        }
-    }
+    redeliveries.extend(flush_queued_for_session(
+        session,
+        channel,
+        receive_maximum,
+        maximum_packet_size,
+    ));
 
     redeliveries
 }
 
+pub(super) fn queued_deliveries_for_client(
+    state: &mut BrokerState,
+    client_id: &str,
+) -> Vec<Delivery> {
+    let Some(connection_id) = state.connection_by_client_id.get(client_id) else {
+        return Vec::new();
+    };
+    let Some(client) = state.clients_by_connection.get(connection_id) else {
+        return Vec::new();
+    };
+    let channel = client.channel.clone();
+    let receive_maximum = client.receive_maximum;
+    let maximum_packet_size = client.maximum_packet_size;
+    let Some(session) = state.sessions_by_client_id.get_mut(client_id) else {
+        return Vec::new();
+    };
+
+    flush_queued_for_session(session, channel, receive_maximum, maximum_packet_size)
+}
+
 fn delivery_for_client(
     session: &mut SessionEntry,
-    channel: Channel<MqttPacket>,
+    target: DeliveryTarget,
     packet: &PublishPacket,
     maximum_qos: QoS,
     retain: bool,
     expires_at_ms: Option<u64>,
+    subscription_identifier: Option<u32>,
 ) -> Option<Delivery> {
     let now_ms = now_ms();
     if is_message_expired(expires_at_ms, now_ms) {
@@ -194,14 +218,46 @@ fn delivery_for_client(
     }
 
     let qos = effective_qos(packet.qos, maximum_qos);
+    if qos != QoS::AtMostOnce && inflight_count(session) >= usize::from(target.receive_maximum) {
+        queue_pending_publish(
+            session,
+            packet,
+            qos,
+            retain,
+            expires_at_ms,
+            subscription_identifier,
+        );
+        return None;
+    }
+
+    if qos == QoS::AtMostOnce
+        && !fits_maximum_packet_size(
+            &pending_publish(packet, qos, retain, None, false, subscription_identifier),
+            target.maximum_packet_size,
+        )
+    {
+        return None;
+    }
+
     let packet_id = match qos {
         QoS::AtMostOnce => None,
         QoS::AtLeastOnce => {
             let packet_id = next_packet_id(session);
+            let publish = pending_publish(
+                packet,
+                qos,
+                retain,
+                Some(packet_id),
+                false,
+                subscription_identifier,
+            );
+            if !fits_maximum_packet_size(&publish, target.maximum_packet_size) {
+                return None;
+            }
             session.outbound_qos1.insert(
                 packet_id,
                 PendingPublish {
-                    packet: pending_publish(packet, qos, retain, Some(packet_id), false),
+                    packet: publish,
                     expires_at_ms,
                 },
             );
@@ -209,10 +265,21 @@ fn delivery_for_client(
         }
         QoS::ExactlyOnce => {
             let packet_id = next_packet_id(session);
+            let publish = pending_publish(
+                packet,
+                qos,
+                retain,
+                Some(packet_id),
+                false,
+                subscription_identifier,
+            );
+            if !fits_maximum_packet_size(&publish, target.maximum_packet_size) {
+                return None;
+            }
             session.outbound_qos2_publish.insert(
                 packet_id,
                 PendingPublish {
-                    packet: pending_publish(packet, qos, retain, Some(packet_id), false),
+                    packet: publish,
                     expires_at_ms,
                 },
             );
@@ -221,8 +288,15 @@ fn delivery_for_client(
     };
 
     Some(Delivery {
-        channel,
-        packet: MqttPacket::Publish(pending_publish(packet, qos, retain, packet_id, false)),
+        channel: target.channel,
+        packet: MqttPacket::Publish(pending_publish(
+            packet,
+            qos,
+            retain,
+            packet_id,
+            false,
+            subscription_identifier,
+        )),
     })
 }
 
@@ -232,14 +306,22 @@ fn pending_publish(
     retain: bool,
     packet_id: Option<u16>,
     dup: bool,
+    subscription_identifier: Option<u32>,
 ) -> PublishPacket {
+    let mut properties = packet.properties.clone();
+    if let Some(subscription_identifier) = subscription_identifier {
+        properties.push(MqttProperty::SubscriptionIdentifier(
+            subscription_identifier,
+        ));
+    }
+
     PublishPacket {
         dup,
         qos,
         retain,
         topic_name: packet.topic_name.clone(),
         packet_id,
-        properties: packet.properties.clone(),
+        properties,
         payload: packet.payload.clone(),
     }
 }
@@ -267,16 +349,14 @@ fn queue_offline_publish(
         return;
     }
 
-    session.offline_queue.push_back(PendingPublish {
-        packet: pending_publish(
-            packet,
-            qos,
-            subscription.options.retain_as_published && packet.retain,
-            None,
-            false,
-        ),
+    queue_pending_publish(
+        session,
+        packet,
+        qos,
+        subscription.options.retain_as_published && packet.retain,
         expires_at_ms,
-    });
+        subscription.subscription_identifier,
+    );
 }
 
 fn effective_qos(publish_qos: QoS, maximum_qos: QoS) -> QoS {
@@ -311,6 +391,107 @@ fn next_packet_id(session: &mut SessionEntry) -> u16 {
             return packet_id;
         }
     }
+}
+
+fn flush_queued_for_session(
+    session: &mut SessionEntry,
+    channel: Channel<MqttPacket>,
+    receive_maximum: u16,
+    maximum_packet_size: u32,
+) -> Vec<Delivery> {
+    let mut deliveries = Vec::new();
+    let now_ms = now_ms();
+    while inflight_count(session) < usize::from(receive_maximum) {
+        let Some(pending) = session.offline_queue.pop_front() else {
+            break;
+        };
+        if is_message_expired(pending.expires_at_ms, now_ms) {
+            continue;
+        }
+
+        let qos = pending.packet.qos;
+        let packet_id = match qos {
+            QoS::AtMostOnce => None,
+            QoS::AtLeastOnce => {
+                let packet_id = next_packet_id(session);
+                let mut publish = pending.packet.clone();
+                publish.packet_id = Some(packet_id);
+                if !fits_maximum_packet_size(&publish, maximum_packet_size) {
+                    continue;
+                }
+                session.outbound_qos1.insert(
+                    packet_id,
+                    PendingPublish {
+                        packet: publish,
+                        expires_at_ms: pending.expires_at_ms,
+                    },
+                );
+                Some(packet_id)
+            }
+            QoS::ExactlyOnce => {
+                let packet_id = next_packet_id(session);
+                let mut publish = pending.packet.clone();
+                publish.packet_id = Some(packet_id);
+                if !fits_maximum_packet_size(&publish, maximum_packet_size) {
+                    continue;
+                }
+                session.outbound_qos2_publish.insert(
+                    packet_id,
+                    PendingPublish {
+                        packet: publish,
+                        expires_at_ms: pending.expires_at_ms,
+                    },
+                );
+                Some(packet_id)
+            }
+        };
+
+        let mut packet = pending.packet;
+        packet.packet_id = packet_id;
+        if !fits_maximum_packet_size(&packet, maximum_packet_size) {
+            continue;
+        }
+        deliveries.push(Delivery {
+            channel: channel.clone(),
+            packet: MqttPacket::Publish(packet),
+        });
+    }
+
+    deliveries
+}
+
+fn queue_pending_publish(
+    session: &mut SessionEntry,
+    packet: &PublishPacket,
+    qos: QoS,
+    retain: bool,
+    expires_at_ms: Option<u64>,
+    subscription_identifier: Option<u32>,
+) {
+    if session.offline_queue.len() >= MAX_OFFLINE_QUEUE_LEN {
+        return;
+    }
+
+    session.offline_queue.push_back(PendingPublish {
+        packet: pending_publish(packet, qos, retain, None, false, subscription_identifier),
+        expires_at_ms,
+    });
+}
+
+fn inflight_count(session: &SessionEntry) -> usize {
+    session.outbound_qos1.len() + session.outbound_qos2_publish.len()
+}
+
+pub(super) fn packet_size(packet: &MqttPacket) -> Option<usize> {
+    let mut codec = MqttCodec::new();
+    let mut buffer = BytesMut::new();
+    codec.encode(packet.clone(), &mut buffer).ok()?;
+    Some(buffer.len())
+}
+
+fn fits_maximum_packet_size(packet: &PublishPacket, maximum_packet_size: u32) -> bool {
+    packet_size(&MqttPacket::Publish(packet.clone()))
+        .is_some_and(|size| size <= maximum_packet_size as usize)
 }
 
 pub(super) async fn flush_deliveries(deliveries: Vec<Delivery>) {

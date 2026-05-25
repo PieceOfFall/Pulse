@@ -131,15 +131,17 @@ impl Handler<MqttPacket> for MqttHandler {
                 }
 
                 let assigned_client_id = packet.client_id.is_empty();
-                let clean_start = packet.clean_start;
-                let session_expiry_interval = session_expiry_interval(&packet.properties);
                 let outcome = self.broker.connect(
                     ctx.id(),
                     packet.client_id,
                     ctx.channel(),
                     packet.will,
-                    clean_start,
-                    session_expiry_interval,
+                    super::ConnectOptions {
+                        clean_start: packet.clean_start,
+                        session_expiry_interval: session_expiry_interval(&packet.properties),
+                        receive_maximum: receive_maximum(&packet.properties),
+                        maximum_packet_size: maximum_packet_size(&packet.properties),
+                    },
                 );
                 if let Some(replaced_channel) = outcome.replaced_channel {
                     let _ = replaced_channel.close().await;
@@ -149,11 +151,12 @@ impl Handler<MqttPacket> for MqttHandler {
                 self.client_id = Some(outcome.client_id.clone());
 
                 let mut properties = vec![
-                    MqttProperty::ReceiveMaximum(1024),
+                    MqttProperty::ReceiveMaximum(protocol::SERVER_RECEIVE_MAXIMUM),
+                    MqttProperty::MaximumPacketSize(protocol::SERVER_MAXIMUM_PACKET_SIZE),
                     MqttProperty::MaximumQoS(2),
                     MqttProperty::RetainAvailable(1),
                     MqttProperty::WildcardSubscriptionAvailable(1),
-                    MqttProperty::SubscriptionIdentifierAvailable(0),
+                    MqttProperty::SubscriptionIdentifierAvailable(1),
                     MqttProperty::SharedSubscriptionAvailable(0),
                 ];
                 if assigned_client_id {
@@ -197,6 +200,12 @@ impl Handler<MqttPacket> for MqttHandler {
                 if !protocol::is_valid_topic_name(&packet.topic_name) {
                     return self.disconnect(ctx, protocol::TOPIC_NAME_INVALID).await;
                 }
+                if self
+                    .broker
+                    .packet_exceeds_server_maximum(&MqttPacket::Publish(packet.clone()))
+                {
+                    return self.disconnect(ctx, protocol::PACKET_TOO_LARGE).await;
+                }
 
                 match packet.qos {
                     QoS::AtMostOnce => {}
@@ -214,11 +223,7 @@ impl Handler<MqttPacket> for MqttHandler {
                     QoS::ExactlyOnce => {
                         return if let Some(packet_id) = packet.packet_id {
                             let reason_code =
-                                if self.broker.store_qos2_publish(ctx.id(), packet_id, packet) {
-                                    protocol::SUCCESS
-                                } else {
-                                    protocol::PACKET_IDENTIFIER_IN_USE
-                                };
+                                self.broker.store_qos2_publish(ctx.id(), packet_id, packet);
                             ctx.write(MqttPacket::PubRec(AckPacket::new(packet_id, reason_code)))
                                 .await?;
                             Ok(())
@@ -253,18 +258,19 @@ impl Handler<MqttPacket> for MqttHandler {
                 .await
             }
             MqttPacket::PubAck(packet) => {
-                if !self
+                let Some(deliveries) = self
                     .broker
                     .complete_outbound_qos1(ctx.id(), packet.packet_id)
-                {
+                else {
                     return self
                         .disconnect(ctx, protocol::PACKET_IDENTIFIER_NOT_FOUND)
                         .await;
-                }
+                };
+                flush_deliveries(deliveries).await;
                 Ok(())
             }
             MqttPacket::PubRec(packet) => {
-                if self
+                if let Some(deliveries) = self
                     .broker
                     .receive_outbound_qos2(ctx.id(), packet.packet_id)
                 {
@@ -272,7 +278,9 @@ impl Handler<MqttPacket> for MqttHandler {
                         packet.packet_id,
                         protocol::SUCCESS,
                     )))
-                    .await
+                    .await?;
+                    flush_deliveries(deliveries).await;
+                    Ok(())
                 } else {
                     self.disconnect(ctx, protocol::PACKET_IDENTIFIER_NOT_FOUND)
                         .await
@@ -330,6 +338,9 @@ fn validate_connect(packet: &rs_netty::codec::ConnectPacket) -> Option<u8> {
         match property {
             MqttProperty::AuthenticationMethod(_) => has_authentication_method = true,
             MqttProperty::AuthenticationData(_) => has_authentication_data = true,
+            MqttProperty::ReceiveMaximum(0) | MqttProperty::MaximumPacketSize(0) => {
+                return Some(protocol::MALFORMED_PACKET);
+            }
             MqttProperty::RequestProblemInformation(value)
             | MqttProperty::RequestResponseInformation(value) => {
                 if !matches!(*value, 0 | 1) {
@@ -358,6 +369,26 @@ fn session_expiry_interval(properties: &[MqttProperty]) -> u32 {
             _ => None,
         })
         .unwrap_or(0)
+}
+
+fn receive_maximum(properties: &[MqttProperty]) -> u16 {
+    properties
+        .iter()
+        .find_map(|property| match property {
+            MqttProperty::ReceiveMaximum(value) => Some(*value),
+            _ => None,
+        })
+        .unwrap_or(u16::MAX)
+}
+
+fn maximum_packet_size(properties: &[MqttProperty]) -> u32 {
+    properties
+        .iter()
+        .find_map(|property| match property {
+            MqttProperty::MaximumPacketSize(value) => Some(*value),
+            _ => None,
+        })
+        .unwrap_or(u32::MAX)
 }
 
 fn is_invalid_payload_format(property: &MqttProperty) -> bool {

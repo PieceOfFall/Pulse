@@ -27,8 +27,8 @@ pub use life::BrokerLife;
 use crate::protocol;
 
 use self::delivery::{
-    Delivery, deliveries_for_publish, flush_deliveries, redeliveries_for_client,
-    retained_for_subscription,
+    Delivery, deliveries_for_publish, flush_deliveries, packet_size, queued_deliveries_for_client,
+    redeliveries_for_client, retained_for_subscription,
 };
 use self::state::{
     BrokerState, ClientEntry, PendingPublish, SessionEntry, is_message_expired,
@@ -88,8 +88,7 @@ impl Broker {
         requested_client_id: String,
         channel: Channel<MqttPacket>,
         will: Option<Will>,
-        clean_start: bool,
-        session_expiry_interval: u32,
+        options: ConnectOptions,
     ) -> ConnectOutcome {
         let client_id = if requested_client_id.is_empty() {
             self.generated_client_id()
@@ -100,7 +99,7 @@ impl Broker {
         self.with_state(|state| {
             state.expire_sessions(now_ms());
             let had_session = state.sessions_by_client_id.contains_key(&client_id);
-            if clean_start {
+            if options.clean_start {
                 state.sessions_by_client_id.remove(&client_id);
                 state.subscriptions.retain(|sub| sub.client_id != client_id);
             }
@@ -124,18 +123,25 @@ impl Broker {
                 .entry(client_id.clone())
                 .and_modify(|session| {
                     session.expires_at_ms = None;
-                    session.session_expiry_interval = session_expiry_interval;
+                    session.session_expiry_interval = options.session_expiry_interval;
                 })
-                .or_insert_with(|| SessionEntry::connected(session_expiry_interval));
+                .or_insert_with(|| SessionEntry::connected(options.session_expiry_interval));
             state.clients_by_connection.insert(
                 connection_id,
-                ClientEntry::new(client_id.clone(), channel, will, session_expiry_interval),
+                ClientEntry::new(
+                    client_id.clone(),
+                    channel,
+                    will,
+                    options.session_expiry_interval,
+                    options.receive_maximum,
+                    options.maximum_packet_size,
+                ),
             );
             let redeliveries = redeliveries_for_client(state, &client_id);
 
             ConnectOutcome {
                 client_id,
-                session_present: !clean_start && had_session,
+                session_present: !options.clean_start && had_session,
                 replaced_channel,
                 redeliveries,
             }
@@ -172,8 +178,12 @@ impl Broker {
                     continue;
                 }
 
-                let upsert =
-                    upsert_subscription(&mut state.subscriptions, &client_id, subscription);
+                let upsert = upsert_subscription(
+                    &mut state.subscriptions,
+                    &client_id,
+                    subscription,
+                    subscription_identifier(&packet.properties),
+                );
                 let stored = state.subscriptions[upsert.index].clone();
                 reason_codes.push(protocol::granted_qos_code(stored.options.maximum_qos));
 
@@ -226,16 +236,21 @@ impl Broker {
         })
     }
 
-    fn store_qos2_publish(
-        &self,
-        connection_id: u64,
-        packet_id: u16,
-        packet: PublishPacket,
-    ) -> bool {
+    fn store_qos2_publish(&self, connection_id: u64, packet_id: u16, packet: PublishPacket) -> u8 {
         self.with_state(|state| {
+            if state
+                .qos2_inflight
+                .keys()
+                .filter(|(conn_id, _)| *conn_id == connection_id)
+                .count()
+                >= usize::from(protocol::SERVER_RECEIVE_MAXIMUM)
+            {
+                return protocol::RECEIVE_MAXIMUM_EXCEEDED;
+            }
+
             let key = (connection_id, packet_id);
             if state.qos2_inflight.contains_key(&key) {
-                return false;
+                return protocol::PACKET_IDENTIFIER_IN_USE;
             }
 
             state.qos2_inflight.insert(
@@ -245,7 +260,7 @@ impl Broker {
                     packet,
                 },
             );
-            true
+            protocol::SUCCESS
         })
     }
 
@@ -268,42 +283,39 @@ impl Broker {
         })
     }
 
-    fn complete_outbound_qos1(&self, connection_id: u64, packet_id: u16) -> bool {
+    fn complete_outbound_qos1(&self, connection_id: u64, packet_id: u16) -> Option<Vec<Delivery>> {
         self.with_state(|state| {
-            let Some(client_id) = state
+            let client_id = state
                 .clients_by_connection
                 .get(&connection_id)
-                .map(|client| client.client_id.clone())
-            else {
-                return false;
-            };
-            state
+                .map(|client| client.client_id.clone())?;
+            let removed = state
                 .sessions_by_client_id
                 .get_mut(&client_id)
-                .is_some_and(|session| session.outbound_qos1.remove(&packet_id).is_some())
+                .is_some_and(|session| session.outbound_qos1.remove(&packet_id).is_some());
+            removed.then(|| queued_deliveries_for_client(state, &client_id))
         })
     }
 
-    fn receive_outbound_qos2(&self, connection_id: u64, packet_id: u16) -> bool {
+    fn receive_outbound_qos2(&self, connection_id: u64, packet_id: u16) -> Option<Vec<Delivery>> {
         self.with_state(|state| {
-            let Some(client_id) = state
+            let client_id = state
                 .clients_by_connection
                 .get(&connection_id)
-                .map(|client| client.client_id.clone())
-            else {
-                return false;
-            };
-            let Some(session) = state.sessions_by_client_id.get_mut(&client_id) else {
-                return false;
-            };
+                .map(|client| client.client_id.clone())?;
+            let session = state.sessions_by_client_id.get_mut(&client_id)?;
 
             if session.outbound_qos2_publish.remove(&packet_id).is_some() {
                 session.outbound_qos2_pubrel.insert(packet_id);
-                true
+                Some(queued_deliveries_for_client(state, &client_id))
             } else {
-                false
+                None
             }
         })
+    }
+
+    fn packet_exceeds_server_maximum(&self, packet: &MqttPacket) -> bool {
+        packet_size(packet).is_some_and(|size| size > protocol::SERVER_MAXIMUM_PACKET_SIZE as usize)
     }
 
     fn complete_outbound_qos2(&self, connection_id: u64, packet_id: u16) -> bool {
@@ -356,6 +368,13 @@ struct ConnectOutcome {
     redeliveries: Vec<Delivery>,
 }
 
+struct ConnectOptions {
+    clean_start: bool,
+    session_expiry_interval: u32,
+    receive_maximum: u16,
+    maximum_packet_size: u32,
+}
+
 fn should_publish_will(reason: CloseReason) -> bool {
     !matches!(
         reason,
@@ -369,4 +388,11 @@ fn should_send_retained_on_subscribe(retain_handling: u8, inserted: bool) -> boo
         2 => false,
         _ => true,
     }
+}
+
+fn subscription_identifier(properties: &[rs_netty::codec::MqttProperty]) -> Option<u32> {
+    properties.iter().find_map(|property| match property {
+        rs_netty::codec::MqttProperty::SubscriptionIdentifier(value) => Some(*value),
+        _ => None,
+    })
 }

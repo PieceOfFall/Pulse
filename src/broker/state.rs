@@ -10,6 +10,10 @@ use rs_netty::{
     },
 };
 
+pub(super) const MAX_OFFLINE_QUEUE_LEN: usize = 1024;
+pub(super) const MAX_RETAINED_MESSAGES: usize = 1024;
+pub(super) const MAX_RETAINED_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Default)]
 pub(super) struct BrokerState {
     pub(super) clients_by_connection: HashMap<u64, ClientEntry>,
@@ -114,6 +118,8 @@ pub(super) struct ClientEntry {
     pub(super) channel: Channel<MqttPacket>,
     pub(super) will: Option<Will>,
     pub(super) session_expiry_interval: u32,
+    pub(super) receive_maximum: u16,
+    pub(super) maximum_packet_size: u32,
 }
 
 impl ClientEntry {
@@ -122,12 +128,16 @@ impl ClientEntry {
         channel: Channel<MqttPacket>,
         will: Option<Will>,
         session_expiry_interval: u32,
+        receive_maximum: u16,
+        maximum_packet_size: u32,
     ) -> Self {
         Self {
             client_id,
             channel,
             will,
             session_expiry_interval,
+            receive_maximum,
+            maximum_packet_size,
         }
     }
 }
@@ -137,6 +147,7 @@ pub(super) struct SubscriptionEntry {
     pub(super) client_id: String,
     pub(super) filter: String,
     pub(super) options: SubscriptionOptions,
+    pub(super) subscription_identifier: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -163,7 +174,7 @@ pub(super) fn retain_publish(state: &mut BrokerState, packet: &PublishPacket) {
     let expires_at_ms = message_expires_at_ms(packet, now_ms);
     if packet.payload.is_empty() || is_message_expired(expires_at_ms, now_ms) {
         state.retained.remove(&packet.topic_name);
-    } else {
+    } else if can_store_retained(state, packet) {
         state.retained.insert(
             packet.topic_name.clone(),
             RetainedMessage {
@@ -181,12 +192,14 @@ pub(super) fn upsert_subscription(
     subscriptions: &mut Vec<SubscriptionEntry>,
     client_id: &str,
     subscription: Subscription,
+    subscription_identifier: Option<u32>,
 ) -> UpsertSubscriptionResult {
     if let Some(index) = subscriptions
         .iter_mut()
         .position(|sub| sub.client_id == client_id && sub.filter == subscription.topic_filter)
     {
         subscriptions[index].options = subscription.options;
+        subscriptions[index].subscription_identifier = subscription_identifier;
         return UpsertSubscriptionResult {
             index,
             inserted: false,
@@ -197,6 +210,7 @@ pub(super) fn upsert_subscription(
         client_id: client_id.to_string(),
         filter: subscription.topic_filter,
         options: subscription.options,
+        subscription_identifier,
     });
     UpsertSubscriptionResult {
         index: subscriptions.len() - 1,
@@ -240,4 +254,20 @@ pub(super) fn message_expires_at_ms(packet: &PublishPacket, now_ms: u64) -> Opti
 
 pub(super) fn is_message_expired(expires_at_ms: Option<u64>, now_ms: u64) -> bool {
     expires_at_ms.is_some_and(|expires_at_ms| expires_at_ms <= now_ms)
+}
+
+fn can_store_retained(state: &BrokerState, packet: &PublishPacket) -> bool {
+    if !state.retained.contains_key(&packet.topic_name)
+        && state.retained.len() >= MAX_RETAINED_MESSAGES
+    {
+        return false;
+    }
+
+    let retained_payload_bytes: usize = state
+        .retained
+        .iter()
+        .filter(|(topic_name, _)| *topic_name != &packet.topic_name)
+        .map(|(_, message)| message.payload.len())
+        .sum();
+    retained_payload_bytes.saturating_add(packet.payload.len()) <= MAX_RETAINED_PAYLOAD_BYTES
 }
