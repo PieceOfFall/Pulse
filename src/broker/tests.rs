@@ -177,6 +177,71 @@ async fn keep_alive_activity_resets_timeout() -> rs_netty::Result<()> {
 }
 
 #[tokio::test]
+async fn protocol_error_publishes_will_message() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.connect("subscriber").await?;
+    subscriber
+        .subscribe(1, "clients/publisher/status", QoS::AtMostOnce)
+        .await?;
+
+    let mut publisher = broker.open_client().await?;
+    publisher
+        .write(connect_with_will(
+            "publisher",
+            "clients/publisher/status",
+            "offline",
+        ))
+        .await?;
+    publisher.expect_connack().await?;
+    publisher
+        .write(MqttPacket::ConnAck(rs_netty::codec::ConnAckPacket {
+            session_present: false,
+            reason_code: protocol::SUCCESS,
+            properties: Vec::new(),
+        }))
+        .await?;
+    publisher
+        .expect_disconnect_reason(protocol::PROTOCOL_ERROR)
+        .await?;
+
+    let packet = subscriber.expect_publish("expected will publish").await?;
+    assert_eq!(packet.topic_name, "clients/publisher/status");
+    assert_eq!(packet.payload, Bytes::from_static(b"offline"));
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn normal_disconnect_does_not_publish_will_message() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.connect("subscriber").await?;
+    subscriber
+        .subscribe(1, "clients/publisher/status", QoS::AtMostOnce)
+        .await?;
+
+    let mut publisher = broker.open_client().await?;
+    publisher
+        .write(connect_with_will(
+            "publisher",
+            "clients/publisher/status",
+            "offline",
+        ))
+        .await?;
+    publisher.expect_connack().await?;
+    publisher
+        .write(MqttPacket::Disconnect(rs_netty::codec::DisconnectPacket {
+            reason_code: protocol::SUCCESS,
+            properties: Vec::new(),
+        }))
+        .await?;
+    subscriber
+        .expect_no_packet(Duration::from_millis(200))
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
 async fn qos1_publish_is_delivered_with_qos1_and_acknowledged() -> rs_netty::Result<()> {
     let broker = TestBroker::start().await?;
     let mut subscriber = broker.connect("subscriber").await?;
@@ -437,6 +502,14 @@ impl TestClient {
         Ok(())
     }
 
+    async fn expect_no_packet(&mut self, timeout: Duration) -> rs_netty::Result<()> {
+        assert!(
+            tokio::time::timeout(timeout, self.read()).await.is_err(),
+            "unexpected MQTT packet before timeout"
+        );
+        Ok(())
+    }
+
     async fn expect_disconnect_reason(&mut self, reason_code: u8) -> rs_netty::Result<()> {
         assert!(matches!(
             self.read().await?,
@@ -567,6 +640,24 @@ fn connect_with_keep_alive(client_id: &str, keep_alive: u16) -> MqttPacket {
         properties: Vec::new(),
         client_id: client_id.to_string(),
         will: None,
+        username: None,
+        password: None,
+    })
+}
+
+fn connect_with_will(client_id: &str, topic: &str, payload: &str) -> MqttPacket {
+    MqttPacket::Connect(ConnectPacket {
+        clean_start: true,
+        keep_alive: 60,
+        properties: Vec::new(),
+        client_id: client_id.to_string(),
+        will: Some(Will {
+            qos: QoS::AtMostOnce,
+            retain: false,
+            properties: Vec::new(),
+            topic: topic.to_string(),
+            payload: Bytes::copy_from_slice(payload.as_bytes()),
+        }),
         username: None,
         password: None,
     })

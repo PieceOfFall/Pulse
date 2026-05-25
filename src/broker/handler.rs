@@ -100,6 +100,15 @@ impl MqttHandler {
             properties: Vec::new(),
         }))
         .await?;
+
+        self.stop_keep_alive();
+        if self.connected {
+            self.connected = false;
+            if let Some(will) = self.broker.remove_connection(ctx.id()) {
+                self.broker.publish_will(ctx.id(), will).await;
+            }
+        }
+
         ctx.close().await
     }
 }

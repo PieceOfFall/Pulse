@@ -31,7 +31,10 @@ items are marked with `[x]`.
 - [x] Implement MQTT keep alive semantics
   - [x] Track per-client keep alive from CONNECT and close idle MQTT sessions according to the MQTT 5 timeout rule.
 - [ ] Normalize DISCONNECT reason handling
-  - Distinguish normal disconnect, protocol errors, admin/server close, and will-triggering closes.
+  - [x] Distinguish normal client disconnects from will-triggering protocol errors.
+  - [x] Publish will messages for protocol-error handler closes.
+  - [x] Avoid will publication for normal client DISCONNECT packets.
+  - [ ] Distinguish admin/server close reason codes.
 - [x] Add packet identifier validation
   - [x] Reject missing packet ids where required at the codec layer.
   - [x] Reject zero packet ids at the codec layer.
@@ -39,7 +42,8 @@ items are marked with `[x]`.
   - [x] Detect packet id reuse in broker state.
   - [x] Detect unexpected ACK packets with correct reason codes.
 - [x] Add focused integration tests for CONNECT validation error paths.
-- [ ] Add focused integration tests for malformed packet and protocol error paths.
+- [x] Add focused integration tests for protocol error will-handling paths.
+- [ ] Add focused integration tests for malformed packet paths.
 
 ## 2. Session Model
 
