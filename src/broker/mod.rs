@@ -220,29 +220,37 @@ impl Broker {
         deliveries_for_publish(&mut state, publisher_connection_id, packet)
     }
 
-    fn store_qos2_publish(&self, connection_id: u64, packet_id: u16, packet: PublishPacket) {
+    fn store_qos2_publish(
+        &self,
+        connection_id: u64,
+        packet_id: u16,
+        packet: PublishPacket,
+    ) -> bool {
         let mut state = self.inner.state.lock().expect("broker state lock poisoned");
-        state
-            .qos2_inflight
-            .insert((connection_id, packet_id), packet);
+        let key = (connection_id, packet_id);
+        if state.qos2_inflight.contains_key(&key) {
+            return false;
+        }
+
+        state.qos2_inflight.insert(key, packet);
+        true
     }
 
-    fn complete_qos2_publish(&self, connection_id: u64, packet_id: u16) -> Vec<Delivery> {
+    fn complete_qos2_publish(&self, connection_id: u64, packet_id: u16) -> Option<Vec<Delivery>> {
         let mut state = self.inner.state.lock().expect("broker state lock poisoned");
-        let Some(packet) = state.qos2_inflight.remove(&(connection_id, packet_id)) else {
-            return Vec::new();
-        };
+        let packet = state.qos2_inflight.remove(&(connection_id, packet_id))?;
 
         retain_publish(&mut state, &packet);
 
-        deliveries_for_publish(&mut state, connection_id, &packet)
+        Some(deliveries_for_publish(&mut state, connection_id, &packet))
     }
 
-    fn complete_outbound_qos1(&self, connection_id: u64, packet_id: u16) {
+    fn complete_outbound_qos1(&self, connection_id: u64, packet_id: u16) -> bool {
         let mut state = self.inner.state.lock().expect("broker state lock poisoned");
-        if let Some(client) = state.clients_by_connection.get_mut(&connection_id) {
-            client.outbound_qos1.remove(&packet_id);
-        }
+        state
+            .clients_by_connection
+            .get_mut(&connection_id)
+            .is_some_and(|client| client.outbound_qos1.remove(&packet_id))
     }
 
     fn receive_outbound_qos2(&self, connection_id: u64, packet_id: u16) -> bool {
@@ -259,11 +267,12 @@ impl Broker {
         }
     }
 
-    fn complete_outbound_qos2(&self, connection_id: u64, packet_id: u16) {
+    fn complete_outbound_qos2(&self, connection_id: u64, packet_id: u16) -> bool {
         let mut state = self.inner.state.lock().expect("broker state lock poisoned");
-        if let Some(client) = state.clients_by_connection.get_mut(&connection_id) {
-            client.outbound_qos2_pubrel.remove(&packet_id);
-        }
+        state
+            .clients_by_connection
+            .get_mut(&connection_id)
+            .is_some_and(|client| client.outbound_qos2_pubrel.remove(&packet_id))
     }
 
     fn remove_connection(&self, connection_id: u64) -> Option<Will> {

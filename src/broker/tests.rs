@@ -208,6 +208,68 @@ async fn qos2_publish_completes_both_handshakes() -> rs_netty::Result<()> {
 }
 
 #[tokio::test]
+async fn qos2_duplicate_packet_id_is_rejected_without_replacing_original() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.connect("subscriber").await?;
+    subscriber
+        .subscribe(1, "devices/dup", QoS::ExactlyOnce)
+        .await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish("devices/dup", QoS::ExactlyOnce, Some(9), "first"))
+        .await?;
+    publisher.expect_pubrec(9).await?;
+    publisher
+        .write(publish("devices/dup", QoS::ExactlyOnce, Some(9), "second"))
+        .await?;
+    publisher
+        .expect_pubrec_reason(9, protocol::PACKET_IDENTIFIER_IN_USE)
+        .await?;
+    publisher
+        .write(MqttPacket::PubRel(AckPacket::new(9, protocol::SUCCESS)))
+        .await?;
+    publisher.expect_pubcomp(9).await?;
+
+    let packet = subscriber
+        .expect_publish("expected original publish")
+        .await?;
+    assert_eq!(packet.payload, Bytes::from_static(b"first"));
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn pubrel_for_missing_inbound_packet_id_returns_not_found() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut publisher = broker.connect("publisher").await?;
+
+    publisher
+        .write(MqttPacket::PubRel(AckPacket::new(42, protocol::SUCCESS)))
+        .await?;
+    publisher
+        .expect_pubcomp_reason(42, protocol::PACKET_IDENTIFIER_NOT_FOUND)
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn unexpected_outbound_ack_disconnects_client() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut client = broker.connect("subscriber").await?;
+
+    client
+        .write(MqttPacket::PubAck(AckPacket::new(42, protocol::SUCCESS)))
+        .await?;
+    client
+        .expect_disconnect_reason(protocol::PACKET_IDENTIFIER_NOT_FOUND)
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
 async fn retained_qos2_publish_replays_at_subscriber_qos() -> rs_netty::Result<()> {
     let broker = TestBroker::start().await?;
     let mut publisher = broker.connect("publisher").await?;
@@ -333,6 +395,14 @@ impl TestClient {
         Ok(())
     }
 
+    async fn expect_disconnect_reason(&mut self, reason_code: u8) -> rs_netty::Result<()> {
+        assert!(matches!(
+            self.read().await?,
+            MqttPacket::Disconnect(packet) if packet.reason_code == reason_code
+        ));
+        Ok(())
+    }
+
     async fn expect_publish(&mut self, message: &str) -> rs_netty::Result<PublishPacket> {
         let delivered = self.read().await?;
         let MqttPacket::Publish(packet) = delivered else {
@@ -350,9 +420,19 @@ impl TestClient {
     }
 
     async fn expect_pubrec(&mut self, packet_id: u16) -> rs_netty::Result<()> {
+        self.expect_pubrec_reason(packet_id, protocol::SUCCESS)
+            .await
+    }
+
+    async fn expect_pubrec_reason(
+        &mut self,
+        packet_id: u16,
+        reason_code: u8,
+    ) -> rs_netty::Result<()> {
         assert!(matches!(
             self.read().await?,
-            MqttPacket::PubRec(packet) if packet.packet_id == packet_id
+            MqttPacket::PubRec(packet)
+                if packet.packet_id == packet_id && packet.reason_code == reason_code
         ));
         Ok(())
     }
@@ -366,9 +446,19 @@ impl TestClient {
     }
 
     async fn expect_pubcomp(&mut self, packet_id: u16) -> rs_netty::Result<()> {
+        self.expect_pubcomp_reason(packet_id, protocol::SUCCESS)
+            .await
+    }
+
+    async fn expect_pubcomp_reason(
+        &mut self,
+        packet_id: u16,
+        reason_code: u8,
+    ) -> rs_netty::Result<()> {
         assert!(matches!(
             self.read().await?,
-            MqttPacket::PubComp(packet) if packet.packet_id == packet_id
+            MqttPacket::PubComp(packet)
+                if packet.packet_id == packet_id && packet.reason_code == reason_code
         ));
         Ok(())
     }

@@ -12,6 +12,8 @@ pub const BAD_USER_NAME_OR_PASSWORD: u8 = 0x86;
 pub const BAD_AUTHENTICATION_METHOD: u8 = 0x8c;
 pub const TOPIC_FILTER_INVALID: u8 = 0x8f;
 pub const TOPIC_NAME_INVALID: u8 = 0x90;
+pub const PACKET_IDENTIFIER_IN_USE: u8 = 0x91;
+pub const PACKET_IDENTIFIER_NOT_FOUND: u8 = 0x92;
 pub const PAYLOAD_FORMAT_INVALID: u8 = 0x99;
 
 pub fn granted_qos_code(qos: QoS) -> u8 {

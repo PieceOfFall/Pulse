@@ -36,8 +36,8 @@ items are marked with `[x]`.
   - [x] Reject missing packet ids where required at the codec layer.
   - [x] Reject zero packet ids at the codec layer.
   - [x] Reject QoS 0 PUBLISH packet ids at the codec layer.
-  - [ ] Detect packet id reuse in broker state.
-  - [ ] Detect unexpected ACK packets with correct reason codes.
+  - [x] Detect packet id reuse in broker state.
+  - [x] Detect unexpected ACK packets with correct reason codes.
 - [x] Add focused integration tests for CONNECT validation error paths.
 - [ ] Add focused integration tests for malformed packet and protocol error paths.
 

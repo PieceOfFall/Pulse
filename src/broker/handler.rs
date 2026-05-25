@@ -131,12 +131,14 @@ impl Handler<MqttPacket> for MqttHandler {
                     }
                     QoS::ExactlyOnce => {
                         return if let Some(packet_id) = packet.packet_id {
-                            self.broker.store_qos2_publish(ctx.id(), packet_id, packet);
-                            ctx.write(MqttPacket::PubRec(AckPacket::new(
-                                packet_id,
-                                protocol::SUCCESS,
-                            )))
-                            .await?;
+                            let reason_code =
+                                if self.broker.store_qos2_publish(ctx.id(), packet_id, packet) {
+                                    protocol::SUCCESS
+                                } else {
+                                    protocol::PACKET_IDENTIFIER_IN_USE
+                                };
+                            ctx.write(MqttPacket::PubRec(AckPacket::new(packet_id, reason_code)))
+                                .await?;
                             Ok(())
                         } else {
                             self.disconnect(ctx, protocol::MALFORMED_PACKET).await
@@ -149,9 +151,18 @@ impl Handler<MqttPacket> for MqttHandler {
                 Ok(())
             }
             MqttPacket::PubRel(packet) => {
-                let deliveries = self
+                let Some(deliveries) = self
                     .broker
-                    .complete_qos2_publish(ctx.id(), packet.packet_id);
+                    .complete_qos2_publish(ctx.id(), packet.packet_id)
+                else {
+                    return ctx
+                        .write(MqttPacket::PubComp(AckPacket::new(
+                            packet.packet_id,
+                            protocol::PACKET_IDENTIFIER_NOT_FOUND,
+                        )))
+                        .await;
+                };
+
                 flush_deliveries(deliveries).await;
                 ctx.write(MqttPacket::PubComp(AckPacket::new(
                     packet.packet_id,
@@ -160,8 +171,14 @@ impl Handler<MqttPacket> for MqttHandler {
                 .await
             }
             MqttPacket::PubAck(packet) => {
-                self.broker
-                    .complete_outbound_qos1(ctx.id(), packet.packet_id);
+                if !self
+                    .broker
+                    .complete_outbound_qos1(ctx.id(), packet.packet_id)
+                {
+                    return self
+                        .disconnect(ctx, protocol::PACKET_IDENTIFIER_NOT_FOUND)
+                        .await;
+                }
                 Ok(())
             }
             MqttPacket::PubRec(packet) => {
@@ -175,12 +192,19 @@ impl Handler<MqttPacket> for MqttHandler {
                     )))
                     .await
                 } else {
-                    Ok(())
+                    self.disconnect(ctx, protocol::PACKET_IDENTIFIER_NOT_FOUND)
+                        .await
                 }
             }
             MqttPacket::PubComp(packet) => {
-                self.broker
-                    .complete_outbound_qos2(ctx.id(), packet.packet_id);
+                if !self
+                    .broker
+                    .complete_outbound_qos2(ctx.id(), packet.packet_id)
+                {
+                    return self
+                        .disconnect(ctx, protocol::PACKET_IDENTIFIER_NOT_FOUND)
+                        .await;
+                }
                 Ok(())
             }
             MqttPacket::Auth(_) => {
