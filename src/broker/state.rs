@@ -61,10 +61,7 @@ impl BrokerState {
             let expires_at_ms = session_expires_at_ms(client.session_expiry_interval);
             self.sessions_by_client_id.insert(
                 client.client_id.clone(),
-                SessionEntry {
-                    expires_at_ms,
-                    _expiry_interval: client.session_expiry_interval,
-                },
+                SessionEntry::disconnected(client.session_expiry_interval, expires_at_ms),
             );
         }
         Some(client)
@@ -73,14 +70,21 @@ impl BrokerState {
 
 pub(super) struct SessionEntry {
     pub(super) expires_at_ms: Option<u64>,
-    _expiry_interval: u32,
+    pub(super) session_expiry_interval: u32,
 }
 
 impl SessionEntry {
     pub(super) fn connected(session_expiry_interval: u32) -> Self {
         Self {
             expires_at_ms: None,
-            _expiry_interval: session_expiry_interval,
+            session_expiry_interval,
+        }
+    }
+
+    pub(super) fn disconnected(session_expiry_interval: u32, expires_at_ms: Option<u64>) -> Self {
+        Self {
+            expires_at_ms,
+            session_expiry_interval,
         }
     }
 }

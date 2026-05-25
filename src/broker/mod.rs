@@ -7,6 +7,7 @@ mod storage;
 #[cfg(test)]
 mod tests;
 
+use std::path::Path;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -31,7 +32,7 @@ use self::delivery::{
 use self::state::{
     BrokerState, ClientEntry, SessionEntry, now_ms, retain_publish, upsert_subscription,
 };
-use self::storage::{BrokerStorage, InMemoryStorage};
+use self::storage::{BrokerStorage, InMemoryStorage, SqliteStorage};
 
 #[derive(Clone)]
 pub struct Broker {
@@ -46,6 +47,10 @@ struct BrokerInner {
 impl Broker {
     pub fn new() -> Self {
         Self::with_storage(Arc::new(InMemoryStorage::default()))
+    }
+
+    pub fn with_sqlite(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
+        Ok(Self::with_storage(Arc::new(SqliteStorage::open(path)?)))
     }
 
     pub(in crate::broker) fn with_storage(storage: Arc<dyn BrokerStorage>) -> Self {

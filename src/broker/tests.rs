@@ -380,6 +380,45 @@ async fn expired_session_does_not_resume_subscriptions() -> rs_netty::Result<()>
 }
 
 #[tokio::test]
+async fn sqlite_broker_recovers_retained_messages_after_restart() -> rs_netty::Result<()> {
+    let path = temp_sqlite_path("retained-restart");
+    let _ = std::fs::remove_file(&path);
+
+    let broker =
+        TestBroker::start_with_broker(Broker::with_sqlite(&path).expect("sqlite broker")).await?;
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish_with_retain(
+            "devices/sqlite",
+            QoS::AtLeastOnce,
+            Some(3),
+            "durable",
+            true,
+        ))
+        .await?;
+    publisher.expect_puback(3).await?;
+    broker.shutdown().await?;
+
+    let broker =
+        TestBroker::start_with_broker(Broker::with_sqlite(&path).expect("sqlite broker")).await?;
+    let mut subscriber = broker.connect("subscriber").await?;
+    subscriber
+        .subscribe(1, "devices/sqlite", QoS::AtMostOnce)
+        .await?;
+
+    let packet = subscriber
+        .expect_publish("expected recovered retained publish")
+        .await?;
+    assert_eq!(packet.qos, QoS::AtMostOnce);
+    assert!(packet.retain);
+    assert_eq!(packet.payload, Bytes::from_static(b"durable"));
+
+    broker.shutdown().await?;
+    cleanup_sqlite_path(&path);
+    Ok(())
+}
+
+#[tokio::test]
 async fn qos1_publish_is_delivered_with_qos1_and_acknowledged() -> rs_netty::Result<()> {
     let broker = TestBroker::start().await?;
     let mut subscriber = broker.connect("subscriber").await?;
@@ -546,7 +585,10 @@ struct TestBroker {
 
 impl TestBroker {
     async fn start() -> rs_netty::Result<Self> {
-        let broker = Broker::new();
+        Self::start_with_broker(Broker::new()).await
+    }
+
+    async fn start_with_broker(broker: Broker) -> rs_netty::Result<Self> {
         let server = TcpServer::bind("127.0.0.1:0")
             .life(BrokerLife::new(broker.clone()))
             .pipeline(move || {
@@ -583,6 +625,16 @@ impl TestBroker {
         self.server.shutdown();
         self.server.wait().await
     }
+}
+
+fn temp_sqlite_path(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("mqtt-rs-{name}-{}.db", std::process::id()))
+}
+
+fn cleanup_sqlite_path(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(path.with_extension("db-shm"));
 }
 
 struct TestClient {

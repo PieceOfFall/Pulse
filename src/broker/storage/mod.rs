@@ -1,6 +1,8 @@
 mod memory;
+mod sqlite;
 
 pub(super) use memory::InMemoryStorage;
+pub(super) use sqlite::SqliteStorage;
 
 use super::state::BrokerState;
 
