@@ -49,6 +49,17 @@ struct BrokerState {
     qos2_inflight: HashMap<(u64, u16), PublishPacket>,
 }
 
+impl BrokerState {
+    fn remove_connection_state(&mut self, connection_id: u64) -> Option<ClientEntry> {
+        let client = self.clients_by_connection.remove(&connection_id)?;
+        self.subscriptions
+            .retain(|sub| sub.connection_id != connection_id);
+        self.qos2_inflight
+            .retain(|(conn_id, _), _| *conn_id != connection_id);
+        Some(client)
+    }
+}
+
 struct ClientEntry {
     client_id: String,
     channel: Channel<MqttPacket>,
@@ -111,13 +122,7 @@ impl Broker {
             .insert(client_id.clone(), connection_id)
         {
             if previous_connection_id != connection_id {
-                let previous = state.clients_by_connection.remove(&previous_connection_id);
-                state
-                    .subscriptions
-                    .retain(|sub| sub.connection_id != previous_connection_id);
-                state
-                    .qos2_inflight
-                    .retain(|(conn_id, _), _| *conn_id != previous_connection_id);
+                let previous = state.remove_connection_state(previous_connection_id);
                 previous.map(|previous| previous.channel)
             } else {
                 None
@@ -263,14 +268,8 @@ impl Broker {
 
     fn remove_connection(&self, connection_id: u64) -> Option<Will> {
         let mut state = self.inner.state.lock().expect("broker state lock poisoned");
-        let client = state.clients_by_connection.remove(&connection_id)?;
+        let client = state.remove_connection_state(connection_id)?;
         state.connection_by_client_id.remove(&client.client_id);
-        state
-            .subscriptions
-            .retain(|sub| sub.connection_id != connection_id);
-        state
-            .qos2_inflight
-            .retain(|(conn_id, _), _| *conn_id != connection_id);
         client.will
     }
 

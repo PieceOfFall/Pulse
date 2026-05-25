@@ -8,6 +8,7 @@ use rs_netty::{
         SubscribePacket, Subscription, SubscriptionOptions, mqtt::AckPacket,
     },
     pipeline,
+    transport::tcp::server::TcpServerHandle,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -18,24 +19,9 @@ use super::{Broker, BrokerLife, MqttHandler, SubscriptionEntry, protocol, upsert
 
 #[tokio::test]
 async fn duplicate_client_id_closes_previous_connection() -> rs_netty::Result<()> {
-    let broker = Broker::new();
-    let server = TcpServer::bind("127.0.0.1:0")
-        .life(BrokerLife::new(broker.clone()))
-        .pipeline(move || {
-            pipeline()
-                .codec(MqttCodec::with_max_packet_size(1024 * 1024))
-                .handler(MqttHandler::new(broker.clone()))
-        })
-        .start()
-        .await?;
-
-    let mut first = TcpStream::connect(server.local_addr()).await?;
-    first.write_all(&connect_packet("same-client")).await?;
-    read_connack(&mut first).await?;
-
-    let mut second = TcpStream::connect(server.local_addr()).await?;
-    second.write_all(&connect_packet("same-client")).await?;
-    read_connack(&mut second).await?;
+    let broker = TestBroker::start().await?;
+    let mut first = broker.connect_raw("same-client").await?;
+    let _second = broker.connect_raw("same-client").await?;
 
     let mut buf = [0; 1];
     let read = tokio::time::timeout(Duration::from_millis(200), first.read(&mut buf))
@@ -43,8 +29,7 @@ async fn duplicate_client_id_closes_previous_connection() -> rs_netty::Result<()
         .expect("previous connection should close")?;
     assert_eq!(read, 0);
 
-    server.shutdown();
-    server.wait().await
+    broker.shutdown().await
 }
 
 #[test]
@@ -81,219 +66,221 @@ fn upsert_subscription_returns_updated_subscription_index() {
 
 #[tokio::test]
 async fn qos1_publish_is_delivered_with_qos1_and_acknowledged() -> rs_netty::Result<()> {
-    let broker = Broker::new();
-    let server = TcpServer::bind("127.0.0.1:0")
-        .life(BrokerLife::new(broker.clone()))
-        .pipeline(move || {
-            pipeline()
-                .codec(MqttCodec::with_max_packet_size(1024 * 1024))
-                .handler(MqttHandler::new(broker.clone()))
-        })
-        .start()
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.connect("subscriber").await?;
+    subscriber
+        .subscribe(1, "devices/one", QoS::AtLeastOnce)
         .await?;
 
-    let mut subscriber = TcpStream::connect(server.local_addr()).await?;
-    let mut subscriber_buf = BytesMut::new();
-    write_packet(&mut subscriber, connect("subscriber")).await?;
-    assert!(matches!(
-        read_packet_with_buf(&mut subscriber, &mut subscriber_buf).await?,
-        MqttPacket::ConnAck(_)
-    ));
-    write_packet(
-        &mut subscriber,
-        subscribe(1, "devices/one", QoS::AtLeastOnce),
-    )
-    .await?;
-    assert!(matches!(
-        read_packet(&mut subscriber).await?,
-        MqttPacket::SubAck(_)
-    ));
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish("devices/one", QoS::AtLeastOnce, Some(7), "hello"))
+        .await?;
+    publisher.expect_puback(7).await?;
 
-    let mut publisher = TcpStream::connect(server.local_addr()).await?;
-    write_packet(&mut publisher, connect("publisher")).await?;
-    assert!(matches!(
-        read_packet(&mut publisher).await?,
-        MqttPacket::ConnAck(_)
-    ));
-    write_packet(
-        &mut publisher,
-        publish("devices/one", QoS::AtLeastOnce, Some(7), "hello"),
-    )
-    .await?;
-    assert!(matches!(
-        read_packet(&mut publisher).await?,
-        MqttPacket::PubAck(packet) if packet.packet_id == 7
-    ));
-
-    let delivered = read_packet(&mut subscriber).await?;
-    let MqttPacket::Publish(packet) = delivered else {
-        panic!("expected publish, got {delivered:?}");
-    };
+    let packet = subscriber.expect_publish("expected publish").await?;
     assert_eq!(packet.qos, QoS::AtLeastOnce);
     assert_eq!(packet.packet_id, Some(1));
     assert_eq!(packet.payload, Bytes::from_static(b"hello"));
-    write_packet(
-        &mut subscriber,
-        MqttPacket::PubAck(AckPacket::new(packet.packet_id.unwrap(), protocol::SUCCESS)),
-    )
-    .await?;
+    subscriber
+        .write(MqttPacket::PubAck(AckPacket::new(
+            packet.packet_id.unwrap(),
+            protocol::SUCCESS,
+        )))
+        .await?;
 
-    server.shutdown();
-    server.wait().await
+    broker.shutdown().await
 }
 
 #[tokio::test]
 async fn qos2_publish_completes_both_handshakes() -> rs_netty::Result<()> {
-    let broker = Broker::new();
-    let server = TcpServer::bind("127.0.0.1:0")
-        .life(BrokerLife::new(broker.clone()))
-        .pipeline(move || {
-            pipeline()
-                .codec(MqttCodec::with_max_packet_size(1024 * 1024))
-                .handler(MqttHandler::new(broker.clone()))
-        })
-        .start()
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.connect("subscriber").await?;
+    subscriber
+        .subscribe(1, "devices/two", QoS::ExactlyOnce)
         .await?;
 
-    let mut subscriber = TcpStream::connect(server.local_addr()).await?;
-    write_packet(&mut subscriber, connect("subscriber")).await?;
-    assert!(matches!(
-        read_packet(&mut subscriber).await?,
-        MqttPacket::ConnAck(_)
-    ));
-    write_packet(
-        &mut subscriber,
-        subscribe(1, "devices/two", QoS::ExactlyOnce),
-    )
-    .await?;
-    assert!(matches!(
-        read_packet(&mut subscriber).await?,
-        MqttPacket::SubAck(_)
-    ));
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish("devices/two", QoS::ExactlyOnce, Some(9), "hello"))
+        .await?;
+    publisher.expect_pubrec(9).await?;
+    publisher
+        .write(MqttPacket::PubRel(AckPacket::new(9, protocol::SUCCESS)))
+        .await?;
+    publisher.expect_pubcomp(9).await?;
 
-    let mut publisher = TcpStream::connect(server.local_addr()).await?;
-    write_packet(&mut publisher, connect("publisher")).await?;
-    assert!(matches!(
-        read_packet(&mut publisher).await?,
-        MqttPacket::ConnAck(_)
-    ));
-    write_packet(
-        &mut publisher,
-        publish("devices/two", QoS::ExactlyOnce, Some(9), "hello"),
-    )
-    .await?;
-    assert!(matches!(
-        read_packet(&mut publisher).await?,
-        MqttPacket::PubRec(packet) if packet.packet_id == 9
-    ));
-    write_packet(
-        &mut publisher,
-        MqttPacket::PubRel(AckPacket::new(9, protocol::SUCCESS)),
-    )
-    .await?;
-    assert!(matches!(
-        read_packet(&mut publisher).await?,
-        MqttPacket::PubComp(packet) if packet.packet_id == 9
-    ));
-
-    let delivered = read_packet(&mut subscriber).await?;
-    let MqttPacket::Publish(packet) = delivered else {
-        panic!("expected publish, got {delivered:?}");
-    };
+    let packet = subscriber.expect_publish("expected publish").await?;
     assert_eq!(packet.qos, QoS::ExactlyOnce);
     assert_eq!(packet.packet_id, Some(1));
     assert_eq!(packet.payload, Bytes::from_static(b"hello"));
-    write_packet(
-        &mut subscriber,
-        MqttPacket::PubRec(AckPacket::new(packet.packet_id.unwrap(), protocol::SUCCESS)),
-    )
-    .await?;
-    assert!(matches!(
-        read_packet(&mut subscriber).await?,
-        MqttPacket::PubRel(packet) if packet.packet_id == 1
-    ));
-    write_packet(
-        &mut subscriber,
-        MqttPacket::PubComp(AckPacket::new(1, protocol::SUCCESS)),
-    )
-    .await?;
+    subscriber
+        .write(MqttPacket::PubRec(AckPacket::new(
+            packet.packet_id.unwrap(),
+            protocol::SUCCESS,
+        )))
+        .await?;
+    subscriber.expect_pubrel(1).await?;
+    subscriber
+        .write(MqttPacket::PubComp(AckPacket::new(1, protocol::SUCCESS)))
+        .await?;
 
-    server.shutdown();
-    server.wait().await
+    broker.shutdown().await
 }
 
 #[tokio::test]
 async fn retained_qos2_publish_replays_at_subscriber_qos() -> rs_netty::Result<()> {
-    let broker = Broker::new();
-    let server = TcpServer::bind("127.0.0.1:0")
-        .life(BrokerLife::new(broker.clone()))
-        .pipeline(move || {
-            pipeline()
-                .codec(MqttCodec::with_max_packet_size(1024 * 1024))
-                .handler(MqttHandler::new(broker.clone()))
-        })
-        .start()
-        .await?;
-
-    let mut publisher = TcpStream::connect(server.local_addr()).await?;
-    write_packet(&mut publisher, connect("publisher")).await?;
-    assert!(matches!(
-        read_packet(&mut publisher).await?,
-        MqttPacket::ConnAck(_)
-    ));
-    write_packet(
-        &mut publisher,
-        publish_with_retain(
+    let broker = TestBroker::start().await?;
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish_with_retain(
             "devices/retained",
             QoS::ExactlyOnce,
             Some(11),
             "sticky",
             true,
-        ),
-    )
-    .await?;
-    assert!(matches!(
-        read_packet(&mut publisher).await?,
-        MqttPacket::PubRec(packet) if packet.packet_id == 11
-    ));
-    write_packet(
-        &mut publisher,
-        MqttPacket::PubRel(AckPacket::new(11, protocol::SUCCESS)),
-    )
-    .await?;
-    assert!(matches!(
-        read_packet(&mut publisher).await?,
-        MqttPacket::PubComp(packet) if packet.packet_id == 11
-    ));
+        ))
+        .await?;
+    publisher.expect_pubrec(11).await?;
+    publisher
+        .write(MqttPacket::PubRel(AckPacket::new(11, protocol::SUCCESS)))
+        .await?;
+    publisher.expect_pubcomp(11).await?;
 
-    let mut subscriber = TcpStream::connect(server.local_addr()).await?;
-    let mut subscriber_buf = BytesMut::new();
-    write_packet(&mut subscriber, connect("subscriber")).await?;
-    assert!(matches!(
-        read_packet_with_buf(&mut subscriber, &mut subscriber_buf).await?,
-        MqttPacket::ConnAck(_)
-    ));
-    write_packet(
-        &mut subscriber,
-        subscribe(1, "devices/retained", QoS::ExactlyOnce),
-    )
-    .await?;
-    assert!(matches!(
-        read_packet_with_buf(&mut subscriber, &mut subscriber_buf).await?,
-        MqttPacket::SubAck(_)
-    ));
+    let mut subscriber = broker.connect("subscriber").await?;
+    subscriber
+        .subscribe(1, "devices/retained", QoS::ExactlyOnce)
+        .await?;
 
-    let delivered = read_packet_with_buf(&mut subscriber, &mut subscriber_buf).await?;
-    let MqttPacket::Publish(packet) = delivered else {
-        panic!("expected retained publish, got {delivered:?}");
-    };
+    let packet = subscriber
+        .expect_publish("expected retained publish")
+        .await?;
     assert_eq!(packet.qos, QoS::ExactlyOnce);
     assert!(packet.retain);
     assert_eq!(packet.packet_id, Some(1));
     assert_eq!(packet.payload, Bytes::from_static(b"sticky"));
 
-    server.shutdown();
-    server.wait().await
+    broker.shutdown().await
+}
+
+struct TestBroker {
+    server: TcpServerHandle,
+}
+
+impl TestBroker {
+    async fn start() -> rs_netty::Result<Self> {
+        let broker = Broker::new();
+        let server = TcpServer::bind("127.0.0.1:0")
+            .life(BrokerLife::new(broker.clone()))
+            .pipeline(move || {
+                pipeline()
+                    .codec(MqttCodec::with_max_packet_size(1024 * 1024))
+                    .handler(MqttHandler::new(broker.clone()))
+            })
+            .start()
+            .await?;
+
+        Ok(Self { server })
+    }
+
+    async fn connect(&self, client_id: &str) -> rs_netty::Result<TestClient> {
+        let stream = TcpStream::connect(self.server.local_addr()).await?;
+        let mut client = TestClient::new(stream);
+        client.write(connect(client_id)).await?;
+        client.expect_connack().await?;
+        Ok(client)
+    }
+
+    async fn connect_raw(&self, client_id: &str) -> rs_netty::Result<TcpStream> {
+        let mut stream = TcpStream::connect(self.server.local_addr()).await?;
+        stream.write_all(&connect_packet(client_id)).await?;
+        read_connack(&mut stream).await?;
+        Ok(stream)
+    }
+
+    async fn shutdown(self) -> rs_netty::Result<()> {
+        self.server.shutdown();
+        self.server.wait().await
+    }
+}
+
+struct TestClient {
+    stream: TcpStream,
+    buf: BytesMut,
+}
+
+impl TestClient {
+    fn new(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            buf: BytesMut::new(),
+        }
+    }
+
+    async fn write(&mut self, packet: MqttPacket) -> rs_netty::Result<()> {
+        write_packet(&mut self.stream, packet).await
+    }
+
+    async fn read(&mut self) -> rs_netty::Result<MqttPacket> {
+        read_packet_with_buf(&mut self.stream, &mut self.buf).await
+    }
+
+    async fn subscribe(
+        &mut self,
+        packet_id: u16,
+        topic_filter: &str,
+        maximum_qos: QoS,
+    ) -> rs_netty::Result<()> {
+        self.write(subscribe(packet_id, topic_filter, maximum_qos))
+            .await?;
+        assert!(matches!(self.read().await?, MqttPacket::SubAck(_)));
+        Ok(())
+    }
+
+    async fn expect_connack(&mut self) -> rs_netty::Result<()> {
+        assert!(matches!(self.read().await?, MqttPacket::ConnAck(_)));
+        Ok(())
+    }
+
+    async fn expect_publish(&mut self, message: &str) -> rs_netty::Result<PublishPacket> {
+        let delivered = self.read().await?;
+        let MqttPacket::Publish(packet) = delivered else {
+            panic!("{message}, got {delivered:?}");
+        };
+        Ok(packet)
+    }
+
+    async fn expect_puback(&mut self, packet_id: u16) -> rs_netty::Result<()> {
+        assert!(matches!(
+            self.read().await?,
+            MqttPacket::PubAck(packet) if packet.packet_id == packet_id
+        ));
+        Ok(())
+    }
+
+    async fn expect_pubrec(&mut self, packet_id: u16) -> rs_netty::Result<()> {
+        assert!(matches!(
+            self.read().await?,
+            MqttPacket::PubRec(packet) if packet.packet_id == packet_id
+        ));
+        Ok(())
+    }
+
+    async fn expect_pubrel(&mut self, packet_id: u16) -> rs_netty::Result<()> {
+        assert!(matches!(
+            self.read().await?,
+            MqttPacket::PubRel(packet) if packet.packet_id == packet_id
+        ));
+        Ok(())
+    }
+
+    async fn expect_pubcomp(&mut self, packet_id: u16) -> rs_netty::Result<()> {
+        assert!(matches!(
+            self.read().await?,
+            MqttPacket::PubComp(packet) if packet.packet_id == packet_id
+        ));
+        Ok(())
+    }
 }
 
 fn connect_packet(client_id: &str) -> Vec<u8> {
@@ -388,11 +375,6 @@ async fn write_packet(stream: &mut TcpStream, packet: MqttPacket) -> rs_netty::R
     codec.encode(packet, &mut buf)?;
     stream.write_all(&buf).await?;
     Ok(())
-}
-
-async fn read_packet(stream: &mut TcpStream) -> rs_netty::Result<MqttPacket> {
-    let mut buf = BytesMut::new();
-    read_packet_with_buf(stream, &mut buf).await
 }
 
 async fn read_packet_with_buf(

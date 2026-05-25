@@ -113,16 +113,16 @@ impl Handler<MqttPacket> for MqttHandler {
                         }
                     }
                     QoS::ExactlyOnce => {
-                        if let Some(packet_id) = packet.packet_id {
+                        return if let Some(packet_id) = packet.packet_id {
                             self.broker.store_qos2_publish(ctx.id(), packet_id, packet);
                             ctx.write(MqttPacket::PubRec(AckPacket::new(
                                 packet_id,
                                 protocol::SUCCESS,
                             )))
-                            .await?;
-                            return Ok(());
+                                .await?;
+                            Ok(())
                         } else {
-                            return self.disconnect(ctx, protocol::MALFORMED_PACKET).await;
+                            self.disconnect(ctx, protocol::MALFORMED_PACKET).await
                         }
                     }
                 }
