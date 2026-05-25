@@ -99,8 +99,8 @@ items are marked with `[x]`.
 
 ## 7. Persistence
 
-- [ ] Define storage traits for sessions, subscriptions, retained messages, and inflight messages.
-- [ ] Implement an in-memory storage backend as the default.
+- [x] Define storage traits for sessions, subscriptions, retained messages, and inflight messages.
+- [x] Implement an in-memory storage backend as the default.
 - [ ] Add an optional durable backend.
 - [ ] Add crash/restart recovery tests for retained messages and persistent sessions.
 

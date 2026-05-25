@@ -6,4 +6,5 @@ edition = "2024"
 [dependencies]
 bytes = "1"
 rs-netty = "0.2.3"
+rusqlite = { version = "0.39.0", features = ["bundled"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
