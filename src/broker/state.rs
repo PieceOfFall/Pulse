@@ -59,10 +59,15 @@ impl BrokerState {
                 .retain(|sub| sub.client_id != client.client_id);
         } else if !preserve_session {
             let expires_at_ms = session_expires_at_ms(client.session_expiry_interval);
-            self.sessions_by_client_id.insert(
-                client.client_id.clone(),
-                SessionEntry::disconnected(client.session_expiry_interval, expires_at_ms),
-            );
+            self.sessions_by_client_id
+                .entry(client.client_id.clone())
+                .and_modify(|session| {
+                    session.expires_at_ms = expires_at_ms;
+                    session.session_expiry_interval = client.session_expiry_interval;
+                })
+                .or_insert_with(|| {
+                    SessionEntry::disconnected(client.session_expiry_interval, expires_at_ms)
+                });
         }
         Some(client)
     }
@@ -71,6 +76,10 @@ impl BrokerState {
 pub(super) struct SessionEntry {
     pub(super) expires_at_ms: Option<u64>,
     pub(super) session_expiry_interval: u32,
+    pub(super) next_packet_id: u16,
+    pub(super) outbound_qos1: HashMap<u16, PublishPacket>,
+    pub(super) outbound_qos2_publish: HashMap<u16, PublishPacket>,
+    pub(super) outbound_qos2_pubrel: HashSet<u16>,
 }
 
 impl SessionEntry {
@@ -78,6 +87,10 @@ impl SessionEntry {
         Self {
             expires_at_ms: None,
             session_expiry_interval,
+            next_packet_id: 1,
+            outbound_qos1: HashMap::new(),
+            outbound_qos2_publish: HashMap::new(),
+            outbound_qos2_pubrel: HashSet::new(),
         }
     }
 
@@ -85,6 +98,10 @@ impl SessionEntry {
         Self {
             expires_at_ms,
             session_expiry_interval,
+            next_packet_id: 1,
+            outbound_qos1: HashMap::new(),
+            outbound_qos2_publish: HashMap::new(),
+            outbound_qos2_pubrel: HashSet::new(),
         }
     }
 }
@@ -94,10 +111,6 @@ pub(super) struct ClientEntry {
     pub(super) channel: Channel<MqttPacket>,
     pub(super) will: Option<Will>,
     pub(super) session_expiry_interval: u32,
-    pub(super) next_packet_id: u16,
-    pub(super) outbound_qos1: HashSet<u16>,
-    pub(super) outbound_qos2_publish: HashSet<u16>,
-    pub(super) outbound_qos2_pubrel: HashSet<u16>,
 }
 
 impl ClientEntry {
@@ -112,10 +125,6 @@ impl ClientEntry {
             channel,
             will,
             session_expiry_interval,
-            next_packet_id: 1,
-            outbound_qos1: HashSet::new(),
-            outbound_qos2_publish: HashSet::new(),
-            outbound_qos2_pubrel: HashSet::new(),
         }
     }
 }
@@ -159,13 +168,16 @@ pub(super) fn upsert_subscription(
     subscriptions: &mut Vec<SubscriptionEntry>,
     client_id: &str,
     subscription: Subscription,
-) -> usize {
+) -> UpsertSubscriptionResult {
     if let Some(index) = subscriptions
         .iter_mut()
         .position(|sub| sub.client_id == client_id && sub.filter == subscription.topic_filter)
     {
         subscriptions[index].options = subscription.options;
-        return index;
+        return UpsertSubscriptionResult {
+            index,
+            inserted: false,
+        };
     }
 
     subscriptions.push(SubscriptionEntry {
@@ -173,7 +185,15 @@ pub(super) fn upsert_subscription(
         filter: subscription.topic_filter,
         options: subscription.options,
     });
-    subscriptions.len() - 1
+    UpsertSubscriptionResult {
+        index: subscriptions.len() - 1,
+        inserted: true,
+    }
+}
+
+pub(super) struct UpsertSubscriptionResult {
+    pub(super) index: usize,
+    pub(super) inserted: bool,
 }
 
 fn session_expires_at_ms(session_expiry_interval: u32) -> Option<u64> {

@@ -5,7 +5,7 @@ use rs_netty::{
 
 use crate::protocol;
 
-use super::state::{BrokerState, ClientEntry, RetainedMessage, SubscriptionEntry};
+use super::state::{BrokerState, RetainedMessage, SessionEntry, SubscriptionEntry};
 
 #[derive(Clone)]
 pub(super) struct Delivery {
@@ -36,9 +36,15 @@ pub(super) fn deliveries_for_publish(
         .into_iter()
         .filter_map(|sub| {
             let connection_id = state.connection_by_client_id.get(&sub.client_id)?;
-            let client = state.clients_by_connection.get_mut(connection_id)?;
+            let channel = state
+                .clients_by_connection
+                .get(connection_id)?
+                .channel
+                .clone();
+            let session = state.sessions_by_client_id.get_mut(&sub.client_id)?;
             Some(delivery_for_client(
-                client,
+                session,
+                channel,
                 packet,
                 sub.options.maximum_qos,
                 sub.options.retain_as_published && packet.retain,
@@ -61,7 +67,14 @@ pub(super) fn retained_for_subscription(
     let Some(connection_id) = state.connection_by_client_id.get(&subscription.client_id) else {
         return Vec::new();
     };
-    let Some(client) = state.clients_by_connection.get_mut(connection_id) else {
+    let Some(channel) = state
+        .clients_by_connection
+        .get(connection_id)
+        .map(|client| client.channel.clone())
+    else {
+        return Vec::new();
+    };
+    let Some(session) = state.sessions_by_client_id.get_mut(&subscription.client_id) else {
         return Vec::new();
     };
 
@@ -69,7 +82,8 @@ pub(super) fn retained_for_subscription(
         .into_iter()
         .map(|message| {
             delivery_for_client(
-                client,
+                session,
+                channel.clone(),
                 &PublishPacket {
                     dup: false,
                     qos: message.qos,
@@ -86,8 +100,40 @@ pub(super) fn retained_for_subscription(
         .collect()
 }
 
+pub(super) fn redeliveries_for_client(state: &mut BrokerState, client_id: &str) -> Vec<Delivery> {
+    let Some(connection_id) = state.connection_by_client_id.get(client_id) else {
+        return Vec::new();
+    };
+    let Some(channel) = state
+        .clients_by_connection
+        .get(connection_id)
+        .map(|client| client.channel.clone())
+    else {
+        return Vec::new();
+    };
+    let Some(session) = state.sessions_by_client_id.get(client_id) else {
+        return Vec::new();
+    };
+
+    session
+        .outbound_qos1
+        .iter()
+        .chain(session.outbound_qos2_publish.iter())
+        .map(|(packet_id, packet)| {
+            let mut packet = packet.clone();
+            packet.dup = true;
+            packet.packet_id = Some(*packet_id);
+            Delivery {
+                channel: channel.clone(),
+                packet: MqttPacket::Publish(packet),
+            }
+        })
+        .collect()
+}
+
 fn delivery_for_client(
-    client: &mut ClientEntry,
+    session: &mut SessionEntry,
+    channel: Channel<MqttPacket>,
     packet: &PublishPacket,
     maximum_qos: QoS,
     retain: bool,
@@ -96,28 +142,44 @@ fn delivery_for_client(
     let packet_id = match qos {
         QoS::AtMostOnce => None,
         QoS::AtLeastOnce => {
-            let packet_id = next_packet_id(client);
-            client.outbound_qos1.insert(packet_id);
+            let packet_id = next_packet_id(session);
+            session.outbound_qos1.insert(
+                packet_id,
+                pending_publish(packet, qos, retain, Some(packet_id), false),
+            );
             Some(packet_id)
         }
         QoS::ExactlyOnce => {
-            let packet_id = next_packet_id(client);
-            client.outbound_qos2_publish.insert(packet_id);
+            let packet_id = next_packet_id(session);
+            session.outbound_qos2_publish.insert(
+                packet_id,
+                pending_publish(packet, qos, retain, Some(packet_id), false),
+            );
             Some(packet_id)
         }
     };
 
     Delivery {
-        channel: client.channel.clone(),
-        packet: MqttPacket::Publish(PublishPacket {
-            dup: false,
-            qos,
-            retain,
-            topic_name: packet.topic_name.clone(),
-            packet_id,
-            properties: packet.properties.clone(),
-            payload: packet.payload.clone(),
-        }),
+        channel,
+        packet: MqttPacket::Publish(pending_publish(packet, qos, retain, packet_id, false)),
+    }
+}
+
+fn pending_publish(
+    packet: &PublishPacket,
+    qos: QoS,
+    retain: bool,
+    packet_id: Option<u16>,
+    dup: bool,
+) -> PublishPacket {
+    PublishPacket {
+        dup,
+        qos,
+        retain,
+        topic_name: packet.topic_name.clone(),
+        packet_id,
+        properties: packet.properties.clone(),
+        payload: packet.payload.clone(),
     }
 }
 
@@ -137,18 +199,18 @@ fn qos_rank(qos: QoS) -> u8 {
     }
 }
 
-fn next_packet_id(client: &mut ClientEntry) -> u16 {
+fn next_packet_id(session: &mut SessionEntry) -> u16 {
     loop {
-        let packet_id = client.next_packet_id;
-        client.next_packet_id = if client.next_packet_id == u16::MAX {
+        let packet_id = session.next_packet_id;
+        session.next_packet_id = if session.next_packet_id == u16::MAX {
             1
         } else {
-            client.next_packet_id + 1
+            session.next_packet_id + 1
         };
 
-        if !client.outbound_qos1.contains(&packet_id)
-            && !client.outbound_qos2_publish.contains(&packet_id)
-            && !client.outbound_qos2_pubrel.contains(&packet_id)
+        if !session.outbound_qos1.contains_key(&packet_id)
+            && !session.outbound_qos2_publish.contains_key(&packet_id)
+            && !session.outbound_qos2_pubrel.contains(&packet_id)
         {
             return packet_id;
         }

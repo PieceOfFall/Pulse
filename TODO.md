@@ -52,8 +52,8 @@ items are marked with `[x]`.
 - [x] Implement Clean Start and `session_present`.
 - [x] Expire sessions according to MQTT v5 Session Expiry Interval rules.
 - [x] Preserve subscriptions across reconnects when the session is persistent.
-- [ ] Preserve QoS 1/2 outbound inflight state across reconnects.
-- [ ] Redeliver pending QoS 1/2 messages with `dup = true` after reconnect.
+- [x] Preserve QoS 1/2 outbound inflight state across reconnects.
+- [x] Redeliver pending QoS 1/2 messages with `dup = true` after reconnect.
 - [x] Add tests for clean start and persistent session resume.
 - [x] Add tests for session expiry.
 
@@ -72,7 +72,7 @@ items are marked with `[x]`.
 
 ## 4. Subscription Features
 
-- [ ] Implement retain handling mode `1` precisely
+- [x] Implement retain handling mode `1` precisely
   - Send retained messages only when a subscription is newly created, not when an existing subscription is updated.
 - [ ] Implement Subscription Identifier
   - Store subscription identifiers and attach them to matching PUBLISH packets.

@@ -50,7 +50,7 @@ fn upsert_subscription_returns_updated_subscription_index() {
         },
     ];
 
-    let index = upsert_subscription(
+    let upsert = upsert_subscription(
         &mut subscriptions,
         "client-one",
         Subscription {
@@ -62,9 +62,13 @@ fn upsert_subscription_returns_updated_subscription_index() {
         },
     );
 
-    assert_eq!(index, 0);
+    assert_eq!(upsert.index, 0);
+    assert!(!upsert.inserted);
     assert_eq!(subscriptions.len(), 2);
-    assert_eq!(subscriptions[index].options.maximum_qos, QoS::ExactlyOnce);
+    assert_eq!(
+        subscriptions[upsert.index].options.maximum_qos,
+        QoS::ExactlyOnce
+    );
 }
 
 #[tokio::test]
@@ -380,6 +384,154 @@ async fn expired_session_does_not_resume_subscriptions() -> rs_netty::Result<()>
 }
 
 #[tokio::test]
+async fn qos1_outbound_inflight_is_redelivered_after_reconnect() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", true, 60))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+    subscriber
+        .subscribe(1, "devices/inflight", QoS::AtLeastOnce)
+        .await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish(
+            "devices/inflight",
+            QoS::AtLeastOnce,
+            Some(7),
+            "pending",
+        ))
+        .await?;
+    publisher.expect_puback(7).await?;
+
+    let packet = subscriber
+        .expect_publish("expected first qos1 delivery")
+        .await?;
+    assert!(!packet.dup);
+    assert_eq!(packet.packet_id, Some(1));
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", false, 60))
+        .await?;
+    subscriber.expect_connack_session_present(true).await?;
+    let packet = subscriber
+        .expect_publish("expected redelivered qos1 publish")
+        .await?;
+    assert!(packet.dup);
+    assert_eq!(packet.qos, QoS::AtLeastOnce);
+    assert_eq!(packet.packet_id, Some(1));
+    assert_eq!(packet.payload, Bytes::from_static(b"pending"));
+    subscriber
+        .write(MqttPacket::PubAck(AckPacket::new(1, protocol::SUCCESS)))
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn qos2_outbound_inflight_is_redelivered_after_reconnect() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", true, 60))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+    subscriber
+        .subscribe(1, "devices/inflight", QoS::ExactlyOnce)
+        .await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish(
+            "devices/inflight",
+            QoS::ExactlyOnce,
+            Some(9),
+            "pending",
+        ))
+        .await?;
+    publisher.expect_pubrec(9).await?;
+    publisher
+        .write(MqttPacket::PubRel(AckPacket::new(9, protocol::SUCCESS)))
+        .await?;
+    publisher.expect_pubcomp(9).await?;
+
+    let packet = subscriber
+        .expect_publish("expected first qos2 delivery")
+        .await?;
+    assert!(!packet.dup);
+    assert_eq!(packet.packet_id, Some(1));
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", false, 60))
+        .await?;
+    subscriber.expect_connack_session_present(true).await?;
+    let packet = subscriber
+        .expect_publish("expected redelivered qos2 publish")
+        .await?;
+    assert!(packet.dup);
+    assert_eq!(packet.qos, QoS::ExactlyOnce);
+    assert_eq!(packet.packet_id, Some(1));
+    assert_eq!(packet.payload, Bytes::from_static(b"pending"));
+    subscriber
+        .write(MqttPacket::PubRec(AckPacket::new(1, protocol::SUCCESS)))
+        .await?;
+    subscriber.expect_pubrel(1).await?;
+    subscriber
+        .write(MqttPacket::PubComp(AckPacket::new(1, protocol::SUCCESS)))
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn clean_start_does_not_redeliver_outbound_inflight() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", true, 60))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+    subscriber
+        .subscribe(1, "devices/inflight", QoS::AtLeastOnce)
+        .await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish(
+            "devices/inflight",
+            QoS::AtLeastOnce,
+            Some(7),
+            "pending",
+        ))
+        .await?;
+    publisher.expect_puback(7).await?;
+    let _ = subscriber
+        .expect_publish("expected first qos1 delivery")
+        .await?;
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", true, 60))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+    subscriber
+        .expect_no_packet(Duration::from_millis(200))
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
 async fn sqlite_broker_recovers_retained_messages_after_restart() -> rs_netty::Result<()> {
     let path = temp_sqlite_path("retained-restart");
     let _ = std::fs::remove_file(&path);
@@ -575,6 +727,51 @@ async fn retained_qos2_publish_replays_at_subscriber_qos() -> rs_netty::Result<(
     assert!(packet.retain);
     assert_eq!(packet.packet_id, Some(1));
     assert_eq!(packet.payload, Bytes::from_static(b"sticky"));
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn retain_handling_one_replays_only_for_new_subscription() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish_with_retain(
+            "devices/retained-once",
+            QoS::AtMostOnce,
+            None,
+            "sticky",
+            true,
+        ))
+        .await?;
+
+    let mut subscriber = broker.connect("subscriber").await?;
+    subscriber
+        .write(subscribe_with_retain_handling(
+            1,
+            "devices/retained-once",
+            QoS::AtMostOnce,
+            1,
+        ))
+        .await?;
+    assert!(matches!(subscriber.read().await?, MqttPacket::SubAck(_)));
+    let packet = subscriber
+        .expect_publish("expected retained publish for new subscription")
+        .await?;
+    assert_eq!(packet.payload, Bytes::from_static(b"sticky"));
+
+    subscriber
+        .write(subscribe_with_retain_handling(
+            2,
+            "devices/retained-once",
+            QoS::AtMostOnce,
+            1,
+        ))
+        .await?;
+    assert!(matches!(subscriber.read().await?, MqttPacket::SubAck(_)));
+    subscriber
+        .expect_no_packet(Duration::from_millis(200))
+        .await?;
 
     broker.shutdown().await
 }
@@ -897,7 +1094,23 @@ fn connect_with_will(client_id: &str, topic: &str, payload: &str) -> MqttPacket 
     })
 }
 
+fn disconnect_success() -> MqttPacket {
+    MqttPacket::Disconnect(rs_netty::codec::DisconnectPacket {
+        reason_code: protocol::SUCCESS,
+        properties: Vec::new(),
+    })
+}
+
 fn subscribe(packet_id: u16, topic_filter: &str, maximum_qos: QoS) -> MqttPacket {
+    subscribe_with_retain_handling(packet_id, topic_filter, maximum_qos, 0)
+}
+
+fn subscribe_with_retain_handling(
+    packet_id: u16,
+    topic_filter: &str,
+    maximum_qos: QoS,
+    retain_handling: u8,
+) -> MqttPacket {
     MqttPacket::Subscribe(SubscribePacket {
         packet_id,
         properties: Vec::new(),
@@ -905,6 +1118,7 @@ fn subscribe(packet_id: u16, topic_filter: &str, maximum_qos: QoS) -> MqttPacket
             topic_filter: topic_filter.to_string(),
             options: SubscriptionOptions {
                 maximum_qos,
+                retain_handling,
                 ..SubscriptionOptions::default()
             },
         }],

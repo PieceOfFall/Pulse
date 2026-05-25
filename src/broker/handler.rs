@@ -165,7 +165,9 @@ impl Handler<MqttPacket> for MqttHandler {
                     reason_code: protocol::SUCCESS,
                     properties,
                 }))
-                .await
+                .await?;
+                flush_deliveries(outcome.redeliveries).await;
+                Ok(())
             }
             packet if !self.connected => {
                 let reason = match packet {

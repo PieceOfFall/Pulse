@@ -27,7 +27,8 @@ pub use life::BrokerLife;
 use crate::protocol;
 
 use self::delivery::{
-    Delivery, deliveries_for_publish, flush_deliveries, retained_for_subscription,
+    Delivery, deliveries_for_publish, flush_deliveries, redeliveries_for_client,
+    retained_for_subscription,
 };
 use self::state::{
     BrokerState, ClientEntry, SessionEntry, now_ms, retain_publish, upsert_subscription,
@@ -117,19 +118,25 @@ impl Broker {
                 None
             };
 
-            state.sessions_by_client_id.insert(
-                client_id.clone(),
-                SessionEntry::connected(session_expiry_interval),
-            );
+            state
+                .sessions_by_client_id
+                .entry(client_id.clone())
+                .and_modify(|session| {
+                    session.expires_at_ms = None;
+                    session.session_expiry_interval = session_expiry_interval;
+                })
+                .or_insert_with(|| SessionEntry::connected(session_expiry_interval));
             state.clients_by_connection.insert(
                 connection_id,
                 ClientEntry::new(client_id.clone(), channel, will, session_expiry_interval),
             );
+            let redeliveries = redeliveries_for_client(state, &client_id);
 
             ConnectOutcome {
                 client_id,
                 session_present: !clean_start && had_session,
                 replaced_channel,
+                redeliveries,
             }
         })
     }
@@ -164,12 +171,15 @@ impl Broker {
                     continue;
                 }
 
-                let stored_index =
+                let upsert =
                     upsert_subscription(&mut state.subscriptions, &client_id, subscription);
-                let stored = state.subscriptions[stored_index].clone();
+                let stored = state.subscriptions[upsert.index].clone();
                 reason_codes.push(protocol::granted_qos_code(stored.options.maximum_qos));
 
-                if stored.options.retain_handling != 2 {
+                if should_send_retained_on_subscribe(
+                    stored.options.retain_handling,
+                    upsert.inserted,
+                ) {
                     retained_deliveries.extend(retained_for_subscription(state, &stored));
                 }
             }
@@ -243,21 +253,35 @@ impl Broker {
 
     fn complete_outbound_qos1(&self, connection_id: u64, packet_id: u16) -> bool {
         self.with_state(|state| {
-            state
+            let Some(client_id) = state
                 .clients_by_connection
-                .get_mut(&connection_id)
-                .is_some_and(|client| client.outbound_qos1.remove(&packet_id))
+                .get(&connection_id)
+                .map(|client| client.client_id.clone())
+            else {
+                return false;
+            };
+            state
+                .sessions_by_client_id
+                .get_mut(&client_id)
+                .is_some_and(|session| session.outbound_qos1.remove(&packet_id).is_some())
         })
     }
 
     fn receive_outbound_qos2(&self, connection_id: u64, packet_id: u16) -> bool {
         self.with_state(|state| {
-            let Some(client) = state.clients_by_connection.get_mut(&connection_id) else {
+            let Some(client_id) = state
+                .clients_by_connection
+                .get(&connection_id)
+                .map(|client| client.client_id.clone())
+            else {
+                return false;
+            };
+            let Some(session) = state.sessions_by_client_id.get_mut(&client_id) else {
                 return false;
             };
 
-            if client.outbound_qos2_publish.remove(&packet_id) {
-                client.outbound_qos2_pubrel.insert(packet_id);
+            if session.outbound_qos2_publish.remove(&packet_id).is_some() {
+                session.outbound_qos2_pubrel.insert(packet_id);
                 true
             } else {
                 false
@@ -267,10 +291,17 @@ impl Broker {
 
     fn complete_outbound_qos2(&self, connection_id: u64, packet_id: u16) -> bool {
         self.with_state(|state| {
-            state
+            let Some(client_id) = state
                 .clients_by_connection
-                .get_mut(&connection_id)
-                .is_some_and(|client| client.outbound_qos2_pubrel.remove(&packet_id))
+                .get(&connection_id)
+                .map(|client| client.client_id.clone())
+            else {
+                return false;
+            };
+            state
+                .sessions_by_client_id
+                .get_mut(&client_id)
+                .is_some_and(|session| session.outbound_qos2_pubrel.remove(&packet_id))
         })
     }
 
@@ -305,6 +336,7 @@ struct ConnectOutcome {
     client_id: String,
     session_present: bool,
     replaced_channel: Option<Channel<MqttPacket>>,
+    redeliveries: Vec<Delivery>,
 }
 
 fn should_publish_will(reason: CloseReason) -> bool {
@@ -312,4 +344,12 @@ fn should_publish_will(reason: CloseReason) -> bool {
         reason,
         CloseReason::HandlerClosed | CloseReason::LocalClosed
     )
+}
+
+fn should_send_retained_on_subscribe(retain_handling: u8, inserted: bool) -> bool {
+    match retain_handling {
+        1 => inserted,
+        2 => false,
+        _ => true,
+    }
 }
