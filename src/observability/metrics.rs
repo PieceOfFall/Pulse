@@ -6,10 +6,10 @@ use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gau
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tracing::info;
 
-const METRICS_BIND_ENV: &str = "MQTT_RS_METRICS_BIND";
-
-pub(crate) fn init_from_env() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if let Ok(bind_addr) = std::env::var(METRICS_BIND_ENV) {
+pub(crate) fn init(
+    metrics_bind: &Option<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(bind_addr) = metrics_bind {
         let socket_addr: SocketAddr = bind_addr.parse()?;
         PrometheusBuilder::new()
             .with_http_listener(socket_addr)

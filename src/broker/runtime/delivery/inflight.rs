@@ -93,6 +93,7 @@ pub(super) fn delivery_for_client(
     retain: bool,
     expires_at_ms: Option<u64>,
     subscription_identifier: Option<u32>,
+    max_offline_queue_len: usize,
 ) -> Option<Delivery> {
     let now_ms = now_ms();
     if is_message_expired(expires_at_ms, now_ms) {
@@ -108,6 +109,7 @@ pub(super) fn delivery_for_client(
             retain,
             expires_at_ms,
             subscription_identifier,
+            max_offline_queue_len,
         );
         return None;
     }

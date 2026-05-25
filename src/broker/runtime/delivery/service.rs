@@ -7,7 +7,6 @@ use crate::{
     broker::{
         Broker,
         runtime::{
-            config::{SERVER_MAXIMUM_PACKET_SIZE, SERVER_RECEIVE_MAXIMUM},
             message::{PendingPublish, is_message_expired, message_expires_at_ms},
             retained_store::retain_publish,
             time::now_ms,
@@ -22,10 +21,11 @@ impl Broker {
         publisher_connection_id: u64,
         packet: &PublishPacket,
     ) -> Vec<Delivery> {
+        let config = *self.config();
         self.with_state(|state| {
             state.expire_sessions(now_ms());
-            retain_publish(state, packet);
-            deliveries_for_publish(state, publisher_connection_id, packet)
+            retain_publish(state, packet, &config);
+            deliveries_for_publish(state, publisher_connection_id, packet, &config)
         })
     }
 
@@ -35,6 +35,7 @@ impl Broker {
         packet_id: u16,
         packet: PublishPacket,
     ) -> u8 {
+        let receive_maximum = self.config().server_receive_maximum;
         self.with_state(|state| {
             let key = (connection_id, packet_id);
             if state.qos2_inflight.contains_key(&key) {
@@ -46,7 +47,7 @@ impl Broker {
                 .keys()
                 .filter(|(conn_id, _)| *conn_id == connection_id)
                 .count()
-                >= usize::from(SERVER_RECEIVE_MAXIMUM)
+                >= usize::from(receive_maximum)
             {
                 return protocol::RECEIVE_MAXIMUM_EXCEEDED;
             }
@@ -67,6 +68,7 @@ impl Broker {
         connection_id: u64,
         packet_id: u16,
     ) -> Option<Vec<Delivery>> {
+        let config = *self.config();
         self.with_state(|state| {
             let pending = state.qos2_inflight.remove(&(connection_id, packet_id))?;
 
@@ -75,12 +77,13 @@ impl Broker {
             if is_message_expired(pending.expires_at_ms, now_ms) {
                 return Some(Vec::new());
             }
-            retain_publish(state, &pending.packet);
+            retain_publish(state, &pending.packet, &config);
 
             Some(deliveries_for_publish(
                 state,
                 connection_id,
                 &pending.packet,
+                &config,
             ))
         })
     }
@@ -125,7 +128,8 @@ impl Broker {
     }
 
     pub(in crate::broker) fn packet_exceeds_server_maximum(&self, packet: &MqttPacket) -> bool {
-        packet_size(packet).is_some_and(|size| size > SERVER_MAXIMUM_PACKET_SIZE as usize)
+        packet_size(packet)
+            .is_some_and(|size| size > self.config().server_maximum_packet_size as usize)
     }
 
     pub(in crate::broker) fn complete_outbound_qos2(

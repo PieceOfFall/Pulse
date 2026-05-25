@@ -5,7 +5,6 @@ use crate::{
     broker::{
         Broker,
         runtime::{
-            config::MAX_SUBSCRIPTIONS_PER_CLIENT,
             delivery::{Delivery, retained_for_subscription},
             reason,
         },
@@ -19,6 +18,7 @@ impl Broker {
         connection_id: u64,
         packet: SubscribePacket,
     ) -> (SubAckPacket, Vec<Delivery>) {
+        let config = *self.config();
         self.with_state(|state| {
             let Some(client_id) = state
                 .clients_by_connection
@@ -50,7 +50,8 @@ impl Broker {
                     continue;
                 }
                 if is_new_subscription(&state.subscriptions, &client_id, &subscription.topic_filter)
-                    && current_subscription_count + inserted_count >= MAX_SUBSCRIPTIONS_PER_CLIENT
+                    && current_subscription_count + inserted_count
+                        >= config.max_subscriptions_per_client
                 {
                     reason_codes.push(protocol::QUOTA_EXCEEDED);
                     continue;
@@ -72,7 +73,7 @@ impl Broker {
                     stored.options.retain_handling,
                     upsert.inserted,
                 ) {
-                    retained_deliveries.extend(retained_for_subscription(state, &stored));
+                    retained_deliveries.extend(retained_for_subscription(state, &stored, &config));
                 }
             }
 

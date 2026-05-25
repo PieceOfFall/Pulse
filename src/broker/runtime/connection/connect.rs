@@ -1,8 +1,6 @@
 use rs_netty::codec::MqttProperty;
 
-use crate::broker::runtime::config::{
-    SERVER_MAXIMUM_PACKET_SIZE, SERVER_RECEIVE_MAXIMUM, SERVER_TOPIC_ALIAS_MAXIMUM,
-};
+use crate::broker::runtime::config::BrokerConfig;
 
 pub(in crate::broker) struct ConnectOptions {
     pub(in crate::broker) clean_start: bool,
@@ -25,11 +23,11 @@ impl ConnectOptions {
     }
 }
 
-pub(in crate::broker) fn connack_capabilities() -> Vec<MqttProperty> {
+pub(in crate::broker) fn connack_capabilities(config: &BrokerConfig) -> Vec<MqttProperty> {
     vec![
-        MqttProperty::ReceiveMaximum(SERVER_RECEIVE_MAXIMUM),
-        MqttProperty::MaximumPacketSize(SERVER_MAXIMUM_PACKET_SIZE),
-        MqttProperty::TopicAliasMaximum(SERVER_TOPIC_ALIAS_MAXIMUM),
+        MqttProperty::ReceiveMaximum(config.server_receive_maximum),
+        MqttProperty::MaximumPacketSize(config.server_maximum_packet_size),
+        MqttProperty::TopicAliasMaximum(config.server_topic_alias_maximum),
         MqttProperty::MaximumQoS(2),
         MqttProperty::RetainAvailable(1),
         MqttProperty::WildcardSubscriptionAvailable(1),

@@ -1,7 +1,7 @@
 use rs_netty::codec::{MqttProperty, PublishPacket, QoS};
 
 use super::{
-    config::{MAX_RETAINED_MESSAGES, MAX_RETAINED_PAYLOAD_BYTES},
+    config::BrokerConfig,
     message::{is_message_expired, message_expires_at_ms},
     session_registry::BrokerState,
     time::now_ms,
@@ -16,7 +16,11 @@ pub(in crate::broker) struct RetainedMessage {
     pub(in crate::broker) expires_at_ms: Option<u64>,
 }
 
-pub(in crate::broker) fn retain_publish(state: &mut BrokerState, packet: &PublishPacket) {
+pub(in crate::broker) fn retain_publish(
+    state: &mut BrokerState,
+    packet: &PublishPacket,
+    config: &BrokerConfig,
+) {
     if !packet.retain {
         return;
     }
@@ -25,7 +29,7 @@ pub(in crate::broker) fn retain_publish(state: &mut BrokerState, packet: &Publis
     let expires_at_ms = message_expires_at_ms(packet, now_ms);
     if packet.payload.is_empty() || is_message_expired(expires_at_ms, now_ms) {
         state.retained.remove(&packet.topic_name);
-    } else if can_store_retained(state, packet) {
+    } else if can_store_retained(state, packet, config) {
         state.retained.insert(
             packet.topic_name.clone(),
             RetainedMessage {
@@ -39,9 +43,9 @@ pub(in crate::broker) fn retain_publish(state: &mut BrokerState, packet: &Publis
     }
 }
 
-fn can_store_retained(state: &BrokerState, packet: &PublishPacket) -> bool {
+fn can_store_retained(state: &BrokerState, packet: &PublishPacket, config: &BrokerConfig) -> bool {
     if !state.retained.contains_key(&packet.topic_name)
-        && state.retained.len() >= MAX_RETAINED_MESSAGES
+        && state.retained.len() >= config.max_retained_messages
     {
         return false;
     }
@@ -52,5 +56,5 @@ fn can_store_retained(state: &BrokerState, packet: &PublishPacket) -> bool {
         .filter(|(topic_name, _)| *topic_name != &packet.topic_name)
         .map(|(_, message)| message.payload.len())
         .sum();
-    retained_payload_bytes.saturating_add(packet.payload.len()) <= MAX_RETAINED_PAYLOAD_BYTES
+    retained_payload_bytes.saturating_add(packet.payload.len()) <= config.max_retained_payload_bytes
 }

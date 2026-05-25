@@ -12,6 +12,7 @@ use std::sync::{
 
 pub use runtime::connection::{BrokerLife, MqttHandler};
 
+use self::runtime::config::BrokerConfig;
 use self::runtime::session_registry::BrokerState;
 use self::storage::{BrokerStorage, InMemoryStorage, SqliteStorage};
 
@@ -23,24 +24,49 @@ pub struct Broker {
 struct BrokerInner {
     next_generated_client_id: AtomicU64,
     storage: Arc<dyn BrokerStorage>,
+    config: BrokerConfig,
 }
 
 impl Broker {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new() -> Self {
-        Self::with_storage(Arc::new(InMemoryStorage::default()))
+        Self::with_config(BrokerConfig::default())
     }
 
+    pub(crate) fn with_config(config: BrokerConfig) -> Self {
+        Self::with_storage(Arc::new(InMemoryStorage::default()), config)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_sqlite(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
-        Ok(Self::with_storage(Arc::new(SqliteStorage::open(path)?)))
+        Self::with_sqlite_and_config(path, BrokerConfig::default())
     }
 
-    pub(in crate::broker) fn with_storage(storage: Arc<dyn BrokerStorage>) -> Self {
+    pub(crate) fn with_sqlite_and_config(
+        path: impl AsRef<Path>,
+        config: BrokerConfig,
+    ) -> rusqlite::Result<Self> {
+        Ok(Self::with_storage(
+            Arc::new(SqliteStorage::open(path)?),
+            config,
+        ))
+    }
+
+    pub(in crate::broker) fn with_storage(
+        storage: Arc<dyn BrokerStorage>,
+        config: BrokerConfig,
+    ) -> Self {
         Self {
             inner: Arc::new(BrokerInner {
                 next_generated_client_id: AtomicU64::new(1),
                 storage,
+                config,
             }),
         }
+    }
+
+    pub(crate) fn config(&self) -> &BrokerConfig {
+        &self.inner.config
     }
 
     pub(in crate::broker) fn generated_client_id(&self) -> String {

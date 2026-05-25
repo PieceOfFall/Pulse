@@ -2,7 +2,6 @@ use rs_netty::codec::{PublishPacket, QoS};
 
 use super::packet::{effective_qos, pending_publish};
 use crate::broker::runtime::{
-    config::MAX_OFFLINE_QUEUE_LEN,
     message::{PendingPublish, is_message_expired, message_expires_at_ms},
     session_registry::{BrokerState, SessionEntry},
     subscription_tree::SubscriptionEntry,
@@ -13,6 +12,7 @@ pub(super) fn queue_offline_publish(
     state: &mut BrokerState,
     subscription: &SubscriptionEntry,
     packet: &PublishPacket,
+    max_offline_queue_len: usize,
 ) {
     let Some(session) = state.sessions_by_client_id.get_mut(&subscription.client_id) else {
         return;
@@ -39,6 +39,7 @@ pub(super) fn queue_offline_publish(
         subscription.options.retain_as_published && packet.retain,
         expires_at_ms,
         subscription.subscription_identifier,
+        max_offline_queue_len,
     );
 }
 
@@ -49,8 +50,9 @@ pub(super) fn queue_pending_publish(
     retain: bool,
     expires_at_ms: Option<u64>,
     subscription_identifier: Option<u32>,
+    max_offline_queue_len: usize,
 ) {
-    if session.offline_queue.len() >= MAX_OFFLINE_QUEUE_LEN {
+    if session.offline_queue.len() >= max_offline_queue_len {
         return;
     }
 

@@ -44,12 +44,13 @@ struct KeepAliveHandle {
 
 impl MqttHandler {
     pub fn new(broker: Broker) -> Self {
+        let topic_alias_maximum = broker.config().server_topic_alias_maximum;
         Self {
             broker,
             connected: false,
             client_id: None,
             keep_alive: None,
-            topic_aliases: TopicAliases::default(),
+            topic_aliases: TopicAliases::new(topic_alias_maximum),
         }
     }
 
@@ -184,7 +185,7 @@ impl Handler<MqttPacket> for MqttHandler {
                     "client connected"
                 );
 
-                let mut properties = connack_capabilities();
+                let mut properties = connack_capabilities(self.broker.config());
                 if assigned_client_id {
                     properties.push(MqttProperty::AssignedClientIdentifier(outcome.client_id));
                 }

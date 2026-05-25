@@ -3,7 +3,7 @@ use rs_netty::codec::PublishPacket;
 use super::{Delivery, DeliveryTarget, inflight::delivery_for_client};
 use crate::{
     broker::runtime::{
-        message::is_message_expired, retained_store::RetainedMessage,
+        config::BrokerConfig, message::is_message_expired, retained_store::RetainedMessage,
         session_registry::BrokerState, subscription_tree::SubscriptionEntry, time::now_ms,
     },
     protocol,
@@ -12,6 +12,7 @@ use crate::{
 pub(in crate::broker) fn retained_for_subscription(
     state: &mut BrokerState,
     subscription: &SubscriptionEntry,
+    config: &BrokerConfig,
 ) -> Vec<Delivery> {
     let now_ms = now_ms();
     state
@@ -59,6 +60,7 @@ pub(in crate::broker) fn retained_for_subscription(
                 true,
                 message.expires_at_ms,
                 subscription.subscription_identifier,
+                config.max_offline_queue_len,
             )
         })
         .collect()

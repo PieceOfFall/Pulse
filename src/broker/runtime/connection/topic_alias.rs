@@ -2,14 +2,19 @@ use std::collections::HashMap;
 
 use rs_netty::codec::{MqttProperty, PublishPacket};
 
-use crate::broker::runtime::config::SERVER_TOPIC_ALIAS_MAXIMUM;
-
-#[derive(Default)]
 pub(in crate::broker) struct TopicAliases {
     aliases: HashMap<u16, String>,
+    maximum: u16,
 }
 
 impl TopicAliases {
+    pub(in crate::broker) fn new(maximum: u16) -> Self {
+        Self {
+            aliases: HashMap::new(),
+            maximum,
+        }
+    }
+
     pub(in crate::broker) fn resolve_publish(&mut self, packet: &mut PublishPacket) -> bool {
         let alias = packet
             .properties
@@ -22,7 +27,7 @@ impl TopicAliases {
         let Some(alias) = alias else {
             return true;
         };
-        if alias == 0 || alias > SERVER_TOPIC_ALIAS_MAXIMUM {
+        if alias == 0 || alias > self.maximum {
             return false;
         }
 

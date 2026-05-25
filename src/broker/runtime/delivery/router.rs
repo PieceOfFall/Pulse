@@ -5,6 +5,7 @@ use super::{
 };
 use crate::{
     broker::runtime::{
+        config::BrokerConfig,
         message::{is_message_expired, message_expires_at_ms},
         session_registry::BrokerState,
         subscription_tree::{SubscriptionEntry, select_shared_subscriptions},
@@ -17,6 +18,7 @@ pub(in crate::broker) fn deliveries_for_publish(
     state: &mut BrokerState,
     publisher_connection_id: u64,
     packet: &PublishPacket,
+    config: &BrokerConfig,
 ) -> Vec<Delivery> {
     let now_ms = now_ms();
     let expires_at_ms = message_expires_at_ms(packet, now_ms);
@@ -59,10 +61,11 @@ pub(in crate::broker) fn deliveries_for_publish(
                         sub.options.retain_as_published && packet.retain,
                         expires_at_ms,
                         sub.subscription_identifier,
+                        config.max_offline_queue_len,
                     )
                 }
                 None => {
-                    queue_offline_publish(state, &sub, packet);
+                    queue_offline_publish(state, &sub, packet, config.max_offline_queue_len);
                     None
                 }
             },
