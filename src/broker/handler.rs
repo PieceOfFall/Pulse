@@ -3,7 +3,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use rs_netty::{
@@ -14,7 +14,7 @@ use tokio::task::JoinHandle;
 
 use crate::protocol;
 
-use super::{Broker, delivery::flush_deliveries};
+use super::{Broker, delivery::flush_deliveries, now_ms};
 
 pub struct MqttHandler {
     broker: Broker,
@@ -131,9 +131,16 @@ impl Handler<MqttPacket> for MqttHandler {
                 }
 
                 let assigned_client_id = packet.client_id.is_empty();
-                let outcome =
-                    self.broker
-                        .connect(ctx.id(), packet.client_id, ctx.channel(), packet.will);
+                let clean_start = packet.clean_start;
+                let session_expiry_interval = session_expiry_interval(&packet.properties);
+                let outcome = self.broker.connect(
+                    ctx.id(),
+                    packet.client_id,
+                    ctx.channel(),
+                    packet.will,
+                    clean_start,
+                    session_expiry_interval,
+                );
                 if let Some(replaced_channel) = outcome.replaced_channel {
                     let _ = replaced_channel.close().await;
                 }
@@ -341,17 +348,18 @@ fn validate_connect(packet: &rs_netty::codec::ConnectPacket) -> Option<u8> {
     None
 }
 
-fn is_invalid_payload_format(property: &MqttProperty) -> bool {
-    matches!(property, MqttProperty::PayloadFormatIndicator(value) if !matches!(*value, 0 | 1))
+fn session_expiry_interval(properties: &[MqttProperty]) -> u32 {
+    properties
+        .iter()
+        .find_map(|property| match property {
+            MqttProperty::SessionExpiryInterval(value) => Some(*value),
+            _ => None,
+        })
+        .unwrap_or(0)
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
+fn is_invalid_payload_format(property: &MqttProperty) -> bool {
+    matches!(property, MqttProperty::PayloadFormatIndicator(value) if !matches!(*value, 0 | 1))
 }
 
 async fn run_keep_alive_watchdog(

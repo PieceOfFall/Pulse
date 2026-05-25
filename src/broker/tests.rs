@@ -36,12 +36,12 @@ async fn duplicate_client_id_closes_previous_connection() -> rs_netty::Result<()
 fn upsert_subscription_returns_updated_subscription_index() {
     let mut subscriptions = vec![
         SubscriptionEntry {
-            connection_id: 1,
+            client_id: "client-one".to_string(),
             filter: "devices/one".to_string(),
             options: SubscriptionOptions::default(),
         },
         SubscriptionEntry {
-            connection_id: 2,
+            client_id: "client-two".to_string(),
             filter: "devices/two".to_string(),
             options: SubscriptionOptions::default(),
         },
@@ -49,7 +49,7 @@ fn upsert_subscription_returns_updated_subscription_index() {
 
     let index = upsert_subscription(
         &mut subscriptions,
-        1,
+        "client-one",
         Subscription {
             topic_filter: "devices/one".to_string(),
             options: SubscriptionOptions {
@@ -257,6 +257,117 @@ async fn normal_disconnect_does_not_publish_will_message() -> rs_netty::Result<(
             reason_code: protocol::SUCCESS,
             properties: Vec::new(),
         }))
+        .await?;
+    subscriber
+        .expect_no_packet(Duration::from_millis(200))
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn persistent_session_preserves_subscriptions_across_reconnect() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", true, 60))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+    subscriber
+        .subscribe(1, "devices/session", QoS::AtMostOnce)
+        .await?;
+    subscriber
+        .write(MqttPacket::Disconnect(rs_netty::codec::DisconnectPacket {
+            reason_code: protocol::SUCCESS,
+            properties: Vec::new(),
+        }))
+        .await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", false, 60))
+        .await?;
+    subscriber.expect_connack_session_present(true).await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish("devices/session", QoS::AtMostOnce, None, "resumed"))
+        .await?;
+
+    let packet = subscriber
+        .expect_publish("expected resumed subscription publish")
+        .await?;
+    assert_eq!(packet.payload, Bytes::from_static(b"resumed"));
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn clean_start_clears_persistent_session_subscriptions() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", true, 60))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+    subscriber
+        .subscribe(1, "devices/session", QoS::AtMostOnce)
+        .await?;
+    subscriber
+        .write(MqttPacket::Disconnect(rs_netty::codec::DisconnectPacket {
+            reason_code: protocol::SUCCESS,
+            properties: Vec::new(),
+        }))
+        .await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", true, 60))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish("devices/session", QoS::AtMostOnce, None, "cleared"))
+        .await?;
+    subscriber
+        .expect_no_packet(Duration::from_millis(200))
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn expired_session_does_not_resume_subscriptions() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", true, 1))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+    subscriber
+        .subscribe(1, "devices/session", QoS::AtMostOnce)
+        .await?;
+    subscriber
+        .write(MqttPacket::Disconnect(rs_netty::codec::DisconnectPacket {
+            reason_code: protocol::SUCCESS,
+            properties: Vec::new(),
+        }))
+        .await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry("subscriber", false, 60))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish("devices/session", QoS::AtMostOnce, None, "expired"))
         .await?;
     subscriber
         .expect_no_packet(Duration::from_millis(200))
@@ -514,6 +625,17 @@ impl TestClient {
         Ok(())
     }
 
+    async fn expect_connack_session_present(
+        &mut self,
+        session_present: bool,
+    ) -> rs_netty::Result<()> {
+        assert!(matches!(
+            self.read().await?,
+            MqttPacket::ConnAck(packet) if packet.session_present == session_present
+        ));
+        Ok(())
+    }
+
     async fn expect_connack_reason(&mut self, reason_code: u8) -> rs_netty::Result<()> {
         assert!(matches!(
             self.read().await?,
@@ -667,6 +789,22 @@ fn connect_with_clean_start(client_id: &str, clean_start: bool) -> MqttPacket {
         clean_start,
         keep_alive: 60,
         properties: Vec::new(),
+        client_id: client_id.to_string(),
+        will: None,
+        username: None,
+        password: None,
+    })
+}
+
+fn connect_with_session_expiry(
+    client_id: &str,
+    clean_start: bool,
+    session_expiry_interval: u32,
+) -> MqttPacket {
+    MqttPacket::Connect(ConnectPacket {
+        clean_start,
+        keep_alive: 60,
+        properties: vec![MqttProperty::SessionExpiryInterval(session_expiry_interval)],
         client_id: client_id.to_string(),
         will: None,
         username: None,

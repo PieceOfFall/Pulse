@@ -47,14 +47,15 @@ items are marked with `[x]`.
 
 ## 2. Session Model
 
-- [ ] Model client sessions separately from live TCP connections
+- [x] Model client sessions separately from live TCP connections
   - Split connection state from session state so reconnects can resume subscriptions and inflight messages.
-- [ ] Implement Clean Start and Session Expiry Interval
-  - Set `session_present` correctly and expire sessions according to MQTT v5 rules.
-- [ ] Preserve subscriptions across reconnects when the session is persistent.
+- [x] Implement Clean Start and `session_present`.
+- [x] Expire sessions according to MQTT v5 Session Expiry Interval rules.
+- [x] Preserve subscriptions across reconnects when the session is persistent.
 - [ ] Preserve QoS 1/2 outbound inflight state across reconnects.
 - [ ] Redeliver pending QoS 1/2 messages with `dup = true` after reconnect.
-- [ ] Add tests for clean start, persistent session resume, and session expiry.
+- [x] Add tests for clean start and persistent session resume.
+- [x] Add tests for session expiry.
 
 ## 3. MQTT v5 Properties
 

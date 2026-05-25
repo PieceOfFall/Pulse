@@ -11,6 +11,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use rs_netty::{
@@ -44,26 +45,73 @@ struct BrokerInner {
 struct BrokerState {
     clients_by_connection: HashMap<u64, ClientEntry>,
     connection_by_client_id: HashMap<String, u64>,
+    sessions_by_client_id: HashMap<String, SessionEntry>,
     subscriptions: Vec<SubscriptionEntry>,
     retained: HashMap<String, RetainedMessage>,
     qos2_inflight: HashMap<(u64, u16), PublishPacket>,
 }
 
 impl BrokerState {
-    fn remove_connection_state(&mut self, connection_id: u64) -> Option<ClientEntry> {
+    fn expire_sessions(&mut self, now_ms: u64) {
+        let expired: Vec<String> = self
+            .sessions_by_client_id
+            .iter()
+            .filter_map(|(client_id, session)| {
+                if session
+                    .expires_at_ms
+                    .is_some_and(|expires_at| expires_at <= now_ms)
+                    && !self.connection_by_client_id.contains_key(client_id)
+                {
+                    Some(client_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for client_id in expired {
+            self.sessions_by_client_id.remove(&client_id);
+            self.subscriptions
+                .retain(|subscription| subscription.client_id != client_id);
+        }
+    }
+
+    fn remove_connection_state(
+        &mut self,
+        connection_id: u64,
+        preserve_session: bool,
+    ) -> Option<ClientEntry> {
         let client = self.clients_by_connection.remove(&connection_id)?;
-        self.subscriptions
-            .retain(|sub| sub.connection_id != connection_id);
         self.qos2_inflight
             .retain(|(conn_id, _), _| *conn_id != connection_id);
+        if !preserve_session && client.session_expiry_interval == 0 {
+            self.sessions_by_client_id.remove(&client.client_id);
+            self.subscriptions
+                .retain(|sub| sub.client_id != client.client_id);
+        } else if !preserve_session {
+            let expires_at_ms = session_expires_at_ms(client.session_expiry_interval);
+            self.sessions_by_client_id.insert(
+                client.client_id.clone(),
+                SessionEntry {
+                    expires_at_ms,
+                    _expiry_interval: client.session_expiry_interval,
+                },
+            );
+        }
         Some(client)
     }
+}
+
+struct SessionEntry {
+    expires_at_ms: Option<u64>,
+    _expiry_interval: u32,
 }
 
 struct ClientEntry {
     client_id: String,
     channel: Channel<MqttPacket>,
     will: Option<Will>,
+    session_expiry_interval: u32,
     next_packet_id: u16,
     outbound_qos1: HashSet<u16>,
     outbound_qos2_publish: HashSet<u16>,
@@ -72,7 +120,7 @@ struct ClientEntry {
 
 #[derive(Clone)]
 struct SubscriptionEntry {
-    connection_id: u64,
+    client_id: String,
     filter: String,
     options: rs_netty::codec::SubscriptionOptions,
 }
@@ -109,6 +157,8 @@ impl Broker {
         requested_client_id: String,
         channel: Channel<MqttPacket>,
         will: Option<Will>,
+        clean_start: bool,
+        session_expiry_interval: u32,
     ) -> ConnectOutcome {
         let client_id = if requested_client_id.is_empty() {
             self.generated_client_id()
@@ -117,12 +167,19 @@ impl Broker {
         };
 
         let mut state = self.inner.state.lock().expect("broker state lock poisoned");
+        state.expire_sessions(now_ms());
+        let had_session = state.sessions_by_client_id.contains_key(&client_id);
+        if clean_start {
+            state.sessions_by_client_id.remove(&client_id);
+            state.subscriptions.retain(|sub| sub.client_id != client_id);
+        }
+
         let replaced_channel = if let Some(previous_connection_id) = state
             .connection_by_client_id
             .insert(client_id.clone(), connection_id)
         {
             if previous_connection_id != connection_id {
-                let previous = state.remove_connection_state(previous_connection_id);
+                let previous = state.remove_connection_state(previous_connection_id, true);
                 previous.map(|previous| previous.channel)
             } else {
                 None
@@ -131,12 +188,20 @@ impl Broker {
             None
         };
 
+        state.sessions_by_client_id.insert(
+            client_id.clone(),
+            SessionEntry {
+                expires_at_ms: None,
+                _expiry_interval: session_expiry_interval,
+            },
+        );
         state.clients_by_connection.insert(
             connection_id,
             ClientEntry {
                 client_id: client_id.clone(),
                 channel,
                 will,
+                session_expiry_interval,
                 next_packet_id: 1,
                 outbound_qos1: HashSet::new(),
                 outbound_qos2_publish: HashSet::new(),
@@ -146,7 +211,7 @@ impl Broker {
 
         ConnectOutcome {
             client_id,
-            session_present: false,
+            session_present: !clean_start && had_session,
             replaced_channel,
         }
     }
@@ -157,7 +222,11 @@ impl Broker {
         packet: SubscribePacket,
     ) -> (SubAckPacket, Vec<Delivery>) {
         let mut state = self.inner.state.lock().expect("broker state lock poisoned");
-        if !state.clients_by_connection.contains_key(&connection_id) {
+        let Some(client_id) = state
+            .clients_by_connection
+            .get(&connection_id)
+            .map(|client| client.client_id.clone())
+        else {
             return (
                 SubAckPacket {
                     packet_id: packet.packet_id,
@@ -166,7 +235,7 @@ impl Broker {
                 },
                 Vec::new(),
             );
-        }
+        };
 
         let mut reason_codes = Vec::with_capacity(packet.subscriptions.len());
         let mut retained_deliveries = Vec::new();
@@ -178,7 +247,7 @@ impl Broker {
             }
 
             let stored_index =
-                upsert_subscription(&mut state.subscriptions, connection_id, subscription);
+                upsert_subscription(&mut state.subscriptions, &client_id, subscription);
             let stored = state.subscriptions[stored_index].clone();
             reason_codes.push(protocol::granted_qos_code(stored.options.maximum_qos));
 
@@ -199,10 +268,16 @@ impl Broker {
 
     fn unsubscribe(&self, connection_id: u64, packet: UnsubscribePacket) -> UnsubAckPacket {
         let mut state = self.inner.state.lock().expect("broker state lock poisoned");
-        for filter in &packet.topic_filters {
-            state
-                .subscriptions
-                .retain(|sub| !(sub.connection_id == connection_id && sub.filter == *filter));
+        if let Some(client_id) = state
+            .clients_by_connection
+            .get(&connection_id)
+            .map(|client| client.client_id.clone())
+        {
+            for filter in &packet.topic_filters {
+                state
+                    .subscriptions
+                    .retain(|sub| !(sub.client_id == client_id && sub.filter == *filter));
+            }
         }
 
         UnsubAckPacket {
@@ -277,7 +352,7 @@ impl Broker {
 
     fn remove_connection(&self, connection_id: u64) -> Option<Will> {
         let mut state = self.inner.state.lock().expect("broker state lock poisoned");
-        let client = state.remove_connection_state(connection_id)?;
+        let client = state.remove_connection_state(connection_id, false)?;
         state.connection_by_client_id.remove(&client.client_id);
         client.will
     }
@@ -329,22 +404,40 @@ fn retain_publish(state: &mut BrokerState, packet: &PublishPacket) {
 
 fn upsert_subscription(
     subscriptions: &mut Vec<SubscriptionEntry>,
-    connection_id: u64,
+    client_id: &str,
     subscription: Subscription,
 ) -> usize {
-    if let Some(index) = subscriptions.iter_mut().position(|sub| {
-        sub.connection_id == connection_id && sub.filter == subscription.topic_filter
-    }) {
+    if let Some(index) = subscriptions
+        .iter_mut()
+        .position(|sub| sub.client_id == client_id && sub.filter == subscription.topic_filter)
+    {
         subscriptions[index].options = subscription.options;
         return index;
     }
 
     subscriptions.push(SubscriptionEntry {
-        connection_id,
+        client_id: client_id.to_string(),
         filter: subscription.topic_filter,
         options: subscription.options,
     });
     subscriptions.len() - 1
+}
+
+fn session_expires_at_ms(session_expiry_interval: u32) -> Option<u64> {
+    if session_expiry_interval == u32::MAX {
+        None
+    } else {
+        Some(now_ms().saturating_add(u64::from(session_expiry_interval) * 1_000))
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn should_publish_will(reason: CloseReason) -> bool {

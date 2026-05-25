@@ -18,12 +18,16 @@ pub(super) fn deliveries_for_publish(
     publisher_connection_id: u64,
     packet: &PublishPacket,
 ) -> Vec<Delivery> {
+    let publisher_client_id = state
+        .clients_by_connection
+        .get(&publisher_connection_id)
+        .map(|client| client.client_id.as_str());
     let matches: Vec<SubscriptionEntry> = state
         .subscriptions
         .iter()
         .filter(|sub| {
             protocol::topic_matches(&sub.filter, &packet.topic_name)
-                && !(sub.options.no_local && sub.connection_id == publisher_connection_id)
+                && !(sub.options.no_local && publisher_client_id == Some(sub.client_id.as_str()))
         })
         .cloned()
         .collect();
@@ -31,7 +35,8 @@ pub(super) fn deliveries_for_publish(
     matches
         .into_iter()
         .filter_map(|sub| {
-            let client = state.clients_by_connection.get_mut(&sub.connection_id)?;
+            let connection_id = state.connection_by_client_id.get(&sub.client_id)?;
+            let client = state.clients_by_connection.get_mut(connection_id)?;
             Some(delivery_for_client(
                 client,
                 packet,
@@ -53,10 +58,10 @@ pub(super) fn retained_for_subscription(
         .cloned()
         .collect();
 
-    let Some(client) = state
-        .clients_by_connection
-        .get_mut(&subscription.connection_id)
-    else {
+    let Some(connection_id) = state.connection_by_client_id.get(&subscription.client_id) else {
+        return Vec::new();
+    };
+    let Some(client) = state.clients_by_connection.get_mut(connection_id) else {
         return Vec::new();
     };
 
