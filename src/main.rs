@@ -25,9 +25,7 @@ async fn main() -> Result<()> {
         Broker::with_config(config.limits)
     };
 
-    info!(bind_addr = config.server.bind, "mqtt-rs listening");
-
-    TcpServer::bind(config.server.bind)
+    let server = TcpServer::bind(config.server.bind)
         .outbound_queue_size(config.server.outbound_queue_size)
         .track_connection_stats()
         .life(BrokerLife::new(broker.clone()))
@@ -38,6 +36,16 @@ async fn main() -> Result<()> {
                 ))
                 .handler(MqttHandler::new(broker.clone()))
         })
-        .run()
+        .start()
+        .await?;
+
+    info!(bind_addr = %server.local_addr(), "mqtt-rs listening");
+
+    tokio::signal::ctrl_c()
         .await
+        .map_err(|error| Error::Pipeline(format!("listen for shutdown signal: {error}")))?;
+    info!("shutdown signal received");
+
+    server.shutdown();
+    server.wait().await
 }
