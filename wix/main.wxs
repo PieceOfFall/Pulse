@@ -108,26 +108,24 @@
                     </Component>
                     -->
 
-                    <Directory Id='Bin' Name='bin'>
-                        <Component Id='Path' Guid='574F7137-703D-42E2-860C-107E5161752A' KeyPath='yes'>
-                            <Environment
-                                Id='PATH'
-                                Name='PATH'
-                                Value='[Bin]'
-                                Permanent='no'
-                                Part='last'
-                                Action='set'
-                                System='yes'/>
-                        </Component>
-                        <Component Id='binary0' Guid='*'>
-                            <File
-                                Id='exe0'
-                                Name='Pulse.exe'
-                                DiskId='1'
-                                Source='$(var.CargoTargetBinDir)\Pulse.exe'
-                                KeyPath='yes'/>
-                        </Component>
-                    </Directory>
+                    <Component Id='Path' Guid='574F7137-703D-42E2-860C-107E5161752A' KeyPath='yes'>
+                        <Environment
+                            Id='PATH'
+                            Name='PATH'
+                            Value='[APPLICATIONFOLDER]'
+                            Permanent='no'
+                            Part='last'
+                            Action='set'
+                            System='yes'/>
+                    </Component>
+                    <Component Id='binary0' Guid='*'>
+                        <File
+                            Id='exe0'
+                            Name='Pulse.exe'
+                            DiskId='1'
+                            Source='$(var.CargoTargetBinDir)\Pulse.exe'
+                            KeyPath='yes'/>
+                    </Component>
                     <Component Id='BrokerConfig' Guid='*'>
                         <File
                             Id='BrokerConfigFile'
