@@ -85,11 +85,10 @@ Configuration can come from four places, applied in this order:
 The `MQTT_RS_*` environment prefix is intentionally kept for compatibility
 while the broker moves under the Pulse name.
 
-Windows MSI installs do not install a default `Broker.toml`. They create
-`C:\ProgramData\Pulse` with write access for local users and use SQLite at
-`C:\ProgramData\Pulse\broker.db` by default. To customize settings on Windows,
-place a `Broker.toml` next to `Pulse.exe`, set `MQTT_RS_*` environment variables,
-or pass `--config`.
+Windows MSI installs do not install a default `Broker.toml`. They use SQLite at
+`C:\ProgramData\Pulse\broker.db` by default and create that directory on first
+startup. To customize settings on Windows, place a `Broker.toml` next to
+`Pulse.exe`, set `MQTT_RS_*` environment variables, or pass `--config`.
 
 ## What Works Today
 

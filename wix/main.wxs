@@ -128,21 +128,6 @@
                     </Component>
                 </Directory>
             </Directory>
-            <Directory Id='CommonAppDataFolder'>
-                <Directory Id='ProgramDataPulse' Name='Pulse'>
-                    <Component Id='ProgramDataDirectory' Guid='*' KeyPath='yes'>
-                        <CreateFolder>
-                            <Permission
-                                User='Users'
-                                Read='yes'
-                                Write='yes'
-                                CreateFile='yes'
-                                CreateChild='yes'
-                                Delete='yes'/>
-                        </CreateFolder>
-                    </Component>
-                </Directory>
-            </Directory>
         </Directory>
 
         <Feature
@@ -162,7 +147,6 @@
             <!--<ComponentRef Id='License'/>-->
 
             <ComponentRef Id='binary0'/>
-            <ComponentRef Id='ProgramDataDirectory'/>
 
             <Feature
                 Id='Environment'
