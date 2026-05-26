@@ -8,6 +8,7 @@ pub(crate) fn init(log: &Option<String>) -> Result<(), Box<dyn std::error::Error
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_ansi(!cfg!(windows))
         .compact()
         .try_init()?;
 

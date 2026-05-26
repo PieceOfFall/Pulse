@@ -1,7 +1,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **mqtt-rs** (664 symbols, 1557 relationships, 43 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **Pulse** (664 symbols, 1557 relationships, 43 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
@@ -24,10 +24,10 @@ This project is indexed by GitNexus as **mqtt-rs** (664 symbols, 1557 relationsh
 
 | Resource | Use for |
 |----------|---------|
-| `gitnexus://repo/mqtt-rs/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/mqtt-rs/clusters` | All functional areas |
-| `gitnexus://repo/mqtt-rs/processes` | All execution flows |
-| `gitnexus://repo/mqtt-rs/process/{name}` | Step-by-step execution trace |
+| `gitnexus://repo/Pulse/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/Pulse/clusters` | All functional areas |
+| `gitnexus://repo/Pulse/processes` | All execution flows |
+| `gitnexus://repo/Pulse/process/{name}` | Step-by-step execution trace |
 
 ## CLI
 
