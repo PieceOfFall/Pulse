@@ -91,7 +91,7 @@ impl Default for AppConfig {
                 bind: "0.0.0.0:1883".to_string(),
                 outbound_queue_size: 1024,
             },
-            storage: StorageConfig::default(),
+            storage: default_storage_config(),
             limits: BrokerConfig::default(),
             observability: ObservabilityConfig::default(),
         }
@@ -241,6 +241,24 @@ fn default_config_path() -> PathBuf {
         .and_then(|path| path.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."))
         .join(CONFIG_FILE_NAME)
+}
+
+#[cfg(windows)]
+fn default_storage_config() -> StorageConfig {
+    StorageConfig {
+        sqlite: env::var_os("ProgramData").map(PathBuf::from).map(|path| {
+            path.join("Pulse")
+                .join("broker.db")
+                .to_string_lossy()
+                .into_owned()
+        }),
+        mysql: None,
+    }
+}
+
+#[cfg(not(windows))]
+fn default_storage_config() -> StorageConfig {
+    StorageConfig::default()
 }
 
 fn read_file_config(

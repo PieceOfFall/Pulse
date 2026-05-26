@@ -3,6 +3,8 @@ mod observability;
 mod protocol;
 mod settings;
 
+use std::{fs, path::Path};
+
 use broker::{Broker, BrokerLife, MqttHandler};
 use rs_netty::{Error, Result, TcpServer, codec::MqttCodec, pipeline};
 use settings::AppConfig;
@@ -19,6 +21,7 @@ async fn main() -> Result<()> {
         Broker::with_mysql_and_config(url, config.limits)
             .map_err(|error| Error::Pipeline(format!("open mysql storage: {error}")))?
     } else if let Some(path) = &config.storage.sqlite {
+        ensure_sqlite_parent_dir(path)?;
         Broker::with_sqlite_and_config(path, config.limits)
             .map_err(|error| Error::Pipeline(format!("open sqlite storage: {error}")))?
     } else {
@@ -48,4 +51,16 @@ async fn main() -> Result<()> {
 
     server.shutdown();
     server.wait().await
+}
+
+fn ensure_sqlite_parent_dir(path: &str) -> Result<()> {
+    let Some(parent) = Path::new(path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Ok(());
+    };
+
+    fs::create_dir_all(parent)
+        .map_err(|error| Error::Pipeline(format!("create sqlite directory: {error}")))
 }

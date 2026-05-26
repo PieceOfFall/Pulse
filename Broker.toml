@@ -12,7 +12,8 @@ outbound_queue_size = 1024
 [storage]
 # Optional SQLite database path for persistent sessions, subscriptions,
 # retained messages, outbound inflight packets, and offline queues.
-# Leave commented to use in-memory storage.
+# Leave commented to use the platform default: in-memory on Unix-like builds,
+# and C:\ProgramData\Pulse\broker.db for Windows MSI installs.
 # sqlite = "broker.db"
 
 # Optional MySQL connection URL for persistent broker state.

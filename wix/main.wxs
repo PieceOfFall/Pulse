@@ -126,13 +126,20 @@
                             Source='$(var.CargoTargetBinDir)\Pulse.exe'
                             KeyPath='yes'/>
                     </Component>
-                    <Component Id='BrokerConfig' Guid='*'>
-                        <File
-                            Id='BrokerConfigFile'
-                            Name='Broker.toml'
-                            DiskId='1'
-                            Source='$(var.CargoTargetDir)\..\Broker.toml'
-                            KeyPath='yes'/>
+                </Directory>
+            </Directory>
+            <Directory Id='CommonAppDataFolder'>
+                <Directory Id='ProgramDataPulse' Name='Pulse'>
+                    <Component Id='ProgramDataDirectory' Guid='*' KeyPath='yes'>
+                        <CreateFolder>
+                            <Permission
+                                User='Users'
+                                Read='yes'
+                                Write='yes'
+                                CreateFile='yes'
+                                CreateChild='yes'
+                                Delete='yes'/>
+                        </CreateFolder>
                     </Component>
                 </Directory>
             </Directory>
@@ -155,7 +162,7 @@
             <!--<ComponentRef Id='License'/>-->
 
             <ComponentRef Id='binary0'/>
-            <ComponentRef Id='BrokerConfig'/>
+            <ComponentRef Id='ProgramDataDirectory'/>
 
             <Feature
                 Id='Environment'

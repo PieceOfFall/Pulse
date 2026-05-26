@@ -20,9 +20,9 @@ message fabrics that need durable sessions without dragging in a giant service.
   backpressure.
 - Persistent sessions with clean start, session expiry, subscription recovery,
   offline queues, retained messages, and durable restart recovery.
-- Storage choices for different stages of a project: in-memory by default,
-  SQLite for simple durable deployments, and MySQL when you want shared
-  operational infrastructure.
+- Storage choices for different stages of a project: in-memory by default on
+  Unix-like builds, SQLite by default for Windows MSI installs, and MySQL when
+  you want shared operational infrastructure.
 - Shared subscriptions, subscription identifiers, retained replay behavior,
   no-local handling, message expiry, and retained-store limits.
 - Prometheus metrics and structured tracing, ready for dashboards instead of
@@ -84,6 +84,12 @@ Configuration can come from four places, applied in this order:
 
 The `MQTT_RS_*` environment prefix is intentionally kept for compatibility
 while the broker moves under the Pulse name.
+
+Windows MSI installs do not install a default `Broker.toml`. They create
+`C:\ProgramData\Pulse` with write access for local users and use SQLite at
+`C:\ProgramData\Pulse\broker.db` by default. To customize settings on Windows,
+place a `Broker.toml` next to `Pulse.exe`, set `MQTT_RS_*` environment variables,
+or pass `--config`.
 
 ## What Works Today
 
