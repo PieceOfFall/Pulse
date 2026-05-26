@@ -133,7 +133,7 @@
                             Id='BrokerConfigFile'
                             Name='Broker.toml'
                             DiskId='1'
-                            Source='..\Broker.toml'
+                            Source='$(var.CargoTargetDir)\..\Broker.toml'
                             KeyPath='yes'/>
                     </Component>
                 </Directory>
