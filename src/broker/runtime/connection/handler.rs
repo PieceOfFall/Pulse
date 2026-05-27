@@ -104,7 +104,7 @@ impl MqttHandler {
             metrics::auth_failed(auth_failure_reason(reason_code));
         }
         warn!(connection_id = ctx.id(), reason_code, "rejecting connect");
-        ctx.write(MqttPacket::ConnAck(ConnAckPacket {
+        ctx.write_and_flush(MqttPacket::ConnAck(ConnAckPacket {
             session_present: false,
             reason_code,
             properties: reason_properties(reason_code),
@@ -123,7 +123,7 @@ impl MqttHandler {
             reason_code,
             "disconnecting client"
         );
-        ctx.write(MqttPacket::Disconnect(DisconnectPacket {
+        ctx.write_and_flush(MqttPacket::Disconnect(DisconnectPacket {
             reason_code,
             properties: reason_properties(reason_code),
         }))
@@ -190,7 +190,7 @@ impl Handler<MqttPacket> for MqttHandler {
                     properties.push(MqttProperty::AssignedClientIdentifier(outcome.client_id));
                 }
 
-                ctx.write(MqttPacket::ConnAck(ConnAckPacket {
+                ctx.write_and_flush(MqttPacket::ConnAck(ConnAckPacket {
                     session_present: outcome.session_present,
                     reason_code: protocol::SUCCESS,
                     properties,
@@ -206,7 +206,7 @@ impl Handler<MqttPacket> for MqttHandler {
                 };
                 self.disconnect(ctx, reason).await
             }
-            MqttPacket::PingReq => ctx.write(MqttPacket::PingResp).await,
+            MqttPacket::PingReq => ctx.write_and_flush(MqttPacket::PingResp).await,
             MqttPacket::Disconnect(_) => {
                 self.stop_keep_alive();
                 if self.broker.remove_connection(ctx.id()).is_some() {
@@ -222,13 +222,13 @@ impl Handler<MqttPacket> for MqttHandler {
             }
             MqttPacket::Subscribe(packet) => {
                 let (suback, retained) = self.broker.subscribe(ctx.id(), packet);
-                ctx.write(MqttPacket::SubAck(suback)).await?;
+                ctx.write_and_flush(MqttPacket::SubAck(suback)).await?;
                 flush_deliveries(retained).await;
                 Ok(())
             }
             MqttPacket::Unsubscribe(packet) => {
                 let unsuback = self.broker.unsubscribe(ctx.id(), packet);
-                ctx.write(MqttPacket::UnsubAck(unsuback)).await
+                ctx.write_and_flush(MqttPacket::UnsubAck(unsuback)).await
             }
             MqttPacket::Publish(mut packet) => {
                 let started_at = Instant::now();
@@ -250,7 +250,7 @@ impl Handler<MqttPacket> for MqttHandler {
                     QoS::AtMostOnce => {}
                     QoS::AtLeastOnce => {
                         if let Some(packet_id) = packet.packet_id {
-                            ctx.write(MqttPacket::PubAck(AckPacket::new(
+                            ctx.write_and_flush(MqttPacket::PubAck(AckPacket::new(
                                 packet_id,
                                 protocol::SUCCESS,
                             )))
@@ -263,8 +263,11 @@ impl Handler<MqttPacket> for MqttHandler {
                         return if let Some(packet_id) = packet.packet_id {
                             let reason_code =
                                 self.broker.store_qos2_publish(ctx.id(), packet_id, packet);
-                            ctx.write(MqttPacket::PubRec(ack_packet(packet_id, reason_code)))
-                                .await?;
+                            ctx.write_and_flush(MqttPacket::PubRec(ack_packet(
+                                packet_id,
+                                reason_code,
+                            )))
+                            .await?;
                             Ok(())
                         } else {
                             self.disconnect(ctx, protocol::MALFORMED_PACKET).await
@@ -283,7 +286,7 @@ impl Handler<MqttPacket> for MqttHandler {
                     .complete_qos2_publish(ctx.id(), packet.packet_id)
                 else {
                     return ctx
-                        .write(MqttPacket::PubComp(ack_packet(
+                        .write_and_flush(MqttPacket::PubComp(ack_packet(
                             packet.packet_id,
                             protocol::PACKET_IDENTIFIER_NOT_FOUND,
                         )))
@@ -291,7 +294,7 @@ impl Handler<MqttPacket> for MqttHandler {
                 };
 
                 flush_deliveries(deliveries).await;
-                ctx.write(MqttPacket::PubComp(ack_packet(
+                ctx.write_and_flush(MqttPacket::PubComp(ack_packet(
                     packet.packet_id,
                     protocol::SUCCESS,
                 )))
@@ -314,7 +317,7 @@ impl Handler<MqttPacket> for MqttHandler {
                     .broker
                     .receive_outbound_qos2(ctx.id(), packet.packet_id)
                 {
-                    ctx.write(MqttPacket::PubRel(AckPacket::new(
+                    ctx.write_and_flush(MqttPacket::PubRel(AckPacket::new(
                         packet.packet_id,
                         protocol::SUCCESS,
                     )))
