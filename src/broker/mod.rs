@@ -1,5 +1,6 @@
 pub(crate) mod runtime;
 mod storage;
+pub(crate) mod vnext;
 
 #[cfg(test)]
 mod tests;
@@ -133,7 +134,7 @@ impl Broker {
         connection_id: u64,
         topic_name: &str,
     ) -> bool {
-        self.with_state(|state| {
+        self.read_state(|state| {
             let principal = state
                 .clients_by_connection
                 .get(&connection_id)
@@ -200,6 +201,30 @@ impl Broker {
             let operation = operation.take().expect("storage operation called once");
             result = Some(operation(state));
             state.record_metrics();
+        });
+        result.expect("storage operation completed")
+    }
+
+    pub(in crate::broker) fn with_transient_state<R>(
+        &self,
+        operation: impl FnOnce(&mut BrokerState) -> R,
+    ) -> R {
+        let mut operation = Some(operation);
+        let mut result = None;
+        self.inner.storage.with_transient_state(&mut |state| {
+            let operation = operation.take().expect("storage operation called once");
+            result = Some(operation(state));
+            state.record_metrics();
+        });
+        result.expect("storage operation completed")
+    }
+
+    pub(in crate::broker) fn read_state<R>(&self, operation: impl FnOnce(&BrokerState) -> R) -> R {
+        let mut operation = Some(operation);
+        let mut result = None;
+        self.inner.storage.read_state(&mut |state| {
+            let operation = operation.take().expect("storage operation called once");
+            result = Some(operation(state));
         });
         result.expect("storage operation completed")
     }

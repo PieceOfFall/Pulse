@@ -302,6 +302,20 @@ impl Handler<MqttPacket> for MqttHandler {
 
                 match packet.qos {
                     QoS::AtMostOnce => {
+                        if let Some(result) =
+                            self.broker.publish_qos0_fast_authorized(ctx.id(), &packet)
+                        {
+                            match result {
+                                Ok(deliveries) => {
+                                    flush_deliveries(deliveries).await;
+                                    metrics::publish_latency(started_at.elapsed());
+                                    return Ok(());
+                                }
+                                Err(reason_code) => {
+                                    return self.disconnect_without_will(ctx, reason_code).await;
+                                }
+                            }
+                        }
                         if !self.broker.authorize_publish(ctx.id(), &packet.topic_name) {
                             return self
                                 .disconnect_without_will(ctx, protocol::NOT_AUTHORIZED)

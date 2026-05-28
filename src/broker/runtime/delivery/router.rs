@@ -1,7 +1,10 @@
-use rs_netty::codec::PublishPacket;
+use rs_netty::codec::{MqttPacket, PublishPacket, QoS};
 
 use super::{
-    Delivery, DeliveryTarget, inflight::delivery_for_client, offline_queue::queue_offline_publish,
+    Delivery, DeliveryTarget,
+    inflight::delivery_for_client,
+    offline_queue::queue_offline_publish,
+    packet::{effective_qos, fits_qos0_publish_fast, pending_publish},
 };
 use crate::{
     broker::runtime::{
@@ -71,4 +74,67 @@ pub(in crate::broker) fn deliveries_for_publish(
             },
         )
         .collect()
+}
+
+pub(in crate::broker) fn qos0_deliveries_for_publish_readonly(
+    state: &BrokerState,
+    publisher_connection_id: u64,
+    packet: &PublishPacket,
+) -> Option<Vec<Delivery>> {
+    if packet.qos != QoS::AtMostOnce || packet.retain {
+        return None;
+    }
+
+    let now_ms = now_ms();
+    let expires_at_ms = message_expires_at_ms(packet, now_ms);
+    if is_message_expired(expires_at_ms, now_ms) {
+        return Some(Vec::new());
+    }
+
+    let publisher_client_id = state
+        .clients_by_connection
+        .get(&publisher_connection_id)
+        .map(|client| client.client_id.as_str());
+    let mut deliveries = Vec::new();
+
+    for subscription in state.subscriptions.iter().filter(|sub| {
+        protocol::topic_matches(&sub.match_filter, &packet.topic_name)
+            && !(sub.options.no_local && publisher_client_id == Some(sub.client_id.as_str()))
+    }) {
+        if subscription.shared_group.is_some() {
+            return None;
+        }
+
+        let Some(connection_id) = state.connection_by_client_id.get(&subscription.client_id) else {
+            continue;
+        };
+        let Some(client) = state.clients_by_connection.get(connection_id) else {
+            continue;
+        };
+
+        let qos = effective_qos(packet.qos, subscription.options.maximum_qos);
+        debug_assert_eq!(qos, QoS::AtMostOnce);
+        if !fits_qos0_publish_fast(
+            packet,
+            subscription.subscription_identifier,
+            client.maximum_packet_size,
+        ) {
+            continue;
+        }
+        let publish = pending_publish(
+            packet,
+            qos,
+            false,
+            None,
+            false,
+            subscription.subscription_identifier,
+        );
+
+        deliveries.push(Delivery {
+            channel: client.channel.clone(),
+            packet: MqttPacket::Publish(publish),
+        });
+    }
+
+    Some(deliveries)
 }

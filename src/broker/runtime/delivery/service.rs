@@ -1,7 +1,8 @@
 use rs_netty::codec::{MqttPacket, PublishPacket, Will};
 
 use super::{
-    Delivery, deliveries_for_publish, flush_deliveries, packet_size, queued_deliveries_for_client,
+    Delivery, deliveries_for_publish, flush_deliveries, packet_size,
+    qos0_deliveries_for_publish_readonly, queued_deliveries_for_client,
     retransmissions_for_connection,
 };
 use crate::{
@@ -17,11 +18,39 @@ use crate::{
 };
 
 impl Broker {
+    pub(in crate::broker) fn publish_qos0_fast_authorized(
+        &self,
+        publisher_connection_id: u64,
+        packet: &PublishPacket,
+    ) -> Option<Result<Vec<Delivery>, u8>> {
+        self.read_state(|state| {
+            let principal = state
+                .clients_by_connection
+                .get(&publisher_connection_id)
+                .and_then(|client| client.principal.as_deref());
+            if !self
+                .inner
+                .authenticator
+                .authorize_publish(principal, &packet.topic_name)
+            {
+                return Some(Err(protocol::NOT_AUTHORIZED));
+            }
+
+            qos0_deliveries_for_publish_readonly(state, publisher_connection_id, packet).map(Ok)
+        })
+    }
+
     pub(in crate::broker) fn publish(
         &self,
         publisher_connection_id: u64,
         packet: &PublishPacket,
     ) -> Vec<Delivery> {
+        if let Some(deliveries) = self.read_state(|state| {
+            qos0_deliveries_for_publish_readonly(state, publisher_connection_id, packet)
+        }) {
+            return deliveries;
+        }
+
         let config = *self.config();
         self.with_state(|state| {
             state.expire_sessions(now_ms());
@@ -94,17 +123,21 @@ impl Broker {
         connection_id: u64,
         packet_id: u16,
     ) -> Option<Vec<Delivery>> {
-        self.with_state(|state| {
+        let outcome = self.with_transient_state(|state| {
             let client_id = state
                 .clients_by_connection
                 .get(&connection_id)
                 .map(|client| client.client_id.clone())?;
-            let removed = state
-                .sessions_by_client_id
-                .get_mut(&client_id)
-                .is_some_and(|session| session.outbound_qos1.remove(&packet_id).is_some());
-            removed.then(|| queued_deliveries_for_client(state, &client_id))
-        })
+            let session = state.sessions_by_client_id.get_mut(&client_id)?;
+            let removed = session.outbound_qos1.remove(&packet_id).is_some();
+            removed.then(|| (client_id, !session.offline_queue.is_empty()))
+        })?;
+
+        if outcome.1 {
+            Some(self.with_state(|state| queued_deliveries_for_client(state, &outcome.0)))
+        } else {
+            Some(Vec::new())
+        }
     }
 
     pub(in crate::broker) fn receive_outbound_qos2(
@@ -112,7 +145,7 @@ impl Broker {
         connection_id: u64,
         packet_id: u16,
     ) -> Option<Vec<Delivery>> {
-        self.with_state(|state| {
+        let outcome = self.with_transient_state(|state| {
             let client_id = state
                 .clients_by_connection
                 .get(&connection_id)
@@ -121,11 +154,17 @@ impl Broker {
 
             if session.outbound_qos2_publish.remove(&packet_id).is_some() {
                 session.outbound_qos2_pubrel.insert(packet_id);
-                Some(queued_deliveries_for_client(state, &client_id))
+                Some((client_id, !session.offline_queue.is_empty()))
             } else {
                 None
             }
-        })
+        })?;
+
+        if outcome.1 {
+            Some(self.with_state(|state| queued_deliveries_for_client(state, &outcome.0)))
+        } else {
+            Some(Vec::new())
+        }
     }
 
     pub(in crate::broker) fn packet_exceeds_server_maximum(&self, packet: &MqttPacket) -> bool {
@@ -138,7 +177,7 @@ impl Broker {
         connection_id: u64,
         packet_id: u16,
     ) -> bool {
-        self.with_state(|state| {
+        self.with_transient_state(|state| {
             let Some(client_id) = state
                 .clients_by_connection
                 .get(&connection_id)

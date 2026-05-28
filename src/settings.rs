@@ -9,7 +9,13 @@ use std::{
 
 use serde::Deserialize;
 
-use crate::broker::runtime::{auth::AuthConfig, config::BrokerConfig};
+use crate::broker::{
+    runtime::{
+        auth::AuthConfig,
+        config::{BrokerConfig, SlowConsumerPolicy},
+    },
+    vnext::CommitPolicy,
+};
 
 const CONFIG_FILE_NAME: &str = "Broker.toml";
 
@@ -25,6 +31,7 @@ pub(crate) struct AppConfig {
 #[derive(Clone, Debug)]
 pub(crate) struct ServerConfig {
     pub(crate) bind: String,
+    pub(crate) worker_threads: usize,
     pub(crate) outbound_queue_size: usize,
     pub(crate) shutdown_drain_timeout_ms: u64,
     pub(crate) tls: ServerTlsConfig,
@@ -82,8 +89,54 @@ impl FromStr for TlsClientAuth {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct StorageConfig {
+    pub(crate) engine: StorageEngine,
     pub(crate) sqlite: Option<String>,
     pub(crate) mysql: Option<String>,
+    pub(crate) wal_dir: Option<PathBuf>,
+    pub(crate) commit_policy: CommitPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum StorageEngine {
+    #[default]
+    Memory,
+    Sqlite,
+    Mysql,
+    Wal,
+}
+
+#[derive(Debug)]
+pub(crate) struct ParseStorageEngineError {
+    value: String,
+}
+
+impl fmt::Display for ParseStorageEngineError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "storage.engine must be one of memory, sqlite, mysql, wal; got `{}`",
+            self.value
+        )
+    }
+}
+
+impl Error for ParseStorageEngineError {}
+
+impl FromStr for StorageEngine {
+    type Err = ParseStorageEngineError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "memory" => Ok(Self::Memory),
+            "sqlite" => Ok(Self::Sqlite),
+            "mysql" => Ok(Self::Mysql),
+            "wal" => Ok(Self::Wal),
+            _ => Err(ParseStorageEngineError {
+                value: value.to_string(),
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -104,6 +157,7 @@ struct FileConfig {
 #[derive(Default, Deserialize)]
 struct ServerFileConfig {
     bind: Option<String>,
+    worker_threads: Option<usize>,
     outbound_queue_size: Option<usize>,
     shutdown_drain_timeout_ms: Option<u64>,
     tls: Option<ServerTlsFileConfig>,
@@ -120,8 +174,11 @@ struct ServerTlsFileConfig {
 
 #[derive(Default, Deserialize)]
 struct StorageFileConfig {
+    engine: Option<StorageEngine>,
     sqlite: Option<String>,
     mysql: Option<String>,
+    wal_dir: Option<PathBuf>,
+    commit_policy: Option<CommitPolicy>,
 }
 
 #[derive(Default, Deserialize)]
@@ -134,6 +191,7 @@ struct LimitsFileConfig {
     max_retained_messages: Option<usize>,
     max_retained_payload_bytes: Option<usize>,
     inflight_retransmit_interval_ms: Option<u64>,
+    slow_consumer_policy: Option<SlowConsumerPolicy>,
 }
 
 #[derive(Default, Deserialize)]
@@ -156,6 +214,7 @@ impl Default for AppConfig {
         Self {
             server: ServerConfig {
                 bind: "0.0.0.0:1883".to_string(),
+                worker_threads: default_worker_threads(),
                 outbound_queue_size: 1024,
                 shutdown_drain_timeout_ms: 5_000,
                 tls: ServerTlsConfig::default(),
@@ -211,6 +270,7 @@ impl AppConfig {
     fn apply_env(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.apply_server(ServerFileConfig {
             bind: env_string("MQTT_RS_BIND"),
+            worker_threads: env_parse("MQTT_RS_WORKER_THREADS")?,
             outbound_queue_size: env_parse("MQTT_RS_OUTBOUND_QUEUE_SIZE")?,
             shutdown_drain_timeout_ms: env_parse("MQTT_RS_SHUTDOWN_DRAIN_TIMEOUT_MS")?,
             tls: Some(ServerTlsFileConfig {
@@ -222,8 +282,11 @@ impl AppConfig {
             }),
         });
         self.apply_storage(StorageFileConfig {
+            engine: env_parse("MQTT_RS_STORAGE_ENGINE")?,
             sqlite: env_string("MQTT_RS_SQLITE"),
             mysql: env_string("MQTT_RS_MYSQL"),
+            wal_dir: env_path("MQTT_RS_WAL_DIR"),
+            commit_policy: env_parse("MQTT_RS_STORAGE_COMMIT_POLICY")?,
         });
         self.apply_limits(LimitsFileConfig {
             server_receive_maximum: env_parse("MQTT_RS_SERVER_RECEIVE_MAXIMUM")?,
@@ -234,6 +297,7 @@ impl AppConfig {
             max_retained_messages: env_parse("MQTT_RS_MAX_RETAINED_MESSAGES")?,
             max_retained_payload_bytes: env_parse("MQTT_RS_MAX_RETAINED_PAYLOAD_BYTES")?,
             inflight_retransmit_interval_ms: env_parse("MQTT_RS_INFLIGHT_RETRANSMIT_INTERVAL_MS")?,
+            slow_consumer_policy: env_parse("MQTT_RS_SLOW_CONSUMER_POLICY")?,
         });
         self.apply_observability(ObservabilityFileConfig {
             log: env_string("MQTT_RS_LOG").or_else(|| env_string("RUST_LOG")),
@@ -252,6 +316,9 @@ impl AppConfig {
     fn apply_server(&mut self, server: ServerFileConfig) {
         if let Some(bind) = server.bind {
             self.server.bind = bind;
+        }
+        if let Some(worker_threads) = server.worker_threads {
+            self.server.worker_threads = worker_threads;
         }
         if let Some(outbound_queue_size) = server.outbound_queue_size {
             self.server.outbound_queue_size = outbound_queue_size;
@@ -283,11 +350,23 @@ impl AppConfig {
     }
 
     fn apply_storage(&mut self, storage: StorageFileConfig) {
+        if let Some(engine) = storage.engine {
+            self.storage.engine = engine;
+        }
         if let Some(sqlite) = storage.sqlite {
+            self.storage.engine = StorageEngine::Sqlite;
             self.storage.sqlite = Some(sqlite);
         }
         if let Some(mysql) = storage.mysql {
+            self.storage.engine = StorageEngine::Mysql;
             self.storage.mysql = Some(mysql);
+        }
+        if let Some(wal_dir) = storage.wal_dir {
+            self.storage.engine = StorageEngine::Wal;
+            self.storage.wal_dir = Some(wal_dir);
+        }
+        if let Some(commit_policy) = storage.commit_policy {
+            self.storage.commit_policy = commit_policy;
         }
     }
 
@@ -316,6 +395,9 @@ impl AppConfig {
         if let Some(value) = limits.inflight_retransmit_interval_ms {
             self.limits.inflight_retransmit_interval_ms = value;
         }
+        if let Some(value) = limits.slow_consumer_policy {
+            self.limits.slow_consumer_policy = value;
+        }
     }
 
     fn apply_observability(&mut self, observability: ObservabilityFileConfig) {
@@ -331,6 +413,9 @@ impl AppConfig {
         if self.server.outbound_queue_size == 0 {
             return Err("server.outbound_queue_size must be greater than 0".into());
         }
+        if self.server.worker_threads == 0 {
+            return Err("server.worker_threads must be greater than 0".into());
+        }
         if self.server.shutdown_drain_timeout_ms == 0 {
             return Err("server.shutdown_drain_timeout_ms must be greater than 0".into());
         }
@@ -342,6 +427,17 @@ impl AppConfig {
         }
         if self.storage.sqlite.is_some() && self.storage.mysql.is_some() {
             return Err("storage.sqlite and storage.mysql are mutually exclusive".into());
+        }
+        match self.storage.engine {
+            StorageEngine::Memory => {}
+            StorageEngine::Sqlite if self.storage.sqlite.is_none() => {
+                return Err("storage.sqlite is required when storage.engine is sqlite".into());
+            }
+            StorageEngine::Mysql if self.storage.mysql.is_none() => {
+                return Err("storage.mysql is required when storage.engine is mysql".into());
+            }
+            StorageEngine::Wal => {}
+            StorageEngine::Sqlite | StorageEngine::Mysql => {}
         }
         if self.server.tls.enabled {
             if self.server.tls.certificate_chain.is_none() {
@@ -381,16 +477,32 @@ fn default_config_path() -> PathBuf {
         .join(CONFIG_FILE_NAME)
 }
 
+fn default_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|threads| threads.get())
+        .unwrap_or(1)
+}
+
 #[cfg(windows)]
 fn default_storage_config() -> StorageConfig {
+    let sqlite = env::var_os("ProgramData").map(PathBuf::from).map(|path| {
+        path.join("Pulse")
+            .join("broker.db")
+            .to_string_lossy()
+            .into_owned()
+    });
+    let engine = if sqlite.is_some() {
+        StorageEngine::Sqlite
+    } else {
+        StorageEngine::Memory
+    };
+
     StorageConfig {
-        sqlite: env::var_os("ProgramData").map(PathBuf::from).map(|path| {
-            path.join("Pulse")
-                .join("broker.db")
-                .to_string_lossy()
-                .into_owned()
-        }),
+        engine,
+        sqlite,
         mysql: None,
+        wal_dir: None,
+        commit_policy: CommitPolicy::default(),
     }
 }
 
@@ -441,6 +553,9 @@ fn parse_cli(
         match arg.as_ref() {
             "-c" | "--config" => config.config_path = Some(next_path(&mut args, arg.as_ref())?),
             "--bind" => config.server.bind = Some(next_string(&mut args, arg.as_ref())?),
+            "--worker-threads" => {
+                config.server.worker_threads = Some(next_parse(&mut args, arg.as_ref())?)
+            }
             "--tls" => tls_config_mut(&mut config.server).enabled = Some(true),
             "--no-tls" => tls_config_mut(&mut config.server).enabled = Some(false),
             "--tls-certificate-chain" => {
@@ -459,8 +574,15 @@ fn parse_cli(
                 tls_config_mut(&mut config.server).client_ca =
                     Some(next_path(&mut args, arg.as_ref())?)
             }
+            "--storage-engine" => {
+                config.storage.engine = Some(next_parse(&mut args, arg.as_ref())?)
+            }
             "--sqlite" => config.storage.sqlite = Some(next_string(&mut args, arg.as_ref())?),
             "--mysql" => config.storage.mysql = Some(next_string(&mut args, arg.as_ref())?),
+            "--wal-dir" => config.storage.wal_dir = Some(next_path(&mut args, arg.as_ref())?),
+            "--storage-commit-policy" => {
+                config.storage.commit_policy = Some(next_parse(&mut args, arg.as_ref())?)
+            }
             "--outbound-queue-size" => {
                 config.server.outbound_queue_size = Some(next_parse(&mut args, arg.as_ref())?)
             }
@@ -499,6 +621,9 @@ fn parse_cli(
             "--inflight-retransmit-interval-ms" => {
                 config.limits.inflight_retransmit_interval_ms =
                     Some(next_parse(&mut args, arg.as_ref())?)
+            }
+            "--slow-consumer-policy" => {
+                config.limits.slow_consumer_policy = Some(next_parse(&mut args, arg.as_ref())?)
             }
             _ => return Err(format!("unknown argument: {arg}").into()),
         }
@@ -557,19 +682,43 @@ mod tests {
         sync::{Mutex, MutexGuard},
     };
 
-    use super::{AppConfig, FileConfig, TlsClientAuth};
-    use crate::broker::runtime::config::{
-        INFLIGHT_RETRANSMIT_INTERVAL_MS, MAX_OFFLINE_QUEUE_LEN, MAX_RETAINED_MESSAGES,
-        MAX_RETAINED_PAYLOAD_BYTES, MAX_SUBSCRIPTIONS_PER_CLIENT, SERVER_MAXIMUM_PACKET_SIZE,
-        SERVER_RECEIVE_MAXIMUM, SERVER_TOPIC_ALIAS_MAXIMUM,
+    use super::{AppConfig, FileConfig, StorageEngine, TlsClientAuth};
+    use crate::broker::{
+        runtime::config::{
+            INFLIGHT_RETRANSMIT_INTERVAL_MS, MAX_OFFLINE_QUEUE_LEN, MAX_RETAINED_MESSAGES,
+            MAX_RETAINED_PAYLOAD_BYTES, MAX_SUBSCRIPTIONS_PER_CLIENT, SERVER_MAXIMUM_PACKET_SIZE,
+            SERVER_RECEIVE_MAXIMUM, SERVER_TOPIC_ALIAS_MAXIMUM, SlowConsumerPolicy,
+        },
+        vnext::CommitPolicy,
     };
 
-    const TLS_ENV_KEYS: &[&str] = &[
+    const CONFIG_ENV_KEYS: &[&str] = &[
+        "MQTT_RS_BIND",
+        "MQTT_RS_WORKER_THREADS",
+        "MQTT_RS_OUTBOUND_QUEUE_SIZE",
+        "MQTT_RS_SHUTDOWN_DRAIN_TIMEOUT_MS",
         "MQTT_RS_TLS_ENABLED",
         "MQTT_RS_TLS_CERTIFICATE_CHAIN",
         "MQTT_RS_TLS_PRIVATE_KEY",
         "MQTT_RS_TLS_CLIENT_AUTH",
         "MQTT_RS_TLS_CLIENT_CA",
+        "MQTT_RS_STORAGE_ENGINE",
+        "MQTT_RS_SQLITE",
+        "MQTT_RS_MYSQL",
+        "MQTT_RS_WAL_DIR",
+        "MQTT_RS_STORAGE_COMMIT_POLICY",
+        "MQTT_RS_SERVER_RECEIVE_MAXIMUM",
+        "MQTT_RS_SERVER_MAXIMUM_PACKET_SIZE",
+        "MQTT_RS_SERVER_TOPIC_ALIAS_MAXIMUM",
+        "MQTT_RS_MAX_SUBSCRIPTIONS_PER_CLIENT",
+        "MQTT_RS_MAX_OFFLINE_QUEUE_LEN",
+        "MQTT_RS_MAX_RETAINED_MESSAGES",
+        "MQTT_RS_MAX_RETAINED_PAYLOAD_BYTES",
+        "MQTT_RS_INFLIGHT_RETRANSMIT_INTERVAL_MS",
+        "MQTT_RS_SLOW_CONSUMER_POLICY",
+        "MQTT_RS_LOG",
+        "RUST_LOG",
+        "MQTT_RS_METRICS_BIND",
     ];
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -586,11 +735,11 @@ mod tests {
 
         fn set_tls(vars: &[(&'static str, &str)]) -> Self {
             let lock = ENV_LOCK.lock().expect("environment lock");
-            let saved = TLS_ENV_KEYS
+            let saved = CONFIG_ENV_KEYS
                 .iter()
                 .map(|name| (*name, env::var_os(name)))
                 .collect();
-            for name in TLS_ENV_KEYS {
+            for name in CONFIG_ENV_KEYS {
                 unsafe {
                     env::remove_var(name);
                 }
@@ -642,10 +791,14 @@ mod tests {
     fn defaults_match_runtime_constants() {
         let config = AppConfig::default();
         assert!(!config.server.tls.enabled);
+        assert!(config.server.worker_threads > 0);
         assert!(config.server.tls.certificate_chain.is_none());
         assert!(config.server.tls.private_key.is_none());
         assert_eq!(config.server.tls.client_auth, TlsClientAuth::Disabled);
         assert!(config.server.tls.client_ca.is_none());
+        #[cfg(not(windows))]
+        assert_eq!(config.storage.engine, StorageEngine::Memory);
+        assert_eq!(config.storage.commit_policy, CommitPolicy::Balanced);
         assert_eq!(config.limits.server_receive_maximum, SERVER_RECEIVE_MAXIMUM);
         assert_eq!(
             config.limits.server_maximum_packet_size,
@@ -669,8 +822,74 @@ mod tests {
             config.limits.inflight_retransmit_interval_ms,
             INFLIGHT_RETRANSMIT_INTERVAL_MS
         );
+        assert_eq!(
+            config.limits.slow_consumer_policy,
+            SlowConsumerPolicy::Throttle
+        );
         assert_eq!(config.server.shutdown_drain_timeout_ms, 5_000);
         assert!(!config.auth.enabled);
+    }
+
+    #[test]
+    fn file_config_enables_vnext_wal_knobs() {
+        let file: FileConfig = toml::from_str(
+            r#"
+            [server]
+            worker_threads = 2
+
+            [storage]
+            engine = "wal"
+            wal_dir = "data/wal"
+            commit_policy = "strict"
+
+            [limits]
+            slow_consumer_policy = "queue-offline"
+            "#,
+        )
+        .expect("parse config");
+
+        let mut config = AppConfig::default();
+        config.apply_file(file);
+        config.validate().expect("valid vNext config");
+
+        assert_eq!(config.server.worker_threads, 2);
+        assert_eq!(config.storage.engine, StorageEngine::Wal);
+        assert_eq!(config.storage.wal_dir, Some(PathBuf::from("data/wal")));
+        assert_eq!(config.storage.commit_policy, CommitPolicy::Strict);
+        assert_eq!(
+            config.limits.slow_consumer_policy,
+            SlowConsumerPolicy::QueueOffline
+        );
+    }
+
+    #[test]
+    fn cli_accepts_vnext_wal_knobs() {
+        let _env = EnvGuard::clear_tls();
+        let args = [
+            "Pulse",
+            "--worker-threads",
+            "3",
+            "--storage-engine",
+            "wal",
+            "--wal-dir",
+            "data/wal",
+            "--storage-commit-policy",
+            "fast",
+            "--slow-consumer-policy",
+            "disconnect",
+        ]
+        .into_iter()
+        .map(OsString::from);
+        let config = AppConfig::load_from_args(args).expect("load config");
+
+        assert_eq!(config.server.worker_threads, 3);
+        assert_eq!(config.storage.engine, StorageEngine::Wal);
+        assert_eq!(config.storage.wal_dir, Some(PathBuf::from("data/wal")));
+        assert_eq!(config.storage.commit_policy, CommitPolicy::Fast);
+        assert_eq!(
+            config.limits.slow_consumer_policy,
+            SlowConsumerPolicy::Disconnect
+        );
     }
 
     #[test]
@@ -836,6 +1055,17 @@ mod tests {
         let error = AppConfig::load_from_args(args).expect_err("invalid config");
 
         assert!(error.to_string().contains("limits.server_receive_maximum"));
+    }
+
+    #[test]
+    fn rejects_invalid_zero_worker_threads() {
+        let _env = EnvGuard::clear_tls();
+        let args = ["Pulse", "--worker-threads", "0"]
+            .into_iter()
+            .map(OsString::from);
+        let error = AppConfig::load_from_args(args).expect_err("invalid config");
+
+        assert!(error.to_string().contains("server.worker_threads"));
     }
 
     #[test]

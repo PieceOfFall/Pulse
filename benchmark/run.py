@@ -37,6 +37,7 @@ SUCCESS_LIMIT = 0x80
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PULSE_BIN = REPO_ROOT / "target" / "release" / "Pulse"
 HOMEBREW_MOSQUITTO = Path("/opt/homebrew/opt/mosquitto/sbin/mosquitto")
+DEFAULT_MEMORY_SAMPLE_INTERVAL_MS = 10
 
 
 class MqttError(RuntimeError):
@@ -66,6 +67,45 @@ class BrokerProcess:
         self.stderr = err or ""
         if self.tempdir is not None:
             self.tempdir.cleanup()
+
+
+class MemorySampler:
+    def __init__(self, pid: int, interval_seconds: float):
+        self.pid = pid
+        self.interval_seconds = interval_seconds
+        self.samples = []
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, name=f"rss-sampler-{pid}")
+
+    def start(self) -> None:
+        self.sample()
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=1)
+        self.sample()
+
+    def index(self) -> int:
+        with self.lock:
+            return len(self.samples)
+
+    def sample(self) -> Optional[int]:
+        rss = rss_kib(self.pid)
+        if rss is not None:
+            with self.lock:
+                self.samples.append(rss)
+        return rss
+
+    def peak_since(self, index: int) -> Optional[int]:
+        with self.lock:
+            window = self.samples[index:]
+            return max(window) if window else None
+
+    def _run(self) -> None:
+        while not self.stop_event.wait(self.interval_seconds):
+            self.sample()
 
 
 class MqttClient:
@@ -327,42 +367,92 @@ def wait_for_port(host: str, port: int, process: subprocess.Popen[str], timeout:
     raise RuntimeError(f"timed out waiting for {host}:{port}: {last_error}")
 
 
-def start_pulse(pulse_bin: Path, port: int) -> BrokerProcess:
+def rss_kib(pid: int) -> Optional[int]:
+    result = subprocess.run(
+        ["ps", "-o", "rss=", "-p", str(pid)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    if not value:
+        return None
+    return int(value.splitlines()[0].strip())
+
+
+def rss_mib(rss: Optional[int]) -> Optional[float]:
+    return None if rss is None else rss / 1024
+
+
+def format_mib(value: object) -> str:
+    if value is None:
+        return "n/a"
+    return f"{float(value):.2f}"
+
+
+def start_pulse(pulse_bin: Path, port: int, sqlite_path: Optional[Path]) -> BrokerProcess:
     if not pulse_bin.exists():
         raise FileNotFoundError(
             f"Pulse binary not found at {pulse_bin}. Run `cargo build --release` or pass --pulse-bin."
         )
+
+    tempdir = None
+    if sqlite_path is None:
+        tempdir = tempfile.TemporaryDirectory(prefix="pulse-sqlite-")
+        sqlite_path = Path(tempdir.name) / "pulse-benchmark.db"
+
+    command = [
+        str(pulse_bin),
+        "--bind",
+        f"127.0.0.1:{port}",
+        "--sqlite",
+        str(sqlite_path),
+        "--log",
+        "error",
+        "--inflight-retransmit-interval-ms",
+        "0",
+    ]
     process = subprocess.Popen(
-        [
-            str(pulse_bin),
-            "--bind",
-            f"127.0.0.1:{port}",
-            "--log",
-            "error",
-            "--inflight-retransmit-interval-ms",
-            "0",
-        ],
+        command,
         cwd=REPO_ROOT,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
-    wait_for_port("127.0.0.1", port, process, timeout=10)
-    return BrokerProcess("Pulse", process)
+    broker = BrokerProcess("Pulse-sqlite", process, tempdir=tempdir)
+    try:
+        wait_for_port("127.0.0.1", port, process, timeout=10)
+    except BaseException:
+        broker.stop()
+        raise
+    return broker
 
 
-def start_mosquitto(mosquitto_bin: Path, port: int) -> BrokerProcess:
+def start_mosquitto(
+    mosquitto_bin: Path, port: int, persistence_dir: Optional[Path]
+) -> BrokerProcess:
     if not mosquitto_bin.exists():
         raise FileNotFoundError(f"mosquitto binary not found at {mosquitto_bin}")
 
-    tempdir = tempfile.TemporaryDirectory(prefix="pulse-mosquitto-")
-    config_path = Path(tempdir.name) / "mosquitto.conf"
+    tempdir = None
+    if persistence_dir is None:
+        tempdir = tempfile.TemporaryDirectory(prefix="pulse-mosquitto-")
+        persistence_dir = Path(tempdir.name)
+    persistence_dir.mkdir(parents=True, exist_ok=True)
+    config_path = persistence_dir / "mosquitto.conf"
+    persistence_location = str(persistence_dir) + os.sep
     config_path.write_text(
         "\n".join(
             [
                 f"listener {port} 127.0.0.1",
                 "allow_anonymous true",
-                "persistence false",
+                "persistence true",
+                "persistence_file mosquitto.db",
+                f"persistence_location {persistence_location}",
+                "autosave_interval 1",
+                "autosave_on_changes true",
                 "max_inflight_bytes 0",
                 "max_inflight_messages 0",
                 "max_queued_bytes 0",
@@ -382,8 +472,13 @@ def start_mosquitto(mosquitto_bin: Path, port: int) -> BrokerProcess:
         stderr=subprocess.PIPE,
         text=True,
     )
-    wait_for_port("127.0.0.1", port, process, timeout=10)
-    return BrokerProcess("Mosquitto", process, tempdir=tempdir)
+    broker = BrokerProcess("Mosquitto-persist", process, tempdir=tempdir)
+    try:
+        wait_for_port("127.0.0.1", port, process, timeout=10)
+    except BaseException:
+        broker.stop()
+        raise
+    return broker
 
 
 def run_throughput(
@@ -509,12 +604,22 @@ def run_retained_fanout(
 def run_benchmark_for_broker(name: str, start_fn, args) -> tuple[list[dict[str, object]], str]:
     port = find_free_port()
     broker = start_fn(port)
+    sampler = None
     try:
-        results = [
-            run_throughput(name, port, QOS0, args.messages, args.payload_bytes, args.timeout),
-            run_throughput(name, port, QOS1, args.messages, args.payload_bytes, args.timeout),
-            run_throughput(name, port, QOS2, args.messages, args.payload_bytes, args.timeout),
-            run_retained_fanout(
+        sampler = MemorySampler(broker.process.pid, args.memory_sample_interval_ms / 1000)
+        sampler.start()
+        baseline = sampler.sample()
+        scenarios = [
+            lambda: run_throughput(
+                name, port, QOS0, args.messages, args.payload_bytes, args.timeout
+            ),
+            lambda: run_throughput(
+                name, port, QOS1, args.messages, args.payload_bytes, args.timeout
+            ),
+            lambda: run_throughput(
+                name, port, QOS2, args.messages, args.payload_bytes, args.timeout
+            ),
+            lambda: run_retained_fanout(
                 name,
                 port,
                 args.fanout_subscribers,
@@ -522,8 +627,23 @@ def run_benchmark_for_broker(name: str, start_fn, args) -> tuple[list[dict[str, 
                 args.timeout,
             ),
         ]
+        results = []
+        for scenario in scenarios:
+            assert sampler is not None
+            start_index = sampler.index()
+            start_rss = sampler.sample()
+            result = scenario()
+            end_rss = sampler.sample()
+            peak_rss = sampler.peak_since(start_index)
+            result["baseline_rss_mib"] = rss_mib(baseline)
+            result["start_rss_mib"] = rss_mib(start_rss)
+            result["peak_rss_mib"] = rss_mib(peak_rss)
+            result["end_rss_mib"] = rss_mib(end_rss)
+            results.append(result)
         return results, ""
     finally:
+        if sampler is not None:
+            sampler.stop()
         broker.stop()
 
 
@@ -561,15 +681,21 @@ def pulse_version() -> str:
 
 def print_results(results: list[dict[str, object]]) -> None:
     print()
-    print(f"{'Broker':<11} {'Scenario':<18} {'Count':>10} {'Seconds':>10} {'Rate/sec':>12}")
-    print("-" * 68)
+    print(
+        f"{'Broker':<18} {'Scenario':<18} {'Count':>10} {'Seconds':>10} "
+        f"{'Rate/sec':>12} {'Base MiB':>10} {'Peak MiB':>10} {'End MiB':>9}"
+    )
+    print("-" * 108)
     for result in results:
         print(
-            f"{result['broker']:<11} "
+            f"{result['broker']:<18} "
             f"{result['scenario']:<18} "
             f"{result['count']:>10} "
             f"{result['seconds']:>10.4f} "
-            f"{result['rate']:>12.2f}"
+            f"{result['rate']:>12.2f} "
+            f"{format_mib(result.get('baseline_rss_mib')):>10} "
+            f"{format_mib(result.get('peak_rss_mib')):>10} "
+            f"{format_mib(result.get('end_rss_mib')):>9}"
         )
 
 
@@ -579,8 +705,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--payload-bytes", type=int, default=128)
     parser.add_argument("--fanout-subscribers", type=int, default=100)
     parser.add_argument("--pulse-bin", type=Path, default=DEFAULT_PULSE_BIN)
+    parser.add_argument("--pulse-sqlite", type=Path)
     parser.add_argument("--mosquitto-bin")
+    parser.add_argument("--mosquitto-persistence-dir", type=Path)
     parser.add_argument("--timeout", type=float, default=10.0)
+    parser.add_argument(
+        "--memory-sample-interval-ms",
+        type=int,
+        default=DEFAULT_MEMORY_SAMPLE_INTERVAL_MS,
+    )
     return parser.parse_args()
 
 
@@ -593,6 +726,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--fanout-subscribers must be greater than 0")
     if args.timeout <= 0:
         raise ValueError("--timeout must be greater than 0")
+    if args.memory_sample_interval_ms <= 0:
+        raise ValueError("--memory-sample-interval-ms must be greater than 0")
 
 
 def main() -> int:
@@ -604,18 +739,30 @@ def main() -> int:
     print(f"  platform: {platform.platform()}")
     print(f"  python: {platform.python_version()}")
     print(f"  pulse: {pulse_version()} ({args.pulse_bin})")
+    print(f"  pulse_storage: sqlite ({args.pulse_sqlite or 'temporary'})")
     print(f"  mosquitto: {version_output([str(mosquitto_bin), '-h'])} ({mosquitto_bin})")
+    print(
+        "  mosquitto_persistence: true "
+        f"({args.mosquitto_persistence_dir or 'temporary'})"
+    )
     print(f"  messages: {args.messages}")
     print(f"  payload_bytes: {args.payload_bytes}")
     print(f"  fanout_subscribers: {args.fanout_subscribers}")
+    print(f"  memory_sample_interval_ms: {args.memory_sample_interval_ms}")
 
     all_results: list[dict[str, object]] = []
     pulse_results, _ = run_benchmark_for_broker(
-        "Pulse", lambda port: start_pulse(args.pulse_bin, port), args
+        "Pulse-sqlite",
+        lambda port: start_pulse(args.pulse_bin, port, args.pulse_sqlite),
+        args,
     )
     all_results.extend(pulse_results)
     mosquitto_results, _ = run_benchmark_for_broker(
-        "Mosquitto", lambda port: start_mosquitto(mosquitto_bin, port), args
+        "Mosquitto-persist",
+        lambda port: start_mosquitto(
+            mosquitto_bin, port, args.mosquitto_persistence_dir
+        ),
+        args,
     )
     all_results.extend(mosquitto_results)
     print_results(all_results)

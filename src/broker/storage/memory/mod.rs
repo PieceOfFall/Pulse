@@ -13,4 +13,14 @@ impl BrokerStorage for InMemoryStorage {
         let mut state = self.state.lock().expect("broker state lock poisoned");
         operation(&mut state);
     }
+
+    fn with_transient_state(&self, operation: &mut dyn FnMut(&mut BrokerState)) {
+        let mut state = self.state.lock().expect("broker state lock poisoned");
+        operation(&mut state);
+    }
+
+    fn read_state(&self, operation: &mut dyn FnMut(&BrokerState)) {
+        let state = self.state.lock().expect("broker state lock poisoned");
+        operation(&state);
+    }
 }

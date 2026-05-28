@@ -51,6 +51,16 @@ impl BrokerStorage for SqliteStorage {
         let mut connection = self.connection.lock().expect("sqlite lock poisoned");
         persist_state(&mut connection, &state).expect("persist broker state to sqlite");
     }
+
+    fn with_transient_state(&self, operation: &mut dyn FnMut(&mut BrokerState)) {
+        let mut state = self.state.lock().expect("broker state lock poisoned");
+        operation(&mut state);
+    }
+
+    fn read_state(&self, operation: &mut dyn FnMut(&BrokerState)) {
+        let state = self.state.lock().expect("broker state lock poisoned");
+        operation(&state);
+    }
 }
 
 fn load_state(connection: &Connection) -> rusqlite::Result<BrokerState> {

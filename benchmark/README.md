@@ -2,7 +2,9 @@
 
 This directory contains local-only benchmark tooling for comparing Pulse with
 the official Eclipse Mosquitto broker installed through Homebrew. It is excluded
-from Cargo packages with `exclude = ["benchmark/**"]`.
+from Cargo packages with `exclude = ["benchmark/**"]`. By default, Pulse runs
+with temporary SQLite storage and Mosquitto runs with temporary built-in
+persistence enabled.
 
 ## Prerequisites
 
@@ -44,8 +46,11 @@ python3 benchmark/run.py \
   --messages 10000 \
   --payload-bytes 128 \
   --fanout-subscribers 100 \
+  --memory-sample-interval-ms 10 \
   --pulse-bin target/release/Pulse \
-  --mosquitto-bin /opt/homebrew/opt/mosquitto/sbin/mosquitto
+  --pulse-sqlite /tmp/pulse-benchmark.db \
+  --mosquitto-bin /opt/homebrew/opt/mosquitto/sbin/mosquitto \
+  --mosquitto-persistence-dir /tmp/mosquitto-benchmark
 ```
 
 ## Scenarios
@@ -56,4 +61,7 @@ python3 benchmark/run.py \
 - `retained-fanout`: publish one retained message, then measure retained replay
   to many already-connected subscribers.
 
-The output reports elapsed seconds and deliveries per second for each scenario.
+The Python output reports elapsed seconds, deliveries per second, and
+broker-process RSS in MiB. `Base MiB` is the idle broker RSS before the
+scenario, `Peak MiB` is the highest sampled RSS during the scenario, and
+`End MiB` is the RSS after the scenario completed.

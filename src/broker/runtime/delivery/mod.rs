@@ -14,7 +14,7 @@ pub(in crate::broker) use inflight::{
 };
 pub(in crate::broker) use packet::packet_size;
 pub(in crate::broker) use retained::retained_for_subscription;
-pub(in crate::broker) use router::deliveries_for_publish;
+pub(in crate::broker) use router::{deliveries_for_publish, qos0_deliveries_for_publish_readonly};
 
 #[derive(Clone)]
 pub(in crate::broker) struct Delivery {

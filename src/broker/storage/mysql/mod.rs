@@ -61,6 +61,16 @@ impl BrokerStorage for MysqlStorage {
         let mut connection = self.pool.get_conn().expect("get mysql connection");
         persist_state(&mut connection, &state).expect("persist broker state to mysql");
     }
+
+    fn with_transient_state(&self, operation: &mut dyn FnMut(&mut BrokerState)) {
+        let mut state = self.state.lock().expect("broker state lock poisoned");
+        operation(&mut state);
+    }
+
+    fn read_state(&self, operation: &mut dyn FnMut(&BrokerState)) {
+        let state = self.state.lock().expect("broker state lock poisoned");
+        operation(&state);
+    }
 }
 
 fn load_state(connection: &mut PooledConn) -> mysql::Result<BrokerState> {
