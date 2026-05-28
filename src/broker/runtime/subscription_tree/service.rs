@@ -34,6 +34,11 @@ impl Broker {
                     Vec::new(),
                 );
             };
+            let principal = state
+                .clients_by_connection
+                .get(&connection_id)
+                .and_then(|client| client.principal.as_deref())
+                .map(str::to_string);
 
             let mut reason_codes = Vec::with_capacity(packet.subscriptions.len());
             let mut retained_deliveries = Vec::new();
@@ -47,6 +52,14 @@ impl Broker {
             for subscription in packet.subscriptions {
                 if !protocol::is_valid_topic_filter(&subscription.topic_filter) {
                     reason_codes.push(protocol::TOPIC_FILTER_INVALID);
+                    continue;
+                }
+                if !self
+                    .inner
+                    .authenticator
+                    .authorize_subscribe(principal.as_deref(), &subscription.topic_filter)
+                {
+                    reason_codes.push(protocol::NOT_AUTHORIZED);
                     continue;
                 }
                 if is_new_subscription(&state.subscriptions, &client_id, &subscription.topic_filter)

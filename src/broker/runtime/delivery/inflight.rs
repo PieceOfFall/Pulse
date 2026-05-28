@@ -1,6 +1,6 @@
 use rs_netty::{
     Channel,
-    codec::{MqttPacket, PublishPacket, QoS},
+    codec::{MqttPacket, PublishPacket, QoS, mqtt::AckPacket},
 };
 
 use super::{
@@ -83,6 +83,54 @@ pub(in crate::broker) fn queued_deliveries_for_client(
     };
 
     flush_queued_for_session(session, channel, receive_maximum, maximum_packet_size)
+}
+
+pub(in crate::broker) fn retransmissions_for_connection(
+    state: &mut BrokerState,
+    connection_id: u64,
+) -> Option<Vec<Delivery>> {
+    let client = state.clients_by_connection.get(&connection_id)?;
+    let client_id = client.client_id.clone();
+    let channel = client.channel.clone();
+    let receive_maximum = client.receive_maximum;
+    let maximum_packet_size = client.maximum_packet_size;
+    let session = state.sessions_by_client_id.get_mut(&client_id)?;
+
+    let now_ms = now_ms();
+    session
+        .outbound_qos1
+        .retain(|_, pending| !is_message_expired(pending.expires_at_ms, now_ms));
+    session
+        .outbound_qos2_publish
+        .retain(|_, pending| !is_message_expired(pending.expires_at_ms, now_ms));
+
+    let mut deliveries: Vec<Delivery> = session
+        .outbound_qos1
+        .iter()
+        .chain(session.outbound_qos2_publish.iter())
+        .take(usize::from(receive_maximum))
+        .filter_map(|(packet_id, pending)| {
+            let mut packet = pending.packet.clone();
+            packet.dup = true;
+            packet.packet_id = Some(*packet_id);
+            fits_maximum_packet_size(&packet, maximum_packet_size).then(|| Delivery {
+                channel: channel.clone(),
+                packet: MqttPacket::Publish(packet),
+            })
+        })
+        .collect();
+
+    deliveries.extend(
+        session
+            .outbound_qos2_pubrel
+            .iter()
+            .map(|packet_id| Delivery {
+                channel: channel.clone(),
+                packet: MqttPacket::PubRel(AckPacket::new(*packet_id, crate::protocol::SUCCESS)),
+            }),
+    );
+
+    Some(deliveries)
 }
 
 pub(super) fn delivery_for_client(

@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use bytes::{Bytes, BytesMut};
 use rs_netty::{
@@ -18,7 +18,11 @@ use tokio::{
 use super::{
     Broker, BrokerLife, MqttHandler,
     runtime::{
-        config::{MAX_OFFLINE_QUEUE_LEN, MAX_RETAINED_MESSAGES, MAX_SUBSCRIPTIONS_PER_CLIENT},
+        auth::{AuthAclConfig, AuthAction, AuthConfig, AuthUserConfig, ConfiguredAuthenticator},
+        config::{
+            BrokerConfig, MAX_OFFLINE_QUEUE_LEN, MAX_RETAINED_MESSAGES,
+            MAX_SUBSCRIPTIONS_PER_CLIENT,
+        },
         subscription_tree::{SubscriptionEntry, upsert_subscription},
     },
 };
@@ -163,6 +167,173 @@ async fn connect_rejects_username_password_until_auth_is_supported() -> rs_netty
 }
 
 #[tokio::test]
+async fn auth_enabled_accepts_configured_username_password() -> rs_netty::Result<()> {
+    let broker = TestBroker::start_with_broker(auth_broker(vec![], vec![])).await?;
+    let mut client = broker.open_client().await?;
+
+    client
+        .write(connect_with_credentials("auth-client", "alice", "secret"))
+        .await?;
+    client.expect_connack().await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn auth_enabled_rejects_bad_password() -> rs_netty::Result<()> {
+    let broker = TestBroker::start_with_broker(auth_broker(vec![], vec![])).await?;
+    let mut client = broker.open_client().await?;
+
+    client
+        .write(connect_with_credentials("auth-client", "alice", "wrong"))
+        .await?;
+    client
+        .expect_connack_reason(protocol::BAD_USER_NAME_OR_PASSWORD)
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn subscribe_acl_partially_denies_subscriptions() -> rs_netty::Result<()> {
+    let broker = TestBroker::start_with_broker(auth_broker(
+        vec![AuthAclConfig {
+            username: "alice".to_string(),
+            action: AuthAction::Subscribe,
+            topic_filter: "devices/alice/#".to_string(),
+        }],
+        vec![],
+    ))
+    .await?;
+    let mut client = broker.open_client().await?;
+    client
+        .write(connect_with_credentials("auth-client", "alice", "secret"))
+        .await?;
+    client.expect_connack().await?;
+
+    client
+        .write(MqttPacket::Subscribe(SubscribePacket {
+            packet_id: 1,
+            properties: Vec::new(),
+            subscriptions: vec![
+                Subscription {
+                    topic_filter: "devices/alice/temp".to_string(),
+                    options: SubscriptionOptions::default(),
+                },
+                Subscription {
+                    topic_filter: "devices/bob/temp".to_string(),
+                    options: SubscriptionOptions::default(),
+                },
+            ],
+        }))
+        .await?;
+
+    assert!(matches!(
+        client.read().await?,
+        MqttPacket::SubAck(packet)
+            if packet.reason_codes == vec![protocol::QOS_0_GRANTED, protocol::NOT_AUTHORIZED]
+    ));
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn publish_acl_denies_qos0_with_disconnect() -> rs_netty::Result<()> {
+    let broker = TestBroker::start_with_broker(auth_broker(
+        vec![AuthAclConfig {
+            username: "alice".to_string(),
+            action: AuthAction::Publish,
+            topic_filter: "devices/alice/#".to_string(),
+        }],
+        vec![],
+    ))
+    .await?;
+    let mut client = broker.open_client().await?;
+    client
+        .write(connect_with_credentials("auth-client", "alice", "secret"))
+        .await?;
+    client.expect_connack().await?;
+
+    client
+        .write(publish("devices/bob/temp", QoS::AtMostOnce, None, "denied"))
+        .await?;
+    client
+        .expect_disconnect_reason(protocol::NOT_AUTHORIZED)
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn publish_acl_denies_qos1_and_qos2_without_routing() -> rs_netty::Result<()> {
+    let broker = TestBroker::start_with_broker(auth_broker(
+        vec![
+            AuthAclConfig {
+                username: "alice".to_string(),
+                action: AuthAction::Publish,
+                topic_filter: "devices/alice/#".to_string(),
+            },
+            AuthAclConfig {
+                username: "bob".to_string(),
+                action: AuthAction::Subscribe,
+                topic_filter: "devices/bob/#".to_string(),
+            },
+        ],
+        vec![AuthUserConfig {
+            username: "bob".to_string(),
+            password: "secret".to_string(),
+        }],
+    ))
+    .await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_credentials("subscriber", "bob", "secret"))
+        .await?;
+    subscriber.expect_connack().await?;
+    subscriber
+        .subscribe(1, "devices/bob/#", QoS::ExactlyOnce)
+        .await?;
+
+    let mut publisher = broker.open_client().await?;
+    publisher
+        .write(connect_with_credentials("publisher", "alice", "secret"))
+        .await?;
+    publisher.expect_connack().await?;
+
+    publisher
+        .write(publish(
+            "devices/bob/temp",
+            QoS::AtLeastOnce,
+            Some(1),
+            "denied",
+        ))
+        .await?;
+    publisher
+        .expect_puback_reason(1, protocol::NOT_AUTHORIZED)
+        .await?;
+    subscriber
+        .expect_no_packet(Duration::from_millis(100))
+        .await?;
+
+    publisher
+        .write(publish(
+            "devices/bob/temp",
+            QoS::ExactlyOnce,
+            Some(2),
+            "denied",
+        ))
+        .await?;
+    publisher
+        .expect_pubrec_reason(2, protocol::NOT_AUTHORIZED)
+        .await?;
+    subscriber
+        .expect_no_packet(Duration::from_millis(100))
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
 async fn malformed_connect_protocol_name_closes_connection() -> rs_netty::Result<()> {
     let broker = TestBroker::start().await?;
     let mut client = broker.open_client().await?;
@@ -279,6 +450,50 @@ async fn normal_disconnect_does_not_publish_will_message() -> rs_netty::Result<(
         .await?;
     subscriber
         .expect_no_packet(Duration::from_millis(200))
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn graceful_shutdown_sends_server_disconnect_and_suppresses_will() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut subscriber = broker.connect("subscriber").await?;
+    subscriber
+        .subscribe(1, "clients/publisher/status", QoS::AtMostOnce)
+        .await?;
+
+    let mut publisher = broker.open_client().await?;
+    publisher
+        .write(connect_with_will(
+            "publisher",
+            "clients/publisher/status",
+            "offline",
+        ))
+        .await?;
+    publisher.expect_connack().await?;
+
+    broker.graceful_shutdown(Duration::from_millis(500)).await?;
+
+    publisher
+        .expect_disconnect_reason_string(protocol::SERVER_SHUTTING_DOWN, "server shutting down")
+        .await?;
+    assert!(matches!(
+        subscriber.read().await?,
+        MqttPacket::Disconnect(packet) if packet.reason_code == protocol::SERVER_SHUTTING_DOWN
+    ));
+    subscriber.expect_closed(Duration::from_millis(200)).await
+}
+
+#[tokio::test]
+async fn connect_after_shutdown_started_is_rejected() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    broker.begin_shutdown();
+
+    let mut client = broker.open_client().await?;
+    client.write(connect("client")).await?;
+    client
+        .expect_connack_reason(protocol::SERVER_UNAVAILABLE)
         .await?;
 
     broker.shutdown().await
@@ -724,6 +939,130 @@ async fn receive_maximum_queues_online_qos1_until_ack() -> rs_netty::Result<()> 
         .expect_publish("expected queued publish after ack")
         .await?;
     assert_eq!(second.payload, Bytes::from_static(b"second"));
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn qos1_outbound_inflight_retransmits_until_ack() -> rs_netty::Result<()> {
+    let broker = TestBroker::start_with_broker(retransmit_broker(50)).await?;
+    let mut subscriber = broker.connect("subscriber").await?;
+    subscriber
+        .subscribe(1, "devices/retransmit", QoS::AtLeastOnce)
+        .await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish(
+            "devices/retransmit",
+            QoS::AtLeastOnce,
+            Some(7),
+            "retry",
+        ))
+        .await?;
+    publisher.expect_puback(7).await?;
+
+    let first = subscriber
+        .expect_publish("expected initial publish")
+        .await?;
+    assert!(!first.dup);
+    let duplicate = subscriber.expect_publish("expected retransmit").await?;
+    assert!(duplicate.dup);
+    assert_eq!(duplicate.packet_id, first.packet_id);
+
+    subscriber
+        .write(MqttPacket::PubAck(AckPacket::new(
+            first.packet_id.unwrap(),
+            protocol::SUCCESS,
+        )))
+        .await?;
+    subscriber
+        .expect_no_packet(Duration::from_millis(120))
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn qos2_outbound_publish_and_pubrel_retransmit() -> rs_netty::Result<()> {
+    let broker = TestBroker::start_with_broker(retransmit_broker(50)).await?;
+    let mut subscriber = broker.connect("subscriber").await?;
+    subscriber
+        .subscribe(1, "devices/retransmit-qos2", QoS::ExactlyOnce)
+        .await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish(
+            "devices/retransmit-qos2",
+            QoS::ExactlyOnce,
+            Some(7),
+            "retry",
+        ))
+        .await?;
+    publisher.expect_pubrec(7).await?;
+    publisher
+        .write(MqttPacket::PubRel(AckPacket::new(7, protocol::SUCCESS)))
+        .await?;
+    publisher.expect_pubcomp(7).await?;
+
+    let first = subscriber.expect_publish("expected initial qos2").await?;
+    assert!(!first.dup);
+    let duplicate = subscriber
+        .expect_publish("expected qos2 publish retransmit")
+        .await?;
+    assert!(duplicate.dup);
+    assert_eq!(duplicate.packet_id, first.packet_id);
+
+    subscriber
+        .write(MqttPacket::PubRec(AckPacket::new(
+            first.packet_id.unwrap(),
+            protocol::SUCCESS,
+        )))
+        .await?;
+    subscriber.expect_pubrel(first.packet_id.unwrap()).await?;
+    subscriber.expect_pubrel(first.packet_id.unwrap()).await?;
+
+    subscriber
+        .write(MqttPacket::PubComp(AckPacket::new(
+            first.packet_id.unwrap(),
+            protocol::SUCCESS,
+        )))
+        .await?;
+    subscriber
+        .expect_no_packet(Duration::from_millis(120))
+        .await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn expired_outbound_inflight_is_not_retransmitted() -> rs_netty::Result<()> {
+    let broker = TestBroker::start_with_broker(retransmit_broker(1_100)).await?;
+    let mut subscriber = broker.connect("subscriber").await?;
+    subscriber
+        .subscribe(1, "devices/retransmit-expiry", QoS::AtLeastOnce)
+        .await?;
+
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish_with_message_expiry(
+            "devices/retransmit-expiry",
+            QoS::AtLeastOnce,
+            Some(7),
+            "expires",
+            false,
+            1,
+        ))
+        .await?;
+    publisher.expect_puback(7).await?;
+    let first = subscriber
+        .expect_publish("expected initial expiring publish")
+        .await?;
+    assert!(!first.dup);
+    subscriber
+        .expect_no_packet(Duration::from_millis(1_300))
+        .await?;
 
     broker.shutdown().await
 }
@@ -1669,6 +2008,7 @@ async fn non_expired_message_expiry_is_delivered() -> rs_netty::Result<()> {
 
 struct TestBroker {
     server: TcpServerHandle,
+    broker: Broker,
 }
 
 impl TestBroker {
@@ -1677,17 +2017,18 @@ impl TestBroker {
     }
 
     async fn start_with_broker(broker: Broker) -> rs_netty::Result<Self> {
+        let broker_for_pipeline = broker.clone();
         let server = TcpServer::bind("127.0.0.1:0")
             .life(BrokerLife::new(broker.clone()))
             .pipeline(move || {
                 pipeline()
                     .codec(MqttCodec::with_max_packet_size(1024 * 1024))
-                    .handler(MqttHandler::new(broker.clone()))
+                    .handler(MqttHandler::new(broker_for_pipeline.clone()))
             })
             .start()
             .await?;
 
-        Ok(Self { server })
+        Ok(Self { server, broker })
     }
 
     async fn connect(&self, client_id: &str) -> rs_netty::Result<TestClient> {
@@ -1713,6 +2054,16 @@ impl TestBroker {
         self.server.shutdown();
         self.server.wait().await
     }
+
+    async fn graceful_shutdown(self, timeout: Duration) -> rs_netty::Result<()> {
+        self.broker.shutdown_active_sessions(timeout).await;
+        self.server.shutdown();
+        self.server.wait().await
+    }
+
+    fn begin_shutdown(&self) {
+        self.broker.begin_shutdown();
+    }
 }
 
 fn temp_sqlite_path(name: &str) -> std::path::PathBuf {
@@ -1723,6 +2074,29 @@ fn cleanup_sqlite_path(path: &std::path::Path) {
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(path.with_extension("db-wal"));
     let _ = std::fs::remove_file(path.with_extension("db-shm"));
+}
+
+fn auth_broker(mut acl: Vec<AuthAclConfig>, mut extra_users: Vec<AuthUserConfig>) -> Broker {
+    let mut users = vec![AuthUserConfig {
+        username: "alice".to_string(),
+        password: "secret".to_string(),
+    }];
+    users.append(&mut extra_users);
+    acl.shrink_to_fit();
+    Broker::with_config_and_auth(
+        BrokerConfig::default(),
+        Arc::new(ConfiguredAuthenticator::new(AuthConfig {
+            enabled: true,
+            users,
+            acl,
+        })),
+    )
+}
+
+fn retransmit_broker(interval_ms: u64) -> Broker {
+    let mut config = BrokerConfig::default();
+    config.inflight_retransmit_interval_ms = interval_ms;
+    Broker::with_config(config)
 }
 
 struct TestClient {
@@ -1835,9 +2209,19 @@ impl TestClient {
     }
 
     async fn expect_puback(&mut self, packet_id: u16) -> rs_netty::Result<()> {
+        self.expect_puback_reason(packet_id, protocol::SUCCESS)
+            .await
+    }
+
+    async fn expect_puback_reason(
+        &mut self,
+        packet_id: u16,
+        reason_code: u8,
+    ) -> rs_netty::Result<()> {
         assert!(matches!(
             self.read().await?,
-            MqttPacket::PubAck(packet) if packet.packet_id == packet_id
+            MqttPacket::PubAck(packet)
+                if packet.packet_id == packet_id && packet.reason_code == reason_code
         ));
         Ok(())
     }
@@ -1990,6 +2374,18 @@ fn connect_with_keep_alive(client_id: &str, keep_alive: u16) -> MqttPacket {
         will: None,
         username: None,
         password: None,
+    })
+}
+
+fn connect_with_credentials(client_id: &str, username: &str, password: &str) -> MqttPacket {
+    MqttPacket::Connect(ConnectPacket {
+        clean_start: true,
+        keep_alive: 60,
+        properties: Vec::new(),
+        client_id: client_id.to_string(),
+        will: None,
+        username: Some(username.to_string()),
+        password: Some(Bytes::copy_from_slice(password.as_bytes())),
     })
 }
 

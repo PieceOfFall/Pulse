@@ -33,6 +33,7 @@ pub struct MqttHandler {
     connected: bool,
     client_id: Option<String>,
     keep_alive: Option<KeepAliveHandle>,
+    retransmit: Option<JoinHandle<()>>,
     topic_aliases: TopicAliases,
 }
 
@@ -50,6 +51,7 @@ impl MqttHandler {
             connected: false,
             client_id: None,
             keep_alive: None,
+            retransmit: None,
             topic_aliases: TopicAliases::new(topic_alias_maximum),
         }
     }
@@ -95,6 +97,25 @@ impl MqttHandler {
         }
     }
 
+    fn start_retransmit(&mut self, connection_id: u64) {
+        self.stop_retransmit();
+        let interval_ms = self.broker.config().inflight_retransmit_interval_ms;
+        if interval_ms == 0 {
+            return;
+        }
+
+        let broker = self.broker.clone();
+        self.retransmit = Some(tokio::spawn(async move {
+            run_inflight_retransmitter(broker, connection_id, interval_ms).await;
+        }));
+    }
+
+    fn stop_retransmit(&mut self) {
+        if let Some(retransmit) = self.retransmit.take() {
+            retransmit.abort();
+        }
+    }
+
     async fn reject_connect(
         &mut self,
         ctx: &mut Context<MqttPacket>,
@@ -114,6 +135,23 @@ impl MqttHandler {
     }
 
     async fn disconnect(&mut self, ctx: &mut Context<MqttPacket>, reason_code: u8) -> Result<()> {
+        self.disconnect_with_policy(ctx, reason_code, true).await
+    }
+
+    async fn disconnect_without_will(
+        &mut self,
+        ctx: &mut Context<MqttPacket>,
+        reason_code: u8,
+    ) -> Result<()> {
+        self.disconnect_with_policy(ctx, reason_code, false).await
+    }
+
+    async fn disconnect_with_policy(
+        &mut self,
+        ctx: &mut Context<MqttPacket>,
+        reason_code: u8,
+        publish_will: bool,
+    ) -> Result<()> {
         if is_auth_failure(reason_code) {
             metrics::auth_failed(auth_failure_reason(reason_code));
         }
@@ -130,12 +168,15 @@ impl MqttHandler {
         .await?;
 
         self.stop_keep_alive();
+        self.stop_retransmit();
         if self.connected {
             self.connected = false;
             if let Some(outcome) = self.broker.remove_connection(ctx.id()) {
                 metrics::connection_closed("broker_disconnect");
                 self.client_id = Some(outcome.client_id);
-                if let Some(will) = outcome.will {
+                if let Some(will) = outcome.will
+                    && publish_will
+                {
                     self.broker.publish_will(ctx.id(), will).await;
                 }
             }
@@ -161,6 +202,16 @@ impl Handler<MqttPacket> for MqttHandler {
                 if let Some(reason_code) = validate_connect(&packet) {
                     return self.reject_connect(ctx, reason_code).await;
                 }
+                if self.broker.is_shutting_down() {
+                    return self.reject_connect(ctx, protocol::SERVER_UNAVAILABLE).await;
+                }
+                let authentication = match self.broker.authenticate(
+                    packet.username.as_deref(),
+                    packet.password.as_ref().map(|password| password.as_ref()),
+                ) {
+                    Ok(authentication) => authentication,
+                    Err(reason_code) => return self.reject_connect(ctx, reason_code).await,
+                };
 
                 let assigned_client_id = packet.client_id.is_empty();
                 let outcome = self.broker.connect(
@@ -168,6 +219,7 @@ impl Handler<MqttPacket> for MqttHandler {
                     packet.client_id,
                     ctx.channel(),
                     packet.will,
+                    authentication.principal,
                     ConnectOptions::from_properties(packet.clean_start, &packet.properties),
                 );
                 if let Some(replaced_channel) = outcome.replaced_channel {
@@ -175,6 +227,7 @@ impl Handler<MqttPacket> for MqttHandler {
                     let _ = replaced_channel.close().await;
                 }
                 self.start_keep_alive(ctx.id(), packet.keep_alive, ctx.channel());
+                self.start_retransmit(ctx.id());
                 self.connected = true;
                 self.client_id = Some(outcome.client_id.clone());
                 metrics::connection_opened();
@@ -209,6 +262,7 @@ impl Handler<MqttPacket> for MqttHandler {
             MqttPacket::PingReq => ctx.write_and_flush(MqttPacket::PingResp).await,
             MqttPacket::Disconnect(_) => {
                 self.stop_keep_alive();
+                self.stop_retransmit();
                 if self.broker.remove_connection(ctx.id()).is_some() {
                     metrics::connection_closed("client_disconnect");
                 }
@@ -247,9 +301,23 @@ impl Handler<MqttPacket> for MqttHandler {
                 }
 
                 match packet.qos {
-                    QoS::AtMostOnce => {}
+                    QoS::AtMostOnce => {
+                        if !self.broker.authorize_publish(ctx.id(), &packet.topic_name) {
+                            return self
+                                .disconnect_without_will(ctx, protocol::NOT_AUTHORIZED)
+                                .await;
+                        }
+                    }
                     QoS::AtLeastOnce => {
                         if let Some(packet_id) = packet.packet_id {
+                            if !self.broker.authorize_publish(ctx.id(), &packet.topic_name) {
+                                return ctx
+                                    .write_and_flush(MqttPacket::PubAck(ack_packet(
+                                        packet_id,
+                                        protocol::NOT_AUTHORIZED,
+                                    )))
+                                    .await;
+                            }
                             ctx.write_and_flush(MqttPacket::PubAck(AckPacket::new(
                                 packet_id,
                                 protocol::SUCCESS,
@@ -261,6 +329,14 @@ impl Handler<MqttPacket> for MqttHandler {
                     }
                     QoS::ExactlyOnce => {
                         return if let Some(packet_id) = packet.packet_id {
+                            if !self.broker.authorize_publish(ctx.id(), &packet.topic_name) {
+                                ctx.write_and_flush(MqttPacket::PubRec(ack_packet(
+                                    packet_id,
+                                    protocol::NOT_AUTHORIZED,
+                                )))
+                                .await?;
+                                return Ok(());
+                            }
                             let reason_code =
                                 self.broker.store_qos2_publish(ctx.id(), packet_id, packet);
                             ctx.write_and_flush(MqttPacket::PubRec(ack_packet(
@@ -355,6 +431,7 @@ impl Handler<MqttPacket> for MqttHandler {
 impl Drop for MqttHandler {
     fn drop(&mut self) {
         self.stop_keep_alive();
+        self.stop_retransmit();
     }
 }
 
@@ -396,9 +473,6 @@ fn validate_connect(packet: &rs_netty::codec::ConnectPacket) -> Option<u8> {
 
     if has_authentication_method || has_authentication_data {
         return Some(protocol::BAD_AUTHENTICATION_METHOD);
-    }
-    if packet.username.is_some() || packet.password.is_some() {
-        return Some(protocol::BAD_USER_NAME_OR_PASSWORD);
     }
 
     None
@@ -446,6 +520,17 @@ async fn run_keep_alive_watchdog(
         }
 
         tokio::time::sleep(Duration::from_millis(deadline - now)).await;
+    }
+}
+
+async fn run_inflight_retransmitter(broker: Broker, connection_id: u64, interval_ms: u64) {
+    let interval = Duration::from_millis(interval_ms);
+    loop {
+        tokio::time::sleep(interval).await;
+        let Some(deliveries) = broker.retransmit_outbound(connection_id) else {
+            return;
+        };
+        flush_deliveries(deliveries).await;
     }
 }
 

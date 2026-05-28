@@ -9,6 +9,10 @@ bind = "0.0.0.0:1883"
 # Must be greater than 0.
 outbound_queue_size = 1024
 
+# Maximum time to wait, in milliseconds, while flushing server-shutdown
+# DISCONNECT packets to active MQTT clients.
+shutdown_drain_timeout_ms = 5000
+
 [server.tls]
 # Enable MQTT over TLS. When enabled, set [server].bind to a TLS listener such
 # as "0.0.0.0:8883"; Pulse does not change the port automatically.
@@ -63,6 +67,28 @@ max_retained_messages = 1024
 
 # Maximum total retained payload bytes stored by the broker.
 max_retained_payload_bytes = 16777216
+
+# Fixed interval, in milliseconds, for retransmitting online outbound QoS 1/2
+# inflight packets. Set to 0 to disable online retransmission timers.
+inflight_retransmit_interval_ms = 30000
+
+[auth]
+# Static username/password and ACL backend. Disabled by default to preserve
+# anonymous local broker behavior.
+enabled = false
+
+# Passwords are plaintext in this v1 static backend. Use only in controlled
+# deployments until a hashed or external authenticator is configured.
+# [[auth.users]]
+# username = "alice"
+# password = "secret"
+
+# ACL rules are default-deny when auth.enabled = true. Shared subscriptions are
+# authorized against the inner topic filter after `$share/{group}/` is removed.
+# [[auth.acl]]
+# username = "alice"
+# action = "publish" # publish or subscribe
+# topic_filter = "devices/alice/#"
 
 [observability]
 # Tracing log filter. Examples: "info", "debug", "Pulse=debug,rs_netty=info".

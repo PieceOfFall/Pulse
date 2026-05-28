@@ -32,6 +32,7 @@ impl Broker {
         requested_client_id: String,
         channel: Channel<MqttPacket>,
         will: Option<Will>,
+        principal: Option<String>,
         options: ConnectOptions,
     ) -> ConnectOutcome {
         let client_id = if requested_client_id.is_empty() {
@@ -76,6 +77,7 @@ impl Broker {
                     client_id.clone(),
                     channel,
                     will,
+                    principal,
                     options.session_expiry_interval,
                     options.receive_maximum,
                     options.maximum_packet_size,

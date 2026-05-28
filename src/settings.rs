@@ -9,7 +9,7 @@ use std::{
 
 use serde::Deserialize;
 
-use crate::broker::runtime::config::BrokerConfig;
+use crate::broker::runtime::{auth::AuthConfig, config::BrokerConfig};
 
 const CONFIG_FILE_NAME: &str = "Broker.toml";
 
@@ -18,6 +18,7 @@ pub(crate) struct AppConfig {
     pub(crate) server: ServerConfig,
     pub(crate) storage: StorageConfig,
     pub(crate) limits: BrokerConfig,
+    pub(crate) auth: AuthConfig,
     pub(crate) observability: ObservabilityConfig,
 }
 
@@ -25,6 +26,7 @@ pub(crate) struct AppConfig {
 pub(crate) struct ServerConfig {
     pub(crate) bind: String,
     pub(crate) outbound_queue_size: usize,
+    pub(crate) shutdown_drain_timeout_ms: u64,
     pub(crate) tls: ServerTlsConfig,
 }
 
@@ -95,6 +97,7 @@ struct FileConfig {
     server: Option<ServerFileConfig>,
     storage: Option<StorageFileConfig>,
     limits: Option<LimitsFileConfig>,
+    auth: Option<AuthConfig>,
     observability: Option<ObservabilityFileConfig>,
 }
 
@@ -102,6 +105,7 @@ struct FileConfig {
 struct ServerFileConfig {
     bind: Option<String>,
     outbound_queue_size: Option<usize>,
+    shutdown_drain_timeout_ms: Option<u64>,
     tls: Option<ServerTlsFileConfig>,
 }
 
@@ -129,6 +133,7 @@ struct LimitsFileConfig {
     max_offline_queue_len: Option<usize>,
     max_retained_messages: Option<usize>,
     max_retained_payload_bytes: Option<usize>,
+    inflight_retransmit_interval_ms: Option<u64>,
 }
 
 #[derive(Default, Deserialize)]
@@ -152,10 +157,12 @@ impl Default for AppConfig {
             server: ServerConfig {
                 bind: "0.0.0.0:1883".to_string(),
                 outbound_queue_size: 1024,
+                shutdown_drain_timeout_ms: 5_000,
                 tls: ServerTlsConfig::default(),
             },
             storage: default_storage_config(),
             limits: BrokerConfig::default(),
+            auth: AuthConfig::default(),
             observability: ObservabilityConfig::default(),
         }
     }
@@ -193,6 +200,9 @@ impl AppConfig {
         if let Some(limits) = file.limits {
             self.apply_limits(limits);
         }
+        if let Some(auth) = file.auth {
+            self.auth = auth;
+        }
         if let Some(observability) = file.observability {
             self.apply_observability(observability);
         }
@@ -202,6 +212,7 @@ impl AppConfig {
         self.apply_server(ServerFileConfig {
             bind: env_string("MQTT_RS_BIND"),
             outbound_queue_size: env_parse("MQTT_RS_OUTBOUND_QUEUE_SIZE")?,
+            shutdown_drain_timeout_ms: env_parse("MQTT_RS_SHUTDOWN_DRAIN_TIMEOUT_MS")?,
             tls: Some(ServerTlsFileConfig {
                 enabled: env_parse("MQTT_RS_TLS_ENABLED")?,
                 certificate_chain: env_path("MQTT_RS_TLS_CERTIFICATE_CHAIN"),
@@ -222,6 +233,7 @@ impl AppConfig {
             max_offline_queue_len: env_parse("MQTT_RS_MAX_OFFLINE_QUEUE_LEN")?,
             max_retained_messages: env_parse("MQTT_RS_MAX_RETAINED_MESSAGES")?,
             max_retained_payload_bytes: env_parse("MQTT_RS_MAX_RETAINED_PAYLOAD_BYTES")?,
+            inflight_retransmit_interval_ms: env_parse("MQTT_RS_INFLIGHT_RETRANSMIT_INTERVAL_MS")?,
         });
         self.apply_observability(ObservabilityFileConfig {
             log: env_string("MQTT_RS_LOG").or_else(|| env_string("RUST_LOG")),
@@ -243,6 +255,9 @@ impl AppConfig {
         }
         if let Some(outbound_queue_size) = server.outbound_queue_size {
             self.server.outbound_queue_size = outbound_queue_size;
+        }
+        if let Some(shutdown_drain_timeout_ms) = server.shutdown_drain_timeout_ms {
+            self.server.shutdown_drain_timeout_ms = shutdown_drain_timeout_ms;
         }
         if let Some(tls) = server.tls {
             self.apply_server_tls(tls);
@@ -298,6 +313,9 @@ impl AppConfig {
         if let Some(value) = limits.max_retained_payload_bytes {
             self.limits.max_retained_payload_bytes = value;
         }
+        if let Some(value) = limits.inflight_retransmit_interval_ms {
+            self.limits.inflight_retransmit_interval_ms = value;
+        }
     }
 
     fn apply_observability(&mut self, observability: ObservabilityFileConfig) {
@@ -312,6 +330,9 @@ impl AppConfig {
     fn validate(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         if self.server.outbound_queue_size == 0 {
             return Err("server.outbound_queue_size must be greater than 0".into());
+        }
+        if self.server.shutdown_drain_timeout_ms == 0 {
+            return Err("server.shutdown_drain_timeout_ms must be greater than 0".into());
         }
         if self.limits.server_receive_maximum == 0 {
             return Err("limits.server_receive_maximum must be greater than 0".into());
@@ -345,6 +366,9 @@ impl AppConfig {
                 );
             }
         }
+        self.auth
+            .validate()
+            .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
         Ok(())
     }
 }
@@ -440,6 +464,9 @@ fn parse_cli(
             "--outbound-queue-size" => {
                 config.server.outbound_queue_size = Some(next_parse(&mut args, arg.as_ref())?)
             }
+            "--shutdown-drain-timeout-ms" => {
+                config.server.shutdown_drain_timeout_ms = Some(next_parse(&mut args, arg.as_ref())?)
+            }
             "--metrics-bind" => {
                 config.observability.metrics_bind = Some(next_string(&mut args, arg.as_ref())?)
             }
@@ -467,6 +494,10 @@ fn parse_cli(
             }
             "--max-retained-payload-bytes" => {
                 config.limits.max_retained_payload_bytes =
+                    Some(next_parse(&mut args, arg.as_ref())?)
+            }
+            "--inflight-retransmit-interval-ms" => {
+                config.limits.inflight_retransmit_interval_ms =
                     Some(next_parse(&mut args, arg.as_ref())?)
             }
             _ => return Err(format!("unknown argument: {arg}").into()),
@@ -528,9 +559,9 @@ mod tests {
 
     use super::{AppConfig, FileConfig, TlsClientAuth};
     use crate::broker::runtime::config::{
-        MAX_OFFLINE_QUEUE_LEN, MAX_RETAINED_MESSAGES, MAX_RETAINED_PAYLOAD_BYTES,
-        MAX_SUBSCRIPTIONS_PER_CLIENT, SERVER_MAXIMUM_PACKET_SIZE, SERVER_RECEIVE_MAXIMUM,
-        SERVER_TOPIC_ALIAS_MAXIMUM,
+        INFLIGHT_RETRANSMIT_INTERVAL_MS, MAX_OFFLINE_QUEUE_LEN, MAX_RETAINED_MESSAGES,
+        MAX_RETAINED_PAYLOAD_BYTES, MAX_SUBSCRIPTIONS_PER_CLIENT, SERVER_MAXIMUM_PACKET_SIZE,
+        SERVER_RECEIVE_MAXIMUM, SERVER_TOPIC_ALIAS_MAXIMUM,
     };
 
     const TLS_ENV_KEYS: &[&str] = &[
@@ -634,6 +665,12 @@ mod tests {
             config.limits.max_retained_payload_bytes,
             MAX_RETAINED_PAYLOAD_BYTES
         );
+        assert_eq!(
+            config.limits.inflight_retransmit_interval_ms,
+            INFLIGHT_RETRANSMIT_INTERVAL_MS
+        );
+        assert_eq!(config.server.shutdown_drain_timeout_ms, 5_000);
+        assert!(!config.auth.enabled);
     }
 
     #[test]
@@ -820,5 +857,50 @@ mod tests {
                 .to_string()
                 .contains("storage.sqlite and storage.mysql")
         );
+    }
+
+    #[test]
+    fn file_config_enables_static_auth_and_acl() {
+        let file: FileConfig = toml::from_str(
+            r#"
+            [auth]
+            enabled = true
+
+            [[auth.users]]
+            username = "alice"
+            password = "secret"
+
+            [[auth.acl]]
+            username = "alice"
+            action = "publish"
+            topic_filter = "devices/alice/#"
+            "#,
+        )
+        .expect("parse config");
+
+        let mut config = AppConfig::default();
+        config.apply_file(file);
+        config.validate().expect("valid auth config");
+
+        assert!(config.auth.enabled);
+        assert_eq!(config.auth.users.len(), 1);
+        assert_eq!(config.auth.acl.len(), 1);
+    }
+
+    #[test]
+    fn rejects_enabled_auth_without_users() {
+        let file: FileConfig = toml::from_str(
+            r#"
+            [auth]
+            enabled = true
+            "#,
+        )
+        .expect("parse config");
+
+        let mut config = AppConfig::default();
+        config.apply_file(file);
+        let error = config.validate().expect_err("invalid auth config");
+
+        assert!(error.to_string().contains("auth.users"));
     }
 }

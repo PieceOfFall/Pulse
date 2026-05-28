@@ -2,6 +2,7 @@ use rs_netty::codec::{MqttPacket, PublishPacket, Will};
 
 use super::{
     Delivery, deliveries_for_publish, flush_deliveries, packet_size, queued_deliveries_for_client,
+    retransmissions_for_connection,
 };
 use crate::{
     broker::{
@@ -150,6 +151,13 @@ impl Broker {
                 .get_mut(&client_id)
                 .is_some_and(|session| session.outbound_qos2_pubrel.remove(&packet_id))
         })
+    }
+
+    pub(in crate::broker) fn retransmit_outbound(
+        &self,
+        connection_id: u64,
+    ) -> Option<Vec<Delivery>> {
+        self.with_state(|state| retransmissions_for_connection(state, connection_id))
     }
 
     pub(in crate::broker) async fn publish_will(&self, connection_id: u64, will: Will) {

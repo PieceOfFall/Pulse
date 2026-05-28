@@ -35,7 +35,7 @@ impl Life for BrokerLife {
 fn should_publish_will(reason: CloseReason) -> bool {
     !matches!(
         reason,
-        CloseReason::HandlerClosed | CloseReason::LocalClosed
+        CloseReason::HandlerClosed | CloseReason::LocalClosed | CloseReason::ServerShutdown
     )
 }
 

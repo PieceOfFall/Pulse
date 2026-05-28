@@ -1,3 +1,4 @@
+pub(crate) mod auth;
 pub(crate) mod config;
 pub(in crate::broker) mod connection;
 pub(in crate::broker) mod delivery;

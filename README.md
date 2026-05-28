@@ -109,6 +109,10 @@ Configuration can come from four places, applied in this order:
 The `MQTT_RS_*` environment prefix is intentionally kept for compatibility
 while the broker moves under the Pulse name.
 
+Operational knobs include `MQTT_RS_SHUTDOWN_DRAIN_TIMEOUT_MS` /
+`--shutdown-drain-timeout-ms` and `MQTT_RS_INFLIGHT_RETRANSMIT_INTERVAL_MS` /
+`--inflight-retransmit-interval-ms`.
+
 TLS can also be enabled without editing the TOML file:
 
 ```sh
@@ -125,6 +129,27 @@ The matching environment variables are `MQTT_RS_TLS_ENABLED`,
 `MQTT_RS_TLS_CERTIFICATE_CHAIN`, `MQTT_RS_TLS_PRIVATE_KEY`,
 `MQTT_RS_TLS_CLIENT_AUTH`, and `MQTT_RS_TLS_CLIENT_CA`.
 
+Enable the static username/password and ACL backend:
+
+```toml
+[auth]
+enabled = true
+
+[[auth.users]]
+username = "alice"
+password = "secret"
+
+[[auth.acl]]
+username = "alice"
+action = "publish"
+topic_filter = "devices/alice/#"
+```
+
+When `auth.enabled = true`, ACLs are default-deny and passwords are stored as
+plain text in this v1 static backend. Keep using TLS or mTLS for transport
+security and prefer controlled deployments until a hashed or external
+authenticator is configured.
+
 Windows MSI installs do not install a default `Broker.toml`. They use SQLite at
 `C:\ProgramData\Pulse\broker.db` by default and create that directory on first
 startup. To customize settings on Windows, place a `Broker.toml` next to
@@ -140,8 +165,10 @@ Pulse already covers the core broker paths:
 - Shared subscriptions with round-robin dispatch.
 - Retained messages with expiry and store limits.
 - QoS 1 and QoS 2 handshakes, inflight state, and reconnect redelivery.
+- Online QoS 1 and QoS 2 inflight retransmission timers.
 - Offline queueing for persistent sessions.
 - SQLite and MySQL-backed state recovery.
+- Optional static username/password authentication and publish/subscribe ACLs.
 - Prometheus metrics for connections, publishes, subscriptions, queues,
   retained messages, inflight packets, parse errors, and delivery failures.
 
@@ -181,9 +208,7 @@ message expiry.
 
 Pulse is still young. The next high-value areas are:
 
-- Pluggable authentication and publish/subscribe authorization hooks.
-- Inflight retransmission timers for QoS 1 and QoS 2.
-- Graceful shutdown policy for active MQTT sessions.
+- Hashed password storage and external authentication providers.
 - Interop testing with common MQTT v5 clients.
 - Clear documentation of supported and intentionally unsupported MQTT v5
   features.

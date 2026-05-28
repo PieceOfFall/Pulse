@@ -6,6 +6,7 @@ pub(crate) const MAX_SUBSCRIPTIONS_PER_CLIENT: usize = 1024;
 pub(crate) const MAX_OFFLINE_QUEUE_LEN: usize = 1024;
 pub(crate) const MAX_RETAINED_MESSAGES: usize = 1024;
 pub(crate) const MAX_RETAINED_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const INFLIGHT_RETRANSMIT_INTERVAL_MS: u64 = 30_000;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BrokerConfig {
@@ -16,6 +17,7 @@ pub(crate) struct BrokerConfig {
     pub(crate) max_offline_queue_len: usize,
     pub(crate) max_retained_messages: usize,
     pub(crate) max_retained_payload_bytes: usize,
+    pub(crate) inflight_retransmit_interval_ms: u64,
 }
 
 impl Default for BrokerConfig {
@@ -28,6 +30,7 @@ impl Default for BrokerConfig {
             max_offline_queue_len: MAX_OFFLINE_QUEUE_LEN,
             max_retained_messages: MAX_RETAINED_MESSAGES,
             max_retained_payload_bytes: MAX_RETAINED_PAYLOAD_BYTES,
+            inflight_retransmit_interval_ms: INFLIGHT_RETRANSMIT_INTERVAL_MS,
         }
     }
 }
