@@ -4,6 +4,7 @@ version = "1.2.0"
 edition = "2024"
 authors = ["FAll"]
 repository = "https://github.com/PieceOfFall/Pulse"
+exclude = ["benchmark/**"]
 
 [package.metadata.wix]
 upgrade-guid = "843208C9-19E0-4573-B63B-EF0F7AA040EE"

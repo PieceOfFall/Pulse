@@ -204,6 +204,33 @@ CONNECT validation, malformed packets, will delivery, keep alive, persistent
 session recovery, retained replay, QoS handshakes, SQLite restart recovery, and
 message expiry.
 
+## Benchmarks
+
+Pulse includes a local benchmark harness in `benchmark/`. The benchmark tooling
+is excluded from Cargo packages and starts both brokers on localhost with
+temporary runtime state. Mosquitto is run with persistence disabled and relaxed
+queue/inflight limits so the comparison focuses on broker delivery paths.
+
+This single local run used:
+
+```sh
+python3 benchmark/run.py --messages 10000 --timeout 60
+```
+
+Environment: macOS 26.5 arm64, Python 3.9.6, Pulse 1.2.0 release build,
+Mosquitto 2.1.2, 128-byte payloads, and 100 retained-fanout subscribers.
+
+| Broker | Scenario | Count | Seconds | Rate/sec |
+| --- | ---: | ---: | ---: | ---: |
+| Pulse | qos0-throughput | 10000 | 0.1151 | 86847.30 |
+| Pulse | qos1-throughput | 10000 | 0.4230 | 23638.38 |
+| Pulse | qos2-throughput | 10000 | 0.8265 | 12099.86 |
+| Pulse | retained-fanout | 100 | 0.0113 | 8877.28 |
+| Mosquitto | qos0-throughput | 10000 | 0.1155 | 86564.38 |
+| Mosquitto | qos1-throughput | 10000 | 0.4720 | 21185.11 |
+| Mosquitto | qos2-throughput | 10000 | 0.7954 | 12571.66 |
+| Mosquitto | retained-fanout | 100 | 0.0106 | 9472.50 |
+
 ## Roadmap
 
 Pulse is still young. The next high-value areas are:
