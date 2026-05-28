@@ -9,6 +9,25 @@ bind = "0.0.0.0:1883"
 # Must be greater than 0.
 outbound_queue_size = 1024
 
+[server.tls]
+# Enable MQTT over TLS. When enabled, set [server].bind to a TLS listener such
+# as "0.0.0.0:8883"; Pulse does not change the port automatically.
+enabled = false
+
+# PEM certificate chain and private key paths for the server identity.
+# Required when enabled = true.
+# certificate_chain = "certs/server-chain.pem"
+# private_key = "certs/server-key.pem"
+
+# Client certificate authentication mode: disabled, optional, or required.
+# optional verifies a certificate when the client presents one; required rejects
+# clients that do not present a certificate.
+client_auth = "disabled"
+
+# PEM CA certificate bundle used to verify client certificates.
+# Required when client_auth is optional or required.
+# client_ca = "certs/client-ca.pem"
+
 [storage]
 # Optional SQLite database path for persistent sessions, subscriptions,
 # retained messages, outbound inflight packets, and offline queues.

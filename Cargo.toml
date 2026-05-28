@@ -1,6 +1,6 @@
 [package]
 name = "Pulse"
-version = "1.0.8"
+version = "1.1.0"
 edition = "2024"
 authors = ["FAll"]
 repository = "https://github.com/PieceOfFall/Pulse"
@@ -16,13 +16,16 @@ bytes = "1"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false, features = ["http-listener"] }
 mysql = "28"
-rs-netty = "1.0"
+rs-netty = { version = "1.1.0", features = ["tls"] }
 rusqlite = { version = "0.39.0", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 toml = "1.1.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+rcgen = { version = "0.14", features = ["pem"] }
 
 # The profile that 'dist' will build with
 [profile.dist]

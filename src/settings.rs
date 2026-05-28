@@ -2,8 +2,9 @@ use std::{
     env,
     error::Error,
     ffi::OsString,
-    fs, io,
+    fmt, fs, io,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 use serde::Deserialize;
@@ -24,6 +25,57 @@ pub(crate) struct AppConfig {
 pub(crate) struct ServerConfig {
     pub(crate) bind: String,
     pub(crate) outbound_queue_size: usize,
+    pub(crate) tls: ServerTlsConfig,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ServerTlsConfig {
+    pub(crate) enabled: bool,
+    pub(crate) certificate_chain: Option<PathBuf>,
+    pub(crate) private_key: Option<PathBuf>,
+    pub(crate) client_auth: TlsClientAuth,
+    pub(crate) client_ca: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum TlsClientAuth {
+    #[default]
+    Disabled,
+    Optional,
+    Required,
+}
+
+#[derive(Debug)]
+pub(crate) struct ParseTlsClientAuthError {
+    value: String,
+}
+
+impl fmt::Display for ParseTlsClientAuthError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "server.tls.client_auth must be one of disabled, optional, required; got `{}`",
+            self.value
+        )
+    }
+}
+
+impl Error for ParseTlsClientAuthError {}
+
+impl FromStr for TlsClientAuth {
+    type Err = ParseTlsClientAuthError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "disabled" => Ok(Self::Disabled),
+            "optional" => Ok(Self::Optional),
+            "required" => Ok(Self::Required),
+            _ => Err(ParseTlsClientAuthError {
+                value: value.to_string(),
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -50,6 +102,16 @@ struct FileConfig {
 struct ServerFileConfig {
     bind: Option<String>,
     outbound_queue_size: Option<usize>,
+    tls: Option<ServerTlsFileConfig>,
+}
+
+#[derive(Default, Deserialize)]
+struct ServerTlsFileConfig {
+    enabled: Option<bool>,
+    certificate_chain: Option<PathBuf>,
+    private_key: Option<PathBuf>,
+    client_auth: Option<TlsClientAuth>,
+    client_ca: Option<PathBuf>,
 }
 
 #[derive(Default, Deserialize)]
@@ -90,6 +152,7 @@ impl Default for AppConfig {
             server: ServerConfig {
                 bind: "0.0.0.0:1883".to_string(),
                 outbound_queue_size: 1024,
+                tls: ServerTlsConfig::default(),
             },
             storage: default_storage_config(),
             limits: BrokerConfig::default(),
@@ -139,6 +202,13 @@ impl AppConfig {
         self.apply_server(ServerFileConfig {
             bind: env_string("MQTT_RS_BIND"),
             outbound_queue_size: env_parse("MQTT_RS_OUTBOUND_QUEUE_SIZE")?,
+            tls: Some(ServerTlsFileConfig {
+                enabled: env_parse("MQTT_RS_TLS_ENABLED")?,
+                certificate_chain: env_path("MQTT_RS_TLS_CERTIFICATE_CHAIN"),
+                private_key: env_path("MQTT_RS_TLS_PRIVATE_KEY"),
+                client_auth: env_parse("MQTT_RS_TLS_CLIENT_AUTH")?,
+                client_ca: env_path("MQTT_RS_TLS_CLIENT_CA"),
+            }),
         });
         self.apply_storage(StorageFileConfig {
             sqlite: env_string("MQTT_RS_SQLITE"),
@@ -173,6 +243,27 @@ impl AppConfig {
         }
         if let Some(outbound_queue_size) = server.outbound_queue_size {
             self.server.outbound_queue_size = outbound_queue_size;
+        }
+        if let Some(tls) = server.tls {
+            self.apply_server_tls(tls);
+        }
+    }
+
+    fn apply_server_tls(&mut self, tls: ServerTlsFileConfig) {
+        if let Some(enabled) = tls.enabled {
+            self.server.tls.enabled = enabled;
+        }
+        if let Some(certificate_chain) = tls.certificate_chain {
+            self.server.tls.certificate_chain = Some(certificate_chain);
+        }
+        if let Some(private_key) = tls.private_key {
+            self.server.tls.private_key = Some(private_key);
+        }
+        if let Some(client_auth) = tls.client_auth {
+            self.server.tls.client_auth = client_auth;
+        }
+        if let Some(client_ca) = tls.client_ca {
+            self.server.tls.client_ca = Some(client_ca);
         }
     }
 
@@ -231,6 +322,29 @@ impl AppConfig {
         if self.storage.sqlite.is_some() && self.storage.mysql.is_some() {
             return Err("storage.sqlite and storage.mysql are mutually exclusive".into());
         }
+        if self.server.tls.enabled {
+            if self.server.tls.certificate_chain.is_none() {
+                return Err(
+                    "server.tls.certificate_chain is required when server.tls.enabled is true"
+                        .into(),
+                );
+            }
+            if self.server.tls.private_key.is_none() {
+                return Err(
+                    "server.tls.private_key is required when server.tls.enabled is true".into(),
+                );
+            }
+            if matches!(
+                self.server.tls.client_auth,
+                TlsClientAuth::Optional | TlsClientAuth::Required
+            ) && self.server.tls.client_ca.is_none()
+            {
+                return Err(
+                    "server.tls.client_ca is required when server.tls.client_auth is optional or required"
+                        .into(),
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -276,6 +390,10 @@ fn env_string(name: &str) -> Option<String> {
     env::var(name).ok()
 }
 
+fn env_path(name: &str) -> Option<PathBuf> {
+    env::var_os(name).map(PathBuf::from)
+}
+
 fn env_parse<T>(name: &str) -> Result<Option<T>, Box<dyn Error + Send + Sync>>
 where
     T: std::str::FromStr,
@@ -299,6 +417,24 @@ fn parse_cli(
         match arg.as_ref() {
             "-c" | "--config" => config.config_path = Some(next_path(&mut args, arg.as_ref())?),
             "--bind" => config.server.bind = Some(next_string(&mut args, arg.as_ref())?),
+            "--tls" => tls_config_mut(&mut config.server).enabled = Some(true),
+            "--no-tls" => tls_config_mut(&mut config.server).enabled = Some(false),
+            "--tls-certificate-chain" => {
+                tls_config_mut(&mut config.server).certificate_chain =
+                    Some(next_path(&mut args, arg.as_ref())?)
+            }
+            "--tls-private-key" => {
+                tls_config_mut(&mut config.server).private_key =
+                    Some(next_path(&mut args, arg.as_ref())?)
+            }
+            "--tls-client-auth" => {
+                tls_config_mut(&mut config.server).client_auth =
+                    Some(next_parse(&mut args, arg.as_ref())?)
+            }
+            "--tls-client-ca" => {
+                tls_config_mut(&mut config.server).client_ca =
+                    Some(next_path(&mut args, arg.as_ref())?)
+            }
             "--sqlite" => config.storage.sqlite = Some(next_string(&mut args, arg.as_ref())?),
             "--mysql" => config.storage.mysql = Some(next_string(&mut args, arg.as_ref())?),
             "--outbound-queue-size" => {
@@ -340,6 +476,10 @@ fn parse_cli(
     Ok(config)
 }
 
+fn tls_config_mut(server: &mut ServerFileConfig) -> &mut ServerTlsFileConfig {
+    server.tls.get_or_insert_with(ServerTlsFileConfig::default)
+}
+
 fn next_path(
     args: &mut impl Iterator<Item = OsString>,
     flag: &str,
@@ -379,17 +519,79 @@ fn next_os(
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
+    use std::{
+        env,
+        ffi::OsString,
+        path::PathBuf,
+        sync::{Mutex, MutexGuard},
+    };
 
-    use super::AppConfig;
+    use super::{AppConfig, FileConfig, TlsClientAuth};
     use crate::broker::runtime::config::{
         MAX_OFFLINE_QUEUE_LEN, MAX_RETAINED_MESSAGES, MAX_RETAINED_PAYLOAD_BYTES,
         MAX_SUBSCRIPTIONS_PER_CLIENT, SERVER_MAXIMUM_PACKET_SIZE, SERVER_RECEIVE_MAXIMUM,
         SERVER_TOPIC_ALIAS_MAXIMUM,
     };
 
+    const TLS_ENV_KEYS: &[&str] = &[
+        "MQTT_RS_TLS_ENABLED",
+        "MQTT_RS_TLS_CERTIFICATE_CHAIN",
+        "MQTT_RS_TLS_PRIVATE_KEY",
+        "MQTT_RS_TLS_CLIENT_AUTH",
+        "MQTT_RS_TLS_CLIENT_CA",
+    ];
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn clear_tls() -> Self {
+            Self::set_tls(&[])
+        }
+
+        fn set_tls(vars: &[(&'static str, &str)]) -> Self {
+            let lock = ENV_LOCK.lock().expect("environment lock");
+            let saved = TLS_ENV_KEYS
+                .iter()
+                .map(|name| (*name, env::var_os(name)))
+                .collect();
+            for name in TLS_ENV_KEYS {
+                unsafe {
+                    env::remove_var(name);
+                }
+            }
+            for (name, value) in vars {
+                unsafe {
+                    env::set_var(name, value);
+                }
+            }
+
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.saved {
+                match value {
+                    Some(value) => unsafe {
+                        env::set_var(name, value);
+                    },
+                    None => unsafe {
+                        env::remove_var(name);
+                    },
+                }
+            }
+        }
+    }
+
     #[test]
     fn cli_overrides_config_file_values() {
+        let _env = EnvGuard::clear_tls();
         let args = [
             "Pulse",
             "--bind",
@@ -408,6 +610,11 @@ mod tests {
     #[test]
     fn defaults_match_runtime_constants() {
         let config = AppConfig::default();
+        assert!(!config.server.tls.enabled);
+        assert!(config.server.tls.certificate_chain.is_none());
+        assert!(config.server.tls.private_key.is_none());
+        assert_eq!(config.server.tls.client_auth, TlsClientAuth::Disabled);
+        assert!(config.server.tls.client_ca.is_none());
         assert_eq!(config.limits.server_receive_maximum, SERVER_RECEIVE_MAXIMUM);
         assert_eq!(
             config.limits.server_maximum_packet_size,
@@ -430,7 +637,162 @@ mod tests {
     }
 
     #[test]
+    fn file_config_enables_tls_with_required_client_auth() {
+        let file: FileConfig = toml::from_str(
+            r#"
+            [server.tls]
+            enabled = true
+            certificate_chain = "certs/server-chain.pem"
+            private_key = "certs/server-key.pem"
+            client_auth = "required"
+            client_ca = "certs/client-ca.pem"
+            "#,
+        )
+        .expect("parse config");
+
+        let mut config = AppConfig::default();
+        config.apply_file(file);
+        config.validate().expect("valid TLS config");
+
+        assert!(config.server.tls.enabled);
+        assert_eq!(
+            config.server.tls.certificate_chain,
+            Some(PathBuf::from("certs/server-chain.pem"))
+        );
+        assert_eq!(
+            config.server.tls.private_key,
+            Some(PathBuf::from("certs/server-key.pem"))
+        );
+        assert_eq!(config.server.tls.client_auth, TlsClientAuth::Required);
+        assert_eq!(
+            config.server.tls.client_ca,
+            Some(PathBuf::from("certs/client-ca.pem"))
+        );
+    }
+
+    #[test]
+    fn env_overrides_tls_config() {
+        let _env = EnvGuard::set_tls(&[
+            ("MQTT_RS_TLS_ENABLED", "true"),
+            ("MQTT_RS_TLS_CERTIFICATE_CHAIN", "env/server-chain.pem"),
+            ("MQTT_RS_TLS_PRIVATE_KEY", "env/server-key.pem"),
+            ("MQTT_RS_TLS_CLIENT_AUTH", "optional"),
+            ("MQTT_RS_TLS_CLIENT_CA", "env/client-ca.pem"),
+        ]);
+        let args = ["Pulse"].into_iter().map(OsString::from);
+        let config = AppConfig::load_from_args(args).expect("load config");
+
+        assert!(config.server.tls.enabled);
+        assert_eq!(
+            config.server.tls.certificate_chain,
+            Some(PathBuf::from("env/server-chain.pem"))
+        );
+        assert_eq!(
+            config.server.tls.private_key,
+            Some(PathBuf::from("env/server-key.pem"))
+        );
+        assert_eq!(config.server.tls.client_auth, TlsClientAuth::Optional);
+        assert_eq!(
+            config.server.tls.client_ca,
+            Some(PathBuf::from("env/client-ca.pem"))
+        );
+    }
+
+    #[test]
+    fn cli_overrides_tls_config() {
+        let _env = EnvGuard::clear_tls();
+        let args = [
+            "Pulse",
+            "--tls",
+            "--tls-certificate-chain",
+            "cli/server-chain.pem",
+            "--tls-private-key",
+            "cli/server-key.pem",
+            "--tls-client-auth",
+            "required",
+            "--tls-client-ca",
+            "cli/client-ca.pem",
+        ]
+        .into_iter()
+        .map(OsString::from);
+        let config = AppConfig::load_from_args(args).expect("load config");
+
+        assert!(config.server.tls.enabled);
+        assert_eq!(
+            config.server.tls.certificate_chain,
+            Some(PathBuf::from("cli/server-chain.pem"))
+        );
+        assert_eq!(
+            config.server.tls.private_key,
+            Some(PathBuf::from("cli/server-key.pem"))
+        );
+        assert_eq!(config.server.tls.client_auth, TlsClientAuth::Required);
+        assert_eq!(
+            config.server.tls.client_ca,
+            Some(PathBuf::from("cli/client-ca.pem"))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_tls_client_auth() {
+        let _env = EnvGuard::clear_tls();
+        let args = ["Pulse", "--tls-client-auth", "sometimes"]
+            .into_iter()
+            .map(OsString::from);
+        let error = AppConfig::load_from_args(args).expect_err("invalid config");
+
+        assert!(error.to_string().contains("server.tls.client_auth"));
+    }
+
+    #[test]
+    fn rejects_enabled_tls_without_certificate_or_private_key() {
+        let _env = EnvGuard::clear_tls();
+        let missing_certificate = [
+            "Pulse",
+            "--tls",
+            "--tls-private-key",
+            "certs/server-key.pem",
+        ]
+        .into_iter()
+        .map(OsString::from);
+        let error = AppConfig::load_from_args(missing_certificate).expect_err("invalid TLS config");
+        assert!(error.to_string().contains("server.tls.certificate_chain"));
+
+        let missing_private_key = [
+            "Pulse",
+            "--tls",
+            "--tls-certificate-chain",
+            "certs/server-chain.pem",
+        ]
+        .into_iter()
+        .map(OsString::from);
+        let error = AppConfig::load_from_args(missing_private_key).expect_err("invalid TLS config");
+        assert!(error.to_string().contains("server.tls.private_key"));
+    }
+
+    #[test]
+    fn rejects_mtls_without_client_ca() {
+        let _env = EnvGuard::clear_tls();
+        let args = [
+            "Pulse",
+            "--tls",
+            "--tls-certificate-chain",
+            "certs/server-chain.pem",
+            "--tls-private-key",
+            "certs/server-key.pem",
+            "--tls-client-auth",
+            "required",
+        ]
+        .into_iter()
+        .map(OsString::from);
+        let error = AppConfig::load_from_args(args).expect_err("invalid TLS config");
+
+        assert!(error.to_string().contains("server.tls.client_ca"));
+    }
+
+    #[test]
     fn rejects_invalid_zero_receive_maximum() {
+        let _env = EnvGuard::clear_tls();
         let args = ["Pulse", "--server-receive-maximum", "0"]
             .into_iter()
             .map(OsString::from);
@@ -441,6 +803,7 @@ mod tests {
 
     #[test]
     fn rejects_multiple_storage_backends() {
+        let _env = EnvGuard::clear_tls();
         let args = [
             "Pulse",
             "--sqlite",

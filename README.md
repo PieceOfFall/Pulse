@@ -58,6 +58,29 @@ Expose Prometheus metrics:
 metrics_bind = "127.0.0.1:9000"
 ```
 
+Enable MQTT over TLS:
+
+```toml
+[server]
+bind = "0.0.0.0:8883"
+
+[server.tls]
+enabled = true
+certificate_chain = "/etc/pulse/server-chain.pem"
+private_key = "/etc/pulse/server-key.pem"
+```
+
+Require client certificates for mTLS:
+
+```toml
+[server.tls]
+enabled = true
+certificate_chain = "/etc/pulse/server-chain.pem"
+private_key = "/etc/pulse/server-key.pem"
+client_auth = "required"
+client_ca = "/etc/pulse/client-ca.pem"
+```
+
 Then run:
 
 ```sh
@@ -78,12 +101,29 @@ Configuration can come from four places, applied in this order:
 1. Built-in defaults.
 2. `Broker.toml`.
 3. Environment variables such as `MQTT_RS_BIND`, `MQTT_RS_SQLITE`,
-   `MQTT_RS_LOG`, and `MQTT_RS_METRICS_BIND`.
+   `MQTT_RS_LOG`, `MQTT_RS_METRICS_BIND`, and
+   `MQTT_RS_TLS_CERTIFICATE_CHAIN`.
 4. CLI flags such as `--bind`, `--sqlite`, `--mysql`, `--log`, and
    `--metrics-bind`.
 
 The `MQTT_RS_*` environment prefix is intentionally kept for compatibility
 while the broker moves under the Pulse name.
+
+TLS can also be enabled without editing the TOML file:
+
+```sh
+cargo run -- \
+  --bind 0.0.0.0:8883 \
+  --tls \
+  --tls-certificate-chain /etc/pulse/server-chain.pem \
+  --tls-private-key /etc/pulse/server-key.pem
+```
+
+For mTLS, add `--tls-client-auth optional` or
+`--tls-client-auth required` plus `--tls-client-ca /etc/pulse/client-ca.pem`.
+The matching environment variables are `MQTT_RS_TLS_ENABLED`,
+`MQTT_RS_TLS_CERTIFICATE_CHAIN`, `MQTT_RS_TLS_PRIVATE_KEY`,
+`MQTT_RS_TLS_CLIENT_AUTH`, and `MQTT_RS_TLS_CLIENT_CA`.
 
 Windows MSI installs do not install a default `Broker.toml`. They use SQLite at
 `C:\ProgramData\Pulse\broker.db` by default and create that directory on first
