@@ -8,7 +8,7 @@ use std::{fs, path::Path, sync::Arc, time::Duration};
 
 use broker::{Broker, BrokerLife, MqttHandler, runtime::auth::ConfiguredAuthenticator};
 use rs_netty::{Error, Result, TcpServer, codec::MqttCodec, pipeline};
-use settings::AppConfig;
+use settings::{AppConfig, StorageEngine};
 use tls::build_server_tls_context;
 use tracing::info;
 
@@ -21,15 +21,41 @@ async fn main() -> Result<()> {
     let server_tls = build_server_tls_context(&config.server.tls)?;
     let authenticator = Arc::new(ConfiguredAuthenticator::new(config.auth.clone()));
 
-    let broker = if let Some(url) = &config.storage.mysql {
-        Broker::with_mysql_auth_and_config(url, config.limits, authenticator.clone())
-            .map_err(|error| Error::Pipeline(format!("open mysql storage: {error}")))?
-    } else if let Some(path) = &config.storage.sqlite {
-        ensure_sqlite_parent_dir(path)?;
-        Broker::with_sqlite_auth_and_config(path, config.limits, authenticator.clone())
-            .map_err(|error| Error::Pipeline(format!("open sqlite storage: {error}")))?
-    } else {
-        Broker::with_config_and_auth(config.limits, authenticator)
+    let broker = match config.storage.engine {
+        StorageEngine::Mysql => {
+            let url = config
+                .storage
+                .mysql
+                .as_deref()
+                .expect("validated mysql storage url");
+            Broker::with_mysql_auth_and_config(url, config.limits, authenticator.clone())
+                .map_err(|error| Error::Pipeline(format!("open mysql storage: {error}")))?
+        }
+        StorageEngine::Sqlite => {
+            let path = config
+                .storage
+                .sqlite
+                .as_deref()
+                .expect("validated sqlite storage path");
+            ensure_sqlite_parent_dir(path)?;
+            Broker::with_sqlite_auth_and_config(path, config.limits, authenticator.clone())
+                .map_err(|error| Error::Pipeline(format!("open sqlite storage: {error}")))?
+        }
+        StorageEngine::Wal => {
+            let dir = config
+                .storage
+                .wal_dir
+                .clone()
+                .unwrap_or_else(|| "pulse-wal".into());
+            Broker::with_binary_auth_and_config(
+                dir,
+                config.storage.commit_policy,
+                config.limits,
+                authenticator.clone(),
+            )
+            .map_err(|error| Error::Pipeline(format!("open binary wal storage: {error}")))?
+        }
+        StorageEngine::Memory => Broker::with_config_and_auth(config.limits, authenticator),
     };
 
     let server =

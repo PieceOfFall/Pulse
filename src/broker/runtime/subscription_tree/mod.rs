@@ -15,11 +15,31 @@ pub(in crate::broker) struct SubscriptionEntry {
     pub(in crate::broker) subscription_identifier: Option<u32>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::broker) fn upsert_subscription(
     subscriptions: &mut Vec<SubscriptionEntry>,
     client_id: &str,
     subscription: Subscription,
     subscription_identifier: Option<u32>,
+) -> UpsertSubscriptionResult {
+    let existing_index = subscriptions
+        .iter()
+        .position(|sub| sub.client_id == client_id && sub.filter == subscription.topic_filter);
+    upsert_subscription_at(
+        subscriptions,
+        client_id,
+        subscription,
+        subscription_identifier,
+        existing_index,
+    )
+}
+
+pub(in crate::broker) fn upsert_subscription_at(
+    subscriptions: &mut Vec<SubscriptionEntry>,
+    client_id: &str,
+    subscription: Subscription,
+    subscription_identifier: Option<u32>,
+    existing_index: Option<usize>,
 ) -> UpsertSubscriptionResult {
     let match_filter = crate::protocol::shared_subscription_filter(&subscription.topic_filter)
         .unwrap_or(&subscription.topic_filter)
@@ -27,10 +47,7 @@ pub(in crate::broker) fn upsert_subscription(
     let shared_group =
         crate::protocol::shared_subscription_group(&subscription.topic_filter).map(str::to_string);
 
-    if let Some(index) = subscriptions
-        .iter_mut()
-        .position(|sub| sub.client_id == client_id && sub.filter == subscription.topic_filter)
-    {
+    if let Some(index) = existing_index {
         subscriptions[index].options = subscription.options;
         subscriptions[index].subscription_identifier = subscription_identifier;
         subscriptions[index].match_filter = match_filter;
@@ -58,14 +75,4 @@ pub(in crate::broker) fn upsert_subscription(
 pub(in crate::broker) struct UpsertSubscriptionResult {
     pub(in crate::broker) index: usize,
     pub(in crate::broker) inserted: bool,
-}
-
-pub(in crate::broker) fn is_new_subscription(
-    subscriptions: &[SubscriptionEntry],
-    client_id: &str,
-    topic_filter: &str,
-) -> bool {
-    !subscriptions.iter().any(|subscription| {
-        subscription.client_id == client_id && subscription.filter == topic_filter
-    })
 }

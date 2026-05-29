@@ -19,7 +19,8 @@ use self::runtime::auth::{Authentication, Authenticator, ConfiguredAuthenticator
 use self::runtime::config::BrokerConfig;
 use self::runtime::reason::reason_properties;
 use self::runtime::session_registry::BrokerState;
-use self::storage::{BrokerStorage, InMemoryStorage, MysqlStorage, SqliteStorage};
+use self::storage::{BinaryStorage, BrokerStorage, InMemoryStorage, MysqlStorage, SqliteStorage};
+use self::vnext::CommitPolicy;
 use crate::protocol;
 
 #[derive(Clone)]
@@ -96,6 +97,19 @@ impl Broker {
     ) -> mysql::Result<Self> {
         Ok(Self::with_storage(
             Arc::new(MysqlStorage::open(url)?),
+            config,
+            authenticator,
+        ))
+    }
+
+    pub(crate) fn with_binary_auth_and_config(
+        dir: impl AsRef<Path>,
+        commit_policy: CommitPolicy,
+        config: BrokerConfig,
+        authenticator: Arc<dyn Authenticator>,
+    ) -> std::io::Result<Self> {
+        Ok(Self::with_storage(
+            Arc::new(BinaryStorage::open(dir, commit_policy)?),
             config,
             authenticator,
         ))

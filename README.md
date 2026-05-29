@@ -232,9 +232,9 @@ message expiry.
 
 Pulse includes a local benchmark harness in `benchmark/`. The benchmark tooling
 is excluded from Cargo packages and starts both brokers on localhost with
-temporary persistent state. Pulse is run against SQLite, while Mosquitto is run
-with built-in persistence enabled, autosave-on-change enabled, and relaxed
-queue/inflight limits.
+temporary persistent state. Pulse is run against binary WAL storage in `fast`
+commit mode, while Mosquitto is run with built-in persistence enabled,
+autosave-on-change enabled, and relaxed queue/inflight limits.
 
 This single local run used:
 
@@ -243,20 +243,21 @@ python3 benchmark/run.py --messages 10000 --timeout 60
 ```
 
 Environment: macOS 26.5 arm64, Python 3.9.6, Pulse 1.2.0 release build,
-Pulse SQLite temporary storage, Mosquitto 2.1.2 temporary persistence,
-128-byte payloads, 100 retained-fanout subscribers, and 10 ms RSS sampling.
+Pulse binary WAL temporary storage in `fast` commit mode, Mosquitto 2.1.2
+temporary persistence, 128-byte payloads, 100 retained-fanout subscribers, and
+10 ms RSS sampling.
 RSS values are MiB for the broker process.
 
 | Broker | Scenario | Count | Seconds | Rate/sec | Base RSS | Peak RSS | End RSS |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Pulse-sqlite | qos0-throughput | 10000 | 0.8339 | 11991.85 | 5.11 | 5.75 | 5.75 |
-| Pulse-sqlite | qos1-throughput | 10000 | 1.6621 | 6016.41 | 5.11 | 5.95 | 5.95 |
-| Pulse-sqlite | qos2-throughput | 10000 | 2.9974 | 3336.26 | 5.11 | 5.98 | 5.98 |
-| Pulse-sqlite | retained-fanout | 100 | 0.0204 | 4898.56 | 5.11 | 10.98 | 10.98 |
-| Mosquitto-persist | qos0-throughput | 10000 | 0.1227 | 81489.19 | 4.42 | 5.44 | 5.44 |
-| Mosquitto-persist | qos1-throughput | 10000 | 1.1163 | 8958.26 | 4.42 | 5.44 | 5.44 |
-| Mosquitto-persist | qos2-throughput | 10000 | 1.7129 | 5838.03 | 4.42 | 5.44 | 5.44 |
-| Mosquitto-persist | retained-fanout | 100 | 0.0110 | 9093.15 | 4.42 | 5.94 | 5.94 |
+| Pulse-wal | qos0-throughput | 10000 | 0.1169 | 85539.33 | 3.70 | 5.42 | 5.42 |
+| Pulse-wal | qos1-throughput | 10000 | 0.4276 | 23387.71 | 3.70 | 5.70 | 5.70 |
+| Pulse-wal | qos2-throughput | 10000 | 0.9196 | 10874.25 | 3.70 | 5.91 | 5.91 |
+| Pulse-wal | retained-fanout | 100 | 0.0095 | 10497.77 | 3.70 | 10.86 | 10.86 |
+| Mosquitto-persist | qos0-throughput | 10000 | 0.1187 | 84266.85 | 4.42 | 5.34 | 5.34 |
+| Mosquitto-persist | qos1-throughput | 10000 | 1.0698 | 9347.75 | 4.42 | 5.34 | 5.34 |
+| Mosquitto-persist | qos2-throughput | 10000 | 1.6935 | 5904.89 | 4.42 | 5.34 | 5.34 |
+| Mosquitto-persist | retained-fanout | 100 | 0.0089 | 11179.48 | 4.42 | 5.86 | 5.86 |
 
 ## Roadmap
 

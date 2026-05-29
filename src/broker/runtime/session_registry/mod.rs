@@ -6,7 +6,7 @@ use rs_netty::{
 };
 
 use super::{
-    message::PendingPublish, retained_store::RetainedMessage, subscription_tree::SubscriptionEntry,
+    message::PendingPublish, retained_store::RetainedStore, subscription_tree::SubscriptionEntry,
     time::now_ms,
 };
 use crate::observability::metrics;
@@ -17,12 +17,40 @@ pub(in crate::broker) struct BrokerState {
     pub(in crate::broker) connection_by_client_id: HashMap<String, u64>,
     pub(in crate::broker) sessions_by_client_id: HashMap<String, SessionEntry>,
     pub(in crate::broker) subscriptions: Vec<SubscriptionEntry>,
-    pub(in crate::broker) retained: HashMap<String, RetainedMessage>,
+    pub(in crate::broker) retained: RetainedStore,
     pub(in crate::broker) qos2_inflight: HashMap<(u64, u16), PendingPublish>,
     pub(in crate::broker) shared_subscription_cursors: HashMap<String, usize>,
+    persistence_changes: Vec<PersistenceChange>,
 }
 
 impl BrokerState {
+    pub(in crate::broker) fn mark_sessions_changed(&mut self) {
+        self.persistence_changes.push(PersistenceChange::Sessions);
+    }
+
+    pub(in crate::broker) fn mark_subscriptions_changed(&mut self) {
+        self.persistence_changes
+            .push(PersistenceChange::Subscriptions);
+    }
+
+    pub(in crate::broker) fn mark_retained_changed(&mut self) {
+        self.persistence_changes.push(PersistenceChange::Retained);
+    }
+
+    pub(in crate::broker) fn mark_offline_changed(&mut self, client_id: impl Into<String>) {
+        self.persistence_changes
+            .push(PersistenceChange::Offline(client_id.into()));
+    }
+
+    pub(in crate::broker) fn mark_outbound_changed(&mut self, client_id: impl Into<String>) {
+        self.persistence_changes
+            .push(PersistenceChange::Outbound(client_id.into()));
+    }
+
+    pub(in crate::broker) fn take_persistence_changes(&mut self) -> Vec<PersistenceChange> {
+        std::mem::take(&mut self.persistence_changes)
+    }
+
     pub(in crate::broker) fn record_metrics(&self) {
         let mut queue_size = 0;
         let mut qos1_inflight = 0;
@@ -78,6 +106,8 @@ impl BrokerState {
             self.sessions_by_client_id.remove(&client.client_id);
             self.subscriptions
                 .retain(|sub| sub.client_id != client.client_id);
+            self.mark_sessions_changed();
+            self.mark_subscriptions_changed();
         } else if !preserve_session {
             let expires_at_ms = session_expires_at_ms(client.session_expiry_interval);
             self.sessions_by_client_id
@@ -89,9 +119,19 @@ impl BrokerState {
                 .or_insert_with(|| {
                     SessionEntry::disconnected(client.session_expiry_interval, expires_at_ms)
                 });
+            self.mark_sessions_changed();
         }
         Some(client)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::broker) enum PersistenceChange {
+    Sessions,
+    Subscriptions,
+    Retained,
+    Offline(String),
+    Outbound(String),
 }
 
 pub(in crate::broker) struct SessionEntry {

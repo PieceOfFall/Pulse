@@ -38,6 +38,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PULSE_BIN = REPO_ROOT / "target" / "release" / "Pulse"
 HOMEBREW_MOSQUITTO = Path("/opt/homebrew/opt/mosquitto/sbin/mosquitto")
 DEFAULT_MEMORY_SAMPLE_INTERVAL_MS = 10
+PULSE_ENGINES = ("wal", "sqlite", "memory")
 
 
 class MqttError(RuntimeError):
@@ -392,28 +393,62 @@ def format_mib(value: object) -> str:
     return f"{float(value):.2f}"
 
 
-def start_pulse(pulse_bin: Path, port: int, sqlite_path: Optional[Path]) -> BrokerProcess:
+def pulse_broker_name(args) -> str:
+    return f"Pulse-{args.pulse_engine}"
+
+
+def pulse_storage_description(args) -> str:
+    if args.pulse_engine == "sqlite":
+        return f"sqlite ({args.pulse_sqlite or 'temporary'})"
+    if args.pulse_engine == "wal":
+        return (
+            f"wal/{args.pulse_commit_policy} "
+            f"({args.pulse_wal_dir or 'temporary'})"
+        )
+    return "memory"
+
+
+def start_pulse(pulse_bin: Path, port: int, args) -> BrokerProcess:
     if not pulse_bin.exists():
         raise FileNotFoundError(
             f"Pulse binary not found at {pulse_bin}. Run `cargo build --release` or pass --pulse-bin."
         )
 
     tempdir = None
-    if sqlite_path is None:
-        tempdir = tempfile.TemporaryDirectory(prefix="pulse-sqlite-")
-        sqlite_path = Path(tempdir.name) / "pulse-benchmark.db"
+    storage_args = ["--storage-engine", args.pulse_engine]
+    if args.pulse_engine == "sqlite":
+        sqlite_path = args.pulse_sqlite
+        if sqlite_path is None:
+            tempdir = tempfile.TemporaryDirectory(prefix="pulse-sqlite-")
+            sqlite_path = Path(tempdir.name) / "pulse-benchmark.db"
+        storage_args = ["--sqlite", str(sqlite_path)]
+    elif args.pulse_engine == "wal":
+        wal_dir = args.pulse_wal_dir
+        if wal_dir is None:
+            tempdir = tempfile.TemporaryDirectory(prefix="pulse-wal-")
+            wal_dir = Path(tempdir.name)
+        storage_args = [
+            "--storage-engine",
+            "wal",
+            "--wal-dir",
+            str(wal_dir),
+            "--storage-commit-policy",
+            args.pulse_commit_policy,
+        ]
+    elif args.pulse_engine == "memory":
+        storage_args = ["--storage-engine", "memory"]
+    else:
+        raise ValueError(f"unsupported Pulse engine: {args.pulse_engine}")
 
     command = [
         str(pulse_bin),
         "--bind",
         f"127.0.0.1:{port}",
-        "--sqlite",
-        str(sqlite_path),
         "--log",
         "error",
         "--inflight-retransmit-interval-ms",
         "0",
-    ]
+    ] + storage_args
     process = subprocess.Popen(
         command,
         cwd=REPO_ROOT,
@@ -421,7 +456,7 @@ def start_pulse(pulse_bin: Path, port: int, sqlite_path: Optional[Path]) -> Brok
         stderr=subprocess.PIPE,
         text=True,
     )
-    broker = BrokerProcess("Pulse-sqlite", process, tempdir=tempdir)
+    broker = BrokerProcess(pulse_broker_name(args), process, tempdir=tempdir)
     try:
         wait_for_port("127.0.0.1", port, process, timeout=10)
     except BaseException:
@@ -705,7 +740,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--payload-bytes", type=int, default=128)
     parser.add_argument("--fanout-subscribers", type=int, default=100)
     parser.add_argument("--pulse-bin", type=Path, default=DEFAULT_PULSE_BIN)
+    parser.add_argument("--pulse-engine", choices=PULSE_ENGINES, default="wal")
     parser.add_argument("--pulse-sqlite", type=Path)
+    parser.add_argument("--pulse-wal-dir", type=Path)
+    parser.add_argument(
+        "--pulse-commit-policy",
+        choices=("fast", "balanced", "strict"),
+        default="fast",
+    )
     parser.add_argument("--mosquitto-bin")
     parser.add_argument("--mosquitto-persistence-dir", type=Path)
     parser.add_argument("--timeout", type=float, default=10.0)
@@ -728,6 +770,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--timeout must be greater than 0")
     if args.memory_sample_interval_ms <= 0:
         raise ValueError("--memory-sample-interval-ms must be greater than 0")
+    if args.pulse_engine != "sqlite" and args.pulse_sqlite is not None:
+        raise ValueError("--pulse-sqlite can only be used with --pulse-engine sqlite")
+    if args.pulse_engine != "wal" and args.pulse_wal_dir is not None:
+        raise ValueError("--pulse-wal-dir can only be used with --pulse-engine wal")
 
 
 def main() -> int:
@@ -739,7 +785,7 @@ def main() -> int:
     print(f"  platform: {platform.platform()}")
     print(f"  python: {platform.python_version()}")
     print(f"  pulse: {pulse_version()} ({args.pulse_bin})")
-    print(f"  pulse_storage: sqlite ({args.pulse_sqlite or 'temporary'})")
+    print(f"  pulse_storage: {pulse_storage_description(args)}")
     print(f"  mosquitto: {version_output([str(mosquitto_bin), '-h'])} ({mosquitto_bin})")
     print(
         "  mosquitto_persistence: true "
@@ -751,9 +797,10 @@ def main() -> int:
     print(f"  memory_sample_interval_ms: {args.memory_sample_interval_ms}")
 
     all_results: list[dict[str, object]] = []
+    pulse_name = pulse_broker_name(args)
     pulse_results, _ = run_benchmark_for_broker(
-        "Pulse-sqlite",
-        lambda port: start_pulse(args.pulse_bin, port, args.pulse_sqlite),
+        pulse_name,
+        lambda port: start_pulse(args.pulse_bin, port, args),
         args,
     )
     all_results.extend(pulse_results)

@@ -1,7 +1,9 @@
+mod binary;
 mod memory;
 mod mysql;
 mod sqlite;
 
+pub(super) use binary::BinaryStorage;
 pub(super) use memory::InMemoryStorage;
 pub(super) use mysql::MysqlStorage;
 pub(super) use sqlite::SqliteStorage;

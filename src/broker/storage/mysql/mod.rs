@@ -269,7 +269,7 @@ fn persist_state(connection: &mut PooledConn, state: &BrokerState) -> mysql::Res
         )?;
     }
 
-    for (topic_name, message) in &state.retained {
+    for (topic_name, message) in state.retained.iter() {
         transaction.exec_drop(
             "INSERT INTO retained_messages (topic_name, packet, expires_at_ms) VALUES (:topic_name, :packet, :expires_at_ms)",
             params! {

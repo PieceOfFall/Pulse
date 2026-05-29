@@ -8,7 +8,7 @@ mod service;
 
 use rs_netty::{Channel, codec::MqttPacket};
 
-pub(in crate::broker) use flush::flush_deliveries;
+pub(in crate::broker) use flush::{flush_deliveries, flush_deliveries_to_context};
 pub(in crate::broker) use inflight::{
     queued_deliveries_for_client, redeliveries_for_client, retransmissions_for_connection,
 };

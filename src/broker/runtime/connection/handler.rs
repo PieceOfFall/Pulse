@@ -19,7 +19,7 @@ use crate::{
     broker::{
         Broker,
         runtime::{
-            delivery::flush_deliveries,
+            delivery::{flush_deliveries, flush_deliveries_to_context},
             reason::{ack_packet, reason_properties},
             time::now_ms,
         },
@@ -276,8 +276,12 @@ impl Handler<MqttPacket> for MqttHandler {
             }
             MqttPacket::Subscribe(packet) => {
                 let (suback, retained) = self.broker.subscribe(ctx.id(), packet);
-                ctx.write_and_flush(MqttPacket::SubAck(suback)).await?;
-                flush_deliveries(retained).await;
+                if retained.is_empty() {
+                    ctx.write_and_flush(MqttPacket::SubAck(suback)).await?;
+                } else {
+                    ctx.write(MqttPacket::SubAck(suback)).await?;
+                    flush_deliveries_to_context(ctx, retained).await?;
+                }
                 Ok(())
             }
             MqttPacket::Unsubscribe(packet) => {

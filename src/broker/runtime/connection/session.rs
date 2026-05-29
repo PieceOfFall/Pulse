@@ -47,6 +47,8 @@ impl Broker {
             if options.clean_start {
                 state.sessions_by_client_id.remove(&client_id);
                 state.subscriptions.retain(|sub| sub.client_id != client_id);
+                state.mark_sessions_changed();
+                state.mark_subscriptions_changed();
             }
 
             let replaced_channel = if let Some(previous_connection_id) = state
@@ -84,6 +86,9 @@ impl Broker {
                 ),
             );
             let redeliveries = redeliveries_for_client(state, &client_id);
+            state.mark_sessions_changed();
+            state.mark_offline_changed(client_id.clone());
+            state.mark_outbound_changed(client_id.clone());
 
             ConnectOutcome {
                 client_id,

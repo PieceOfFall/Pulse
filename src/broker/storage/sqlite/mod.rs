@@ -319,7 +319,7 @@ fn persist_state(
         let mut statement = transaction.prepare(
             "INSERT INTO retained_messages (topic_name, packet, expires_at_ms) VALUES (?1, ?2, ?3)",
         )?;
-        for (topic_name, message) in &state.retained {
+        for (topic_name, message) in state.retained.iter() {
             statement.execute(params![
                 topic_name,
                 encode_retained(message),

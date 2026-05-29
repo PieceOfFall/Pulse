@@ -3,8 +3,8 @@
 This directory contains local-only benchmark tooling for comparing Pulse with
 the official Eclipse Mosquitto broker installed through Homebrew. It is excluded
 from Cargo packages with `exclude = ["benchmark/**"]`. By default, Pulse runs
-with temporary SQLite storage and Mosquitto runs with temporary built-in
-persistence enabled.
+with temporary binary WAL persistence in `fast` commit mode and Mosquitto runs
+with temporary built-in persistence enabled.
 
 ## Prerequisites
 
@@ -48,10 +48,16 @@ python3 benchmark/run.py \
   --fanout-subscribers 100 \
   --memory-sample-interval-ms 10 \
   --pulse-bin target/release/Pulse \
-  --pulse-sqlite /tmp/pulse-benchmark.db \
+  --pulse-engine wal \
+  --pulse-wal-dir /tmp/pulse-benchmark-wal \
+  --pulse-commit-policy fast \
   --mosquitto-bin /opt/homebrew/opt/mosquitto/sbin/mosquitto \
   --mosquitto-persistence-dir /tmp/mosquitto-benchmark
 ```
+
+Use `--pulse-engine sqlite` with `--pulse-sqlite` for the legacy SQLite
+compatibility path, or `--pulse-engine memory` to isolate broker runtime cost
+from persistence cost.
 
 ## Scenarios
 

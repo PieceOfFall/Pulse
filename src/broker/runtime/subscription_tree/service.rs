@@ -1,6 +1,6 @@
 use rs_netty::codec::{SubAckPacket, SubscribePacket, UnsubAckPacket, UnsubscribePacket};
 
-use super::{is_new_subscription, upsert_subscription};
+use super::upsert_subscription_at;
 use crate::{
     broker::{
         Broker,
@@ -42,11 +42,6 @@ impl Broker {
 
             let mut reason_codes = Vec::with_capacity(packet.subscriptions.len());
             let mut retained_deliveries = Vec::new();
-            let current_subscription_count = state
-                .subscriptions
-                .iter()
-                .filter(|subscription| subscription.client_id == client_id)
-                .count();
             let mut inserted_count = 0;
 
             for subscription in packet.subscriptions {
@@ -62,7 +57,12 @@ impl Broker {
                     reason_codes.push(protocol::NOT_AUTHORIZED);
                     continue;
                 }
-                if is_new_subscription(&state.subscriptions, &client_id, &subscription.topic_filter)
+                let (current_subscription_count, existing_index) = subscription_position_and_count(
+                    &state.subscriptions,
+                    &client_id,
+                    &subscription.topic_filter,
+                );
+                if existing_index.is_none()
                     && current_subscription_count + inserted_count
                         >= config.max_subscriptions_per_client
                 {
@@ -70,13 +70,15 @@ impl Broker {
                     continue;
                 }
 
-                let upsert = upsert_subscription(
+                let upsert = upsert_subscription_at(
                     &mut state.subscriptions,
                     &client_id,
                     subscription,
                     subscription_identifier(&packet.properties),
+                    existing_index,
                 );
                 let stored = state.subscriptions[upsert.index].clone();
+                state.mark_subscriptions_changed();
                 reason_codes.push(protocol::granted_qos_code(stored.options.maximum_qos));
                 if upsert.inserted {
                     inserted_count += 1;
@@ -121,6 +123,7 @@ impl Broker {
                         .subscriptions
                         .retain(|sub| !(sub.client_id == client_id && sub.filter == *filter));
                 }
+                state.mark_subscriptions_changed();
             }
 
             UnsubAckPacket {
@@ -130,6 +133,24 @@ impl Broker {
             }
         })
     }
+}
+
+fn subscription_position_and_count(
+    subscriptions: &[super::SubscriptionEntry],
+    client_id: &str,
+    topic_filter: &str,
+) -> (usize, Option<usize>) {
+    let mut count = 0;
+    let mut position = None;
+    for (index, subscription) in subscriptions.iter().enumerate() {
+        if subscription.client_id == client_id {
+            count += 1;
+            if subscription.filter == topic_filter {
+                position = Some(index);
+            }
+        }
+    }
+    (count, position)
 }
 
 fn should_send_retained_on_subscribe(retain_handling: u8, inserted: bool) -> bool {
