@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Mutex, mpsc},
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use bytes::{Bytes, BytesMut};
@@ -22,9 +23,30 @@ use crate::broker::{
     },
     vnext::CommitPolicy,
 };
+use tracing::warn;
 
 const MAGIC: &[u8] = b"PBIN1\n";
 const LOG_FILE_NAME: &str = "broker.binlog";
+const MANIFEST_FILE_NAME: &str = "broker.manifest";
+const CHECKPOINT_FILE_NAME: &str = "broker.checkpoint";
+const TMP_SUFFIX: &str = ".tmp";
+const DEFAULT_WAL_COMPACT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_WAL_COMPACT_INTERVAL_MS: u64 = 10 * 60 * 1000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WalCompactConfig {
+    pub(crate) max_bytes: u64,
+    pub(crate) interval_ms: u64,
+}
+
+impl Default for WalCompactConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes: DEFAULT_WAL_COMPACT_MAX_BYTES,
+            interval_ms: DEFAULT_WAL_COMPACT_INTERVAL_MS,
+        }
+    }
+}
 
 const SESSION_UPSERT: u8 = 1;
 const SESSION_DELETE: u8 = 2;
@@ -47,12 +69,26 @@ struct BinaryStorageInner {
 
 impl BinaryStorage {
     pub(crate) fn open(dir: impl AsRef<Path>, commit_policy: CommitPolicy) -> io::Result<Self> {
+        Self::open_with_options(dir, commit_policy, WalCompactConfig::default())
+    }
+
+    pub(crate) fn open_with_options(
+        dir: impl AsRef<Path>,
+        commit_policy: CommitPolicy,
+        compact: WalCompactConfig,
+    ) -> io::Result<Self> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
-        let path = dir.join(LOG_FILE_NAME);
-        let state = replay_log(&path)?;
+        let recovered = recover_storage(dir)?;
+        let state = recovered.state;
         let snapshot = PersistentSnapshot::from_state(&state);
-        let log = BinaryLog::open(path, commit_policy)?;
+        let log = BinaryLog::open(
+            dir.to_path_buf(),
+            recovered.active_path,
+            recovered.active_epoch,
+            commit_policy,
+            compact,
+        )?;
 
         Ok(Self {
             inner: Mutex::new(BinaryStorageInner { state, snapshot }),
@@ -74,11 +110,11 @@ impl BrokerStorage for BinaryStorage {
         let BinaryStorageInner { state, snapshot } = &mut *inner;
         let records = diff_records_for_changes(snapshot, state, changes);
         if !records.is_empty() {
-            self.log
-                .lock()
-                .expect("binary log lock poisoned")
-                .append_many(&records)
+            let mut log = self.log.lock().expect("binary log lock poisoned");
+            log.append_many(&records)
                 .expect("persist broker state to binary log");
+            log.compact_if_needed(snapshot)
+                .expect("compact binary log checkpoint");
         }
     }
 
@@ -94,62 +130,61 @@ impl BrokerStorage for BinaryStorage {
 }
 
 struct BinaryLog {
+    dir: PathBuf,
+    active_path: PathBuf,
+    active_epoch: Option<u64>,
     file: Option<File>,
     commit_policy: CommitPolicy,
+    compact: WalCompactConfig,
+    current_bytes: u64,
+    last_compacted_at: Instant,
+    records_since_checkpoint: usize,
     pending_balanced_records: usize,
     fast_tx: Option<mpsc::Sender<Vec<Record>>>,
     fast_thread: Option<JoinHandle<io::Result<()>>>,
 }
 
 impl BinaryLog {
-    fn open(path: PathBuf, commit_policy: CommitPolicy) -> io::Result<Self> {
-        let new_file = !path.exists() || fs::metadata(&path)?.len() == 0;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(path)?;
-        if new_file {
-            file.write_all(MAGIC)?;
-            file.flush()?;
-        }
-
-        if matches!(commit_policy, CommitPolicy::Fast) {
-            let (tx, rx) = mpsc::channel::<Vec<Record>>();
-            let fast_thread = thread::spawn(move || {
-                let mut file = file;
-                while let Ok(records) = rx.recv() {
-                    write_records(&mut file, &records)?;
-                }
-                file.flush()
-            });
-            return Ok(Self {
-                file: None,
-                commit_policy,
-                pending_balanced_records: 0,
-                fast_tx: Some(tx),
-                fast_thread: Some(fast_thread),
-            });
-        }
-
-        Ok(Self {
-            file: Some(file),
+    fn open(
+        dir: PathBuf,
+        active_path: PathBuf,
+        active_epoch: Option<u64>,
+        commit_policy: CommitPolicy,
+        compact: WalCompactConfig,
+    ) -> io::Result<Self> {
+        let file = open_wal_file(&active_path)?;
+        let current_bytes = file.metadata()?.len();
+        let mut log = Self {
+            dir,
+            active_path,
+            active_epoch,
+            file: None,
             commit_policy,
+            compact,
+            current_bytes,
+            last_compacted_at: Instant::now(),
+            records_since_checkpoint: 0,
             pending_balanced_records: 0,
             fast_tx: None,
             fast_thread: None,
-        })
+        };
+        log.start_writer(file);
+        Ok(log)
     }
 
     fn append_many(&mut self, records: &[Record]) -> io::Result<()> {
+        let encoded_bytes = encoded_records_len(records);
         if let Some(tx) = &self.fast_tx {
             tx.send(records.to_vec())
                 .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "binary log writer stopped"))?;
+            self.current_bytes += encoded_bytes;
+            self.records_since_checkpoint += records.len();
             return Ok(());
         }
 
         let file = self.file.as_mut().expect("sync binary log file");
-        write_records(file, records)?;
+        self.current_bytes += write_records(file, records)?;
+        self.records_since_checkpoint += records.len();
         self.pending_balanced_records += records.len();
         match self.commit_policy {
             CommitPolicy::Strict => {
@@ -166,26 +201,493 @@ impl BinaryLog {
         }
         Ok(())
     }
+
+    fn compact_if_needed(&mut self, snapshot: &PersistentSnapshot) -> io::Result<()> {
+        let size_triggered =
+            self.compact.max_bytes != 0 && self.current_bytes > self.compact.max_bytes;
+        let time_triggered = self.compact.interval_ms != 0
+            && self.records_since_checkpoint > 0
+            && self.last_compacted_at.elapsed() >= Duration::from_millis(self.compact.interval_ms);
+        if !size_triggered && !time_triggered {
+            return Ok(());
+        }
+
+        self.compact(snapshot)
+    }
+
+    fn compact(&mut self, snapshot: &PersistentSnapshot) -> io::Result<()> {
+        self.close_writer()?;
+
+        let checkpoint_path = self.dir.join(CHECKPOINT_FILE_NAME);
+        write_checkpoint(&checkpoint_path, snapshot)?;
+
+        let next_epoch = self.active_epoch.unwrap_or(0) + 1;
+        let next_path = wal_epoch_path(&self.dir, next_epoch);
+        remove_file_if_exists(&next_path)?;
+        let new_file = create_wal_file(&next_path)?;
+
+        let manifest = WalManifest::new(next_epoch);
+        write_manifest(&self.dir, &manifest)?;
+        sync_dir(&self.dir)?;
+
+        self.active_path = next_path;
+        self.active_epoch = Some(next_epoch);
+        self.current_bytes = MAGIC.len() as u64;
+        self.records_since_checkpoint = 0;
+        self.pending_balanced_records = 0;
+        self.last_compacted_at = Instant::now();
+        self.start_writer(new_file);
+        cleanup_unreferenced(&self.dir, self.active_epoch)?;
+        Ok(())
+    }
+
+    fn start_writer(&mut self, file: File) {
+        if matches!(self.commit_policy, CommitPolicy::Fast) {
+            let (tx, rx) = mpsc::channel::<Vec<Record>>();
+            let fast_thread = thread::spawn(move || {
+                let mut file = file;
+                while let Ok(records) = rx.recv() {
+                    write_records(&mut file, &records)?;
+                }
+                file.flush()?;
+                file.sync_data()
+            });
+            self.file = None;
+            self.fast_tx = Some(tx);
+            self.fast_thread = Some(fast_thread);
+            return;
+        }
+
+        self.file = Some(file);
+        self.fast_tx = None;
+        self.fast_thread = None;
+    }
+
+    fn close_writer(&mut self) -> io::Result<()> {
+        self.fast_tx.take();
+        if let Some(thread) = self.fast_thread.take() {
+            thread.join().map_err(|_| {
+                io::Error::new(ErrorKind::BrokenPipe, "binary log writer panicked")
+            })??;
+        }
+        if let Some(mut file) = self.file.take() {
+            file.flush()?;
+            file.sync_data()?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for BinaryLog {
     fn drop(&mut self) {
-        self.fast_tx.take();
-        if let Some(thread) = self.fast_thread.take() {
-            let _ = thread.join();
-        }
+        let _ = self.close_writer();
     }
 }
 
-fn write_records(file: &mut File, records: &[Record]) -> io::Result<()> {
+fn write_records(file: &mut File, records: &[Record]) -> io::Result<u64> {
+    let mut written = 0;
     for record in records {
         let payload = encode_record(record);
         let checksum = crc32(&payload);
         file.write_all(&(payload.len() as u32).to_le_bytes())?;
         file.write_all(&payload)?;
         file.write_all(&checksum.to_le_bytes())?;
+        written += record_encoded_len(payload.len());
+    }
+    Ok(written)
+}
+
+fn encoded_records_len(records: &[Record]) -> u64 {
+    records
+        .iter()
+        .map(|record| record_encoded_len(encode_record(record).len()))
+        .sum()
+}
+
+fn record_encoded_len(payload_len: usize) -> u64 {
+    (4 + payload_len + 4) as u64
+}
+
+struct RecoveredStorage {
+    state: BrokerState,
+    active_path: PathBuf,
+    active_epoch: Option<u64>,
+}
+
+#[derive(Clone)]
+struct WalManifest {
+    checkpoint: String,
+    active_log: String,
+    active_epoch: u64,
+}
+
+impl WalManifest {
+    fn new(active_epoch: u64) -> Self {
+        Self {
+            checkpoint: CHECKPOINT_FILE_NAME.to_string(),
+            active_log: wal_epoch_file_name(active_epoch),
+            active_epoch,
+        }
+    }
+
+    fn encode(&self) -> String {
+        format!(
+            "version=1\ncheckpoint={}\nactive_log={}\nactive_epoch={}\n",
+            self.checkpoint, self.active_log, self.active_epoch
+        )
+    }
+}
+
+fn recover_storage(dir: &Path) -> io::Result<RecoveredStorage> {
+    let manifest_path = dir.join(MANIFEST_FILE_NAME);
+    if manifest_path.exists() {
+        match recover_from_manifest(dir, &manifest_path) {
+            Ok(recovered) => {
+                cleanup_unreferenced(dir, recovered.active_epoch)?;
+                return Ok(recovered);
+            }
+            Err(error) => {
+                let legacy_path = dir.join(LOG_FILE_NAME);
+                if legacy_path.exists() {
+                    let legacy_state = replay_log(&legacy_path).map_err(|legacy_error| {
+                        io::Error::new(
+                            ErrorKind::InvalidData,
+                            format!(
+                                "recover manifest WAL failed: {error}; legacy broker.binlog fallback also failed: {legacy_error}"
+                            ),
+                        )
+                    })?;
+                    warn!(
+                        error = %error,
+                        legacy_path = %legacy_path.display(),
+                        "recover manifest WAL failed; falling back to legacy binary log"
+                    );
+                    cleanup_unreferenced(dir, None)?;
+                    return Ok(RecoveredStorage {
+                        state: legacy_state,
+                        active_path: legacy_path,
+                        active_epoch: None,
+                    });
+                }
+
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "recover manifest WAL failed: {error}; no legacy broker.binlog fallback exists"
+                    ),
+                ));
+            }
+        }
+    }
+
+    cleanup_unreferenced(dir, None)?;
+    let active_path = dir.join(LOG_FILE_NAME);
+    Ok(RecoveredStorage {
+        state: replay_log(&active_path)?,
+        active_path,
+        active_epoch: None,
+    })
+}
+
+fn recover_from_manifest(dir: &Path, manifest_path: &Path) -> io::Result<RecoveredStorage> {
+    let manifest = read_manifest(manifest_path)?;
+    let checkpoint_path = manifest_file_path(dir, &manifest.checkpoint)?;
+    let active_path = manifest_file_path(dir, &manifest.active_log)?;
+
+    if !checkpoint_path.exists() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "manifest checkpoint is missing: {}",
+                checkpoint_path.display()
+            ),
+        ));
+    }
+    if !active_path.exists() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("manifest active WAL is missing: {}", active_path.display()),
+        ));
+    }
+
+    let expected_active = wal_epoch_file_name(manifest.active_epoch);
+    if manifest.active_log != expected_active {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "manifest active_log {} does not match active_epoch {}",
+                manifest.active_log, manifest.active_epoch
+            ),
+        ));
+    }
+
+    let mut state = replay_checkpoint(&checkpoint_path)?;
+    replay_log_into(&active_path, &mut state, ReplayMode::AllowCorruptTail)?;
+    Ok(RecoveredStorage {
+        state,
+        active_path,
+        active_epoch: Some(manifest.active_epoch),
+    })
+}
+
+fn read_manifest(path: &Path) -> io::Result<WalManifest> {
+    let contents = fs::read_to_string(path)?;
+    let mut version = None;
+    let mut checkpoint = None;
+    let mut active_log = None;
+    let mut active_epoch = None;
+
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("invalid manifest line: {line}"),
+            ));
+        };
+        match key {
+            "version" => {
+                version = Some(value.parse::<u32>().map_err(|error| {
+                    io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!("invalid manifest version: {error}"),
+                    )
+                })?)
+            }
+            "checkpoint" => checkpoint = Some(value.to_string()),
+            "active_log" => active_log = Some(value.to_string()),
+            "active_epoch" => {
+                active_epoch = Some(value.parse::<u64>().map_err(|error| {
+                    io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!("invalid manifest active_epoch: {error}"),
+                    )
+                })?)
+            }
+            _ => {}
+        }
+    }
+
+    if version != Some(1) {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "unsupported manifest version",
+        ));
+    }
+
+    Ok(WalManifest {
+        checkpoint: checkpoint
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "manifest missing checkpoint"))?,
+        active_log: active_log
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "manifest missing active_log"))?,
+        active_epoch: active_epoch.ok_or_else(|| {
+            io::Error::new(ErrorKind::InvalidData, "manifest missing active_epoch")
+        })?,
+    })
+}
+
+fn write_checkpoint(path: &Path, snapshot: &PersistentSnapshot) -> io::Result<()> {
+    let tmp = tmp_path(path);
+    remove_file_if_exists(&tmp)?;
+    let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    file.write_all(MAGIC)?;
+    write_records(&mut file, &checkpoint_records(snapshot))?;
+    file.flush()?;
+    file.sync_all()?;
+    fs::rename(&tmp, path)?;
+    if let Some(dir) = path.parent() {
+        sync_dir(dir)?;
     }
     Ok(())
+}
+
+fn write_manifest(dir: &Path, manifest: &WalManifest) -> io::Result<()> {
+    let path = dir.join(MANIFEST_FILE_NAME);
+    let tmp = tmp_path(&path);
+    remove_file_if_exists(&tmp)?;
+    let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    file.write_all(manifest.encode().as_bytes())?;
+    file.flush()?;
+    file.sync_all()?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn checkpoint_records(snapshot: &PersistentSnapshot) -> Vec<Record> {
+    let mut records = Vec::new();
+    records.extend(
+        snapshot
+            .sessions
+            .iter()
+            .map(|(client_id, session)| Record::SessionUpsert {
+                client_id: client_id.clone(),
+                session: session.clone(),
+            }),
+    );
+    records.extend(
+        snapshot
+            .subscriptions
+            .values()
+            .cloned()
+            .map(Record::SubscriptionUpsert),
+    );
+    records.extend(
+        snapshot
+            .retained
+            .iter()
+            .map(|(topic_name, message)| Record::RetainedUpsert {
+                topic_name: topic_name.clone(),
+                message: message.clone(),
+            }),
+    );
+    records.extend(
+        snapshot
+            .offline
+            .iter()
+            .map(|(client_id, queue)| Record::OfflineReplace {
+                client_id: client_id.clone(),
+                queue: queue.clone(),
+            }),
+    );
+    records.extend(
+        snapshot
+            .outbound
+            .iter()
+            .map(|(client_id, outbound)| Record::OutboundReplace {
+                client_id: client_id.clone(),
+                outbound: outbound.clone(),
+            }),
+    );
+    records
+}
+
+fn open_wal_file(path: &Path) -> io::Result<File> {
+    let new_file = !path.exists() || fs::metadata(path)?.len() == 0;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(path)?;
+    if new_file {
+        file.write_all(MAGIC)?;
+        file.flush()?;
+        file.sync_data()?;
+    }
+    Ok(file)
+}
+
+fn create_wal_file(path: &Path) -> io::Result<File> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .append(true)
+        .read(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(MAGIC)?;
+    file.flush()?;
+    file.sync_data()?;
+    Ok(file)
+}
+
+fn cleanup_unreferenced(dir: &Path, active_epoch: Option<u64>) -> io::Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+
+        if name.ends_with(TMP_SUFFIX) {
+            remove_file_if_exists(&path)?;
+            continue;
+        }
+
+        if name == LOG_FILE_NAME {
+            if active_epoch.is_some() {
+                remove_file_if_exists(&path)?;
+            }
+            continue;
+        }
+
+        if let Some(epoch) = wal_epoch_from_file_name(name)
+            && Some(epoch) != active_epoch
+        {
+            remove_file_if_exists(&path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn manifest_file_path(dir: &Path, file_name: &str) -> io::Result<PathBuf> {
+    if Path::new(file_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        != Some(file_name)
+    {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("manifest path must be a file name: {file_name}"),
+        ));
+    }
+    Ok(dir.join(file_name))
+}
+
+fn wal_epoch_path(dir: &Path, epoch: u64) -> PathBuf {
+    dir.join(wal_epoch_file_name(epoch))
+}
+
+fn wal_epoch_file_name(epoch: u64) -> String {
+    format!("{LOG_FILE_NAME}.{epoch}")
+}
+
+fn wal_epoch_from_file_name(name: &str) -> Option<u64> {
+    name.strip_prefix(&format!("{LOG_FILE_NAME}."))?
+        .parse()
+        .ok()
+}
+
+fn tmp_path(path: &Path) -> PathBuf {
+    let mut file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("WAL file name")
+        .to_string();
+    file_name.push_str(TMP_SUFFIX);
+    path.with_file_name(file_name)
+}
+
+fn remove_file_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    match File::open(dir) {
+        Ok(file) => file.sync_all(),
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::PermissionDenied | ErrorKind::IsADirectory
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -594,12 +1096,30 @@ fn sync_outbound_records(
     }]
 }
 
+#[derive(Clone, Copy)]
+enum ReplayMode {
+    AllowCorruptTail,
+    Strict,
+}
+
 fn replay_log(path: &Path) -> io::Result<BrokerState> {
+    replay_log_with_mode(path, ReplayMode::AllowCorruptTail)
+}
+
+fn replay_checkpoint(path: &Path) -> io::Result<BrokerState> {
+    replay_log_with_mode(path, ReplayMode::Strict)
+}
+
+fn replay_log_with_mode(path: &Path, mode: ReplayMode) -> io::Result<BrokerState> {
     let mut state = BrokerState::default();
     if !path.exists() {
         return Ok(state);
     }
+    replay_log_into(path, &mut state, mode)?;
+    Ok(state)
+}
 
+fn replay_log_into(path: &Path, state: &mut BrokerState, mode: ReplayMode) -> io::Result<()> {
     let mut file = File::open(path)?;
     let mut magic = [0u8; MAGIC.len()];
     match file.read_exact(&mut magic) {
@@ -610,7 +1130,15 @@ fn replay_log(path: &Path) -> io::Result<BrokerState> {
                 "invalid Pulse binary log header",
             ));
         }
-        Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(state),
+        Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+            return match mode {
+                ReplayMode::AllowCorruptTail => Ok(()),
+                ReplayMode::Strict => Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "incomplete Pulse binary log header",
+                )),
+            };
+        }
         Err(error) => return Err(error),
     }
 
@@ -626,7 +1154,13 @@ fn replay_log(path: &Path) -> io::Result<BrokerState> {
         let mut payload = vec![0u8; length];
         if let Err(error) = file.read_exact(&mut payload) {
             if error.kind() == ErrorKind::UnexpectedEof {
-                break;
+                return match mode {
+                    ReplayMode::AllowCorruptTail => Ok(()),
+                    ReplayMode::Strict => Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "incomplete Pulse binary log payload",
+                    )),
+                };
             }
             return Err(error);
         }
@@ -634,21 +1168,39 @@ fn replay_log(path: &Path) -> io::Result<BrokerState> {
         let mut checksum = [0u8; 4];
         if let Err(error) = file.read_exact(&mut checksum) {
             if error.kind() == ErrorKind::UnexpectedEof {
-                break;
+                return match mode {
+                    ReplayMode::AllowCorruptTail => Ok(()),
+                    ReplayMode::Strict => Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "incomplete Pulse binary log checksum",
+                    )),
+                };
             }
             return Err(error);
         }
         if crc32(&payload) != u32::from_le_bytes(checksum) {
-            break;
+            return match mode {
+                ReplayMode::AllowCorruptTail => Ok(()),
+                ReplayMode::Strict => Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "Pulse binary log checksum mismatch",
+                )),
+            };
         }
 
         let Some(record) = decode_record(&payload) else {
-            break;
+            return match mode {
+                ReplayMode::AllowCorruptTail => Ok(()),
+                ReplayMode::Strict => Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "invalid Pulse binary log record",
+                )),
+            };
         };
-        apply_record(&mut state, record);
+        apply_record(state, record);
     }
 
-    Ok(state)
+    Ok(())
 }
 
 fn apply_record(state: &mut BrokerState, record: Record) {
@@ -1145,6 +1697,21 @@ mod tests {
         }
     }
 
+    fn wal_epoch_files(dir: &Path) -> Vec<PathBuf> {
+        let mut files = fs::read_dir(dir)
+            .expect("read WAL dir")
+            .map(|entry| entry.expect("dir entry").path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(wal_epoch_from_file_name)
+                    .is_some()
+            })
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+    }
+
     #[test]
     fn recovers_sessions_subscriptions_retained_offline_and_outbound() {
         let dir = temp_dir("recover");
@@ -1215,6 +1782,160 @@ mod tests {
             assert_eq!(retained.payload, Bytes::from_static(b"retained"));
             assert_eq!(retained.expires_at_ms, Some(999));
         });
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn size_trigger_compacts_checkpoint_and_removes_legacy_wal() {
+        let dir = temp_dir("size-compact");
+        {
+            let storage = BinaryStorage::open_with_options(
+                &dir,
+                CommitPolicy::Strict,
+                WalCompactConfig {
+                    max_bytes: MAGIC.len() as u64,
+                    interval_ms: 0,
+                },
+            )
+            .expect("open storage");
+            storage.with_state(&mut |state| {
+                state
+                    .sessions_by_client_id
+                    .insert("client".to_string(), SessionEntry::disconnected(60, None));
+                state.mark_sessions_changed();
+            });
+
+            assert!(dir.join(MANIFEST_FILE_NAME).exists());
+            assert!(dir.join(CHECKPOINT_FILE_NAME).exists());
+            assert!(!dir.join(LOG_FILE_NAME).exists());
+            assert_eq!(wal_epoch_files(&dir).len(), 1);
+        }
+
+        let storage = BinaryStorage::open(&dir, CommitPolicy::Strict).expect("reopen storage");
+        storage.read_state(&mut |state| {
+            assert!(state.sessions_by_client_id.contains_key("client"));
+        });
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn time_trigger_compacts_only_after_a_new_wal_write() {
+        let dir = temp_dir("time-compact");
+        let compact = WalCompactConfig {
+            max_bytes: 0,
+            interval_ms: 1,
+        };
+        {
+            let _storage = BinaryStorage::open_with_options(&dir, CommitPolicy::Strict, compact)
+                .expect("open storage");
+            thread::sleep(Duration::from_millis(2));
+            assert!(!dir.join(MANIFEST_FILE_NAME).exists());
+        }
+
+        {
+            let storage = BinaryStorage::open_with_options(&dir, CommitPolicy::Strict, compact)
+                .expect("reopen storage");
+            thread::sleep(Duration::from_millis(2));
+            storage.with_state(&mut |state| {
+                state
+                    .sessions_by_client_id
+                    .insert("client".to_string(), SessionEntry::disconnected(60, None));
+                state.mark_sessions_changed();
+            });
+            assert!(dir.join(MANIFEST_FILE_NAME).exists());
+            assert!(dir.join(CHECKPOINT_FILE_NAME).exists());
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn compact_recovery_restores_checkpoint_and_active_wal_records() {
+        let dir = temp_dir("checkpoint-active-recover");
+        {
+            let storage = BinaryStorage::open_with_options(
+                &dir,
+                CommitPolicy::Strict,
+                WalCompactConfig {
+                    max_bytes: MAGIC.len() as u64,
+                    interval_ms: 0,
+                },
+            )
+            .expect("open storage");
+            storage.with_state(&mut |state| {
+                state
+                    .sessions_by_client_id
+                    .insert("client".to_string(), SessionEntry::disconnected(60, None));
+                state.mark_sessions_changed();
+            });
+        }
+
+        {
+            let storage = BinaryStorage::open_with_options(
+                &dir,
+                CommitPolicy::Strict,
+                WalCompactConfig {
+                    max_bytes: 0,
+                    interval_ms: 0,
+                },
+            )
+            .expect("reopen storage");
+            storage.with_state(&mut |state| {
+                state.subscriptions.push(SubscriptionEntry {
+                    client_id: "client".to_string(),
+                    filter: "devices/#".to_string(),
+                    match_filter: "devices/#".to_string(),
+                    shared_group: None,
+                    options: SubscriptionOptions {
+                        maximum_qos: QoS::AtLeastOnce,
+                        no_local: false,
+                        retain_as_published: false,
+                        retain_handling: 0,
+                    },
+                    subscription_identifier: None,
+                });
+                state.mark_subscriptions_changed();
+            });
+        }
+
+        let storage = BinaryStorage::open(&dir, CommitPolicy::Strict).expect("recover storage");
+        storage.read_state(&mut |state| {
+            assert!(state.sessions_by_client_id.contains_key("client"));
+            assert_eq!(state.subscriptions.len(), 1);
+        });
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn startup_cleans_tmp_and_unreferenced_epoch_files() {
+        let dir = temp_dir("cleanup");
+        {
+            let storage = BinaryStorage::open_with_options(
+                &dir,
+                CommitPolicy::Strict,
+                WalCompactConfig {
+                    max_bytes: MAGIC.len() as u64,
+                    interval_ms: 0,
+                },
+            )
+            .expect("open storage");
+            storage.with_state(&mut |state| {
+                state
+                    .sessions_by_client_id
+                    .insert("client".to_string(), SessionEntry::disconnected(60, None));
+                state.mark_sessions_changed();
+            });
+        }
+        fs::write(dir.join("broker.checkpoint.tmp"), b"junk").expect("write tmp checkpoint");
+        fs::write(dir.join("broker.manifest.tmp"), b"junk").expect("write tmp manifest");
+        fs::write(dir.join(LOG_FILE_NAME), MAGIC).expect("write stale legacy WAL");
+        fs::write(wal_epoch_path(&dir, 999), MAGIC).expect("write orphan WAL");
+
+        let _storage = BinaryStorage::open(&dir, CommitPolicy::Strict).expect("reopen storage");
+        assert!(!dir.join("broker.checkpoint.tmp").exists());
+        assert!(!dir.join("broker.manifest.tmp").exists());
+        assert!(!dir.join(LOG_FILE_NAME).exists());
+        assert!(!wal_epoch_path(&dir, 999).exists());
+        assert_eq!(wal_epoch_files(&dir).len(), 1);
         let _ = fs::remove_dir_all(dir);
     }
 

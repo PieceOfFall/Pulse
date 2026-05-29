@@ -75,6 +75,7 @@ async fn run(config: AppConfig) -> Result<()> {
             Broker::with_binary_auth_and_config(
                 dir,
                 config.storage.commit_policy,
+                config.storage.wal_compact,
                 config.limits,
                 authenticator.clone(),
             )

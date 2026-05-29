@@ -4,6 +4,7 @@ mod mysql;
 mod sqlite;
 
 pub(super) use binary::BinaryStorage;
+pub(crate) use binary::WalCompactConfig;
 pub(super) use memory::InMemoryStorage;
 pub(super) use mysql::MysqlStorage;
 pub(super) use sqlite::SqliteStorage;

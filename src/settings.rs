@@ -10,6 +10,7 @@ use std::{
 use serde::Deserialize;
 
 use crate::broker::{
+    WalCompactConfig,
     runtime::{
         auth::AuthConfig,
         config::{BrokerConfig, SlowConsumerPolicy},
@@ -94,6 +95,7 @@ pub(crate) struct StorageConfig {
     pub(crate) mysql: Option<String>,
     pub(crate) wal_dir: Option<PathBuf>,
     pub(crate) commit_policy: CommitPolicy,
+    pub(crate) wal_compact: WalCompactConfig,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -179,6 +181,8 @@ struct StorageFileConfig {
     mysql: Option<String>,
     wal_dir: Option<PathBuf>,
     commit_policy: Option<CommitPolicy>,
+    wal_compact_max_bytes: Option<u64>,
+    wal_compact_interval_ms: Option<u64>,
 }
 
 #[derive(Default, Deserialize)]
@@ -287,6 +291,8 @@ impl AppConfig {
             mysql: env_string("MQTT_RS_MYSQL"),
             wal_dir: env_path("MQTT_RS_WAL_DIR"),
             commit_policy: env_parse("MQTT_RS_STORAGE_COMMIT_POLICY")?,
+            wal_compact_max_bytes: env_parse("MQTT_RS_WAL_COMPACT_MAX_BYTES")?,
+            wal_compact_interval_ms: env_parse("MQTT_RS_WAL_COMPACT_INTERVAL_MS")?,
         });
         self.apply_limits(LimitsFileConfig {
             server_receive_maximum: env_parse("MQTT_RS_SERVER_RECEIVE_MAXIMUM")?,
@@ -367,6 +373,12 @@ impl AppConfig {
         }
         if let Some(commit_policy) = storage.commit_policy {
             self.storage.commit_policy = commit_policy;
+        }
+        if let Some(max_bytes) = storage.wal_compact_max_bytes {
+            self.storage.wal_compact.max_bytes = max_bytes;
+        }
+        if let Some(interval_ms) = storage.wal_compact_interval_ms {
+            self.storage.wal_compact.interval_ms = interval_ms;
         }
     }
 
@@ -501,6 +513,7 @@ fn default_storage_config() -> StorageConfig {
         mysql: None,
         wal_dir: None,
         commit_policy: CommitPolicy::default(),
+        wal_compact: WalCompactConfig::default(),
     }
 }
 
@@ -580,6 +593,12 @@ fn parse_cli(
             "--wal-dir" => config.storage.wal_dir = Some(next_path(&mut args, arg.as_ref())?),
             "--storage-commit-policy" => {
                 config.storage.commit_policy = Some(next_parse(&mut args, arg.as_ref())?)
+            }
+            "--wal-compact-max-bytes" => {
+                config.storage.wal_compact_max_bytes = Some(next_parse(&mut args, arg.as_ref())?)
+            }
+            "--wal-compact-interval-ms" => {
+                config.storage.wal_compact_interval_ms = Some(next_parse(&mut args, arg.as_ref())?)
             }
             "--outbound-queue-size" => {
                 config.server.outbound_queue_size = Some(next_parse(&mut args, arg.as_ref())?)
@@ -676,6 +695,7 @@ mod tests {
     use std::{
         env,
         ffi::OsString,
+        fs,
         path::PathBuf,
         sync::{Mutex, MutexGuard},
     };
@@ -705,6 +725,8 @@ mod tests {
         "MQTT_RS_MYSQL",
         "MQTT_RS_WAL_DIR",
         "MQTT_RS_STORAGE_COMMIT_POLICY",
+        "MQTT_RS_WAL_COMPACT_MAX_BYTES",
+        "MQTT_RS_WAL_COMPACT_INTERVAL_MS",
         "MQTT_RS_SERVER_RECEIVE_MAXIMUM",
         "MQTT_RS_SERVER_MAXIMUM_PACKET_SIZE",
         "MQTT_RS_SERVER_TOPIC_ALIAS_MAXIMUM",
@@ -797,6 +819,8 @@ mod tests {
         #[cfg(not(windows))]
         assert_eq!(config.storage.engine, StorageEngine::Memory);
         assert_eq!(config.storage.commit_policy, CommitPolicy::Balanced);
+        assert_eq!(config.storage.wal_compact.max_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.storage.wal_compact.interval_ms, 10 * 60 * 1000);
         assert_eq!(config.limits.server_receive_maximum, SERVER_RECEIVE_MAXIMUM);
         assert_eq!(
             config.limits.server_maximum_packet_size,
@@ -839,6 +863,8 @@ mod tests {
             engine = "wal"
             wal_dir = "data/wal"
             commit_policy = "strict"
+            wal_compact_max_bytes = 1024
+            wal_compact_interval_ms = 0
 
             [limits]
             slow_consumer_policy = "queue-offline"
@@ -854,6 +880,8 @@ mod tests {
         assert_eq!(config.storage.engine, StorageEngine::Wal);
         assert_eq!(config.storage.wal_dir, Some(PathBuf::from("data/wal")));
         assert_eq!(config.storage.commit_policy, CommitPolicy::Strict);
+        assert_eq!(config.storage.wal_compact.max_bytes, 1024);
+        assert_eq!(config.storage.wal_compact.interval_ms, 0);
         assert_eq!(
             config.limits.slow_consumer_policy,
             SlowConsumerPolicy::QueueOffline
@@ -873,6 +901,10 @@ mod tests {
             "data/wal",
             "--storage-commit-policy",
             "fast",
+            "--wal-compact-max-bytes",
+            "2048",
+            "--wal-compact-interval-ms",
+            "0",
             "--slow-consumer-policy",
             "disconnect",
         ]
@@ -884,10 +916,53 @@ mod tests {
         assert_eq!(config.storage.engine, StorageEngine::Wal);
         assert_eq!(config.storage.wal_dir, Some(PathBuf::from("data/wal")));
         assert_eq!(config.storage.commit_policy, CommitPolicy::Fast);
+        assert_eq!(config.storage.wal_compact.max_bytes, 2048);
+        assert_eq!(config.storage.wal_compact.interval_ms, 0);
         assert_eq!(
             config.limits.slow_consumer_policy,
             SlowConsumerPolicy::Disconnect
         );
+    }
+
+    #[test]
+    fn wal_compact_config_follows_cli_env_file_precedence() {
+        let config_path = env::temp_dir().join(format!(
+            "pulse-config-wal-compact-{}.toml",
+            std::process::id()
+        ));
+        fs::write(
+            &config_path,
+            r#"
+            [storage]
+            engine = "wal"
+            wal_compact_max_bytes = 111
+            wal_compact_interval_ms = 222
+            "#,
+        )
+        .expect("write config file");
+
+        let _env = EnvGuard::set_tls(&[
+            ("MQTT_RS_WAL_COMPACT_MAX_BYTES", "333"),
+            ("MQTT_RS_WAL_COMPACT_INTERVAL_MS", "444"),
+        ]);
+        let args = [
+            "Pulse",
+            "--config",
+            config_path.to_str().expect("config path"),
+            "--wal-compact-max-bytes",
+            "0",
+            "--wal-compact-interval-ms",
+            "555",
+        ]
+        .into_iter()
+        .map(OsString::from);
+        let config = AppConfig::load_from_args(args).expect("load config");
+
+        assert_eq!(config.storage.engine, StorageEngine::Wal);
+        assert_eq!(config.storage.wal_compact.max_bytes, 0);
+        assert_eq!(config.storage.wal_compact.interval_ms, 555);
+
+        let _ = fs::remove_file(config_path);
     }
 
     #[test]

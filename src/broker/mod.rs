@@ -28,6 +28,8 @@ use self::storage::{BinaryStorage, BrokerStorage, InMemoryStorage, MysqlStorage,
 use self::vnext::CommitPolicy;
 use crate::{observability::metrics, protocol};
 
+pub(crate) use self::storage::WalCompactConfig;
+
 const KEEP_ALIVE_MONITOR_INTERVAL: Duration = Duration::from_millis(100);
 const METRICS_RECORD_INTERVAL_MS: u64 = 1_000;
 
@@ -121,11 +123,16 @@ impl Broker {
     pub(crate) fn with_binary_auth_and_config(
         dir: impl AsRef<Path>,
         commit_policy: CommitPolicy,
+        compact: WalCompactConfig,
         config: BrokerConfig,
         authenticator: Arc<dyn Authenticator>,
     ) -> std::io::Result<Self> {
         Ok(Self::with_storage(
-            Arc::new(BinaryStorage::open(dir, commit_policy)?),
+            Arc::new(BinaryStorage::open_with_options(
+                dir,
+                commit_policy,
+                compact,
+            )?),
             config,
             authenticator,
         ))

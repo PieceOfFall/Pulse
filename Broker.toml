@@ -33,14 +33,35 @@ client_auth = "disabled"
 # client_ca = "certs/client-ca.pem"
 
 [storage]
+# Storage engine: memory, wal, sqlite, or mysql.
+# memory is volatile and best for local testing. wal is the recommended
+# lightweight persistent engine for normal broker use.
+# engine = "wal"
+
+# Binary WAL directory used when engine = "wal". If omitted while WAL is
+# selected, Pulse stores state under ./pulse-wal.
+# wal_dir = "pulse-wal"
+
+# WAL durability policy: strict, balanced, or fast.
+# strict fsyncs every write, balanced batches fsyncs, and fast writes through a
+# background writer with the highest throughput but weakest crash guarantees.
+# commit_policy = "balanced"
+
+# WAL checkpoint compaction triggers. Set either value to 0 to disable that
+# trigger. These options are ignored unless engine = "wal".
+# wal_compact_max_bytes = 67108864
+# wal_compact_interval_ms = 600000
+
 # Optional SQLite database path for persistent sessions, subscriptions,
 # retained messages, outbound inflight packets, and offline queues.
-# Leave commented to use the platform default: in-memory on Unix-like builds,
-# and C:\ProgramData\Pulse\broker.db for Windows MSI installs.
+# Setting sqlite also selects the SQLite engine.
+# If no storage backend is configured, Windows MSI installs use
+# C:\ProgramData\Pulse\broker.db by default.
 # sqlite = "broker.db"
 
 # Optional MySQL connection URL for persistent broker state.
-# Do not set both sqlite and mysql at the same time.
+# Setting mysql also selects the MySQL engine. Do not set both sqlite and mysql
+# at the same time.
 # mysql = "mysql://user:password@localhost:3306/mqtt"
 
 [limits]
