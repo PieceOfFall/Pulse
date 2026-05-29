@@ -215,7 +215,7 @@ impl Default for AppConfig {
             server: ServerConfig {
                 bind: "0.0.0.0:1883".to_string(),
                 worker_threads: default_worker_threads(),
-                outbound_queue_size: 1024,
+                outbound_queue_size: 1,
                 shutdown_drain_timeout_ms: 5_000,
                 tls: ServerTlsConfig::default(),
             },
@@ -478,9 +478,7 @@ fn default_config_path() -> PathBuf {
 }
 
 fn default_worker_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|threads| threads.get())
-        .unwrap_or(1)
+    1
 }
 
 #[cfg(windows)]

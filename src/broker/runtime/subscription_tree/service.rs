@@ -20,11 +20,7 @@ impl Broker {
     ) -> (SubAckPacket, Vec<Delivery>) {
         let config = *self.config();
         self.with_state(|state| {
-            let Some(client_id) = state
-                .clients_by_connection
-                .get(&connection_id)
-                .map(|client| client.client_id.clone())
-            else {
+            let Some(client) = state.clients_by_connection.get(&connection_id) else {
                 return (
                     SubAckPacket {
                         packet_id: packet.packet_id,
@@ -34,11 +30,10 @@ impl Broker {
                     Vec::new(),
                 );
             };
-            let principal = state
-                .clients_by_connection
-                .get(&connection_id)
-                .and_then(|client| client.principal.as_deref())
-                .map(str::to_string);
+            let client_id = client.client_id.clone();
+            let principal = client.principal.clone();
+            let persistent_session = client.persistent_session;
+            let mut subscription_count = client.subscription_count;
 
             let mut reason_codes = Vec::with_capacity(packet.subscriptions.len());
             let mut retained_deliveries = Vec::new();
@@ -57,14 +52,18 @@ impl Broker {
                     reason_codes.push(protocol::NOT_AUTHORIZED);
                     continue;
                 }
-                let (current_subscription_count, existing_index) = subscription_position_and_count(
-                    &state.subscriptions,
-                    &client_id,
-                    &subscription.topic_filter,
-                );
+                let known_subscription_count = subscription_count + inserted_count;
+                let existing_index = if known_subscription_count == 0 {
+                    None
+                } else {
+                    subscription_position(
+                        &state.subscriptions,
+                        &client_id,
+                        &subscription.topic_filter,
+                    )
+                };
                 if existing_index.is_none()
-                    && current_subscription_count + inserted_count
-                        >= config.max_subscriptions_per_client
+                    && known_subscription_count >= config.max_subscriptions_per_client
                 {
                     reason_codes.push(protocol::QUOTA_EXCEEDED);
                     continue;
@@ -78,7 +77,9 @@ impl Broker {
                     existing_index,
                 );
                 let stored = state.subscriptions[upsert.index].clone();
-                state.mark_subscriptions_changed();
+                if persistent_session {
+                    state.mark_subscriptions_changed();
+                }
                 reason_codes.push(protocol::granted_qos_code(stored.options.maximum_qos));
                 if upsert.inserted {
                     inserted_count += 1;
@@ -88,7 +89,18 @@ impl Broker {
                     stored.options.retain_handling,
                     upsert.inserted,
                 ) {
-                    retained_deliveries.extend(retained_for_subscription(state, &stored, &config));
+                    let retained = retained_for_subscription(state, &stored, &config);
+                    if retained_deliveries.is_empty() {
+                        retained_deliveries = retained;
+                    } else {
+                        retained_deliveries.extend(retained);
+                    }
+                }
+            }
+            if inserted_count != 0 {
+                subscription_count += inserted_count;
+                if let Some(client) = state.clients_by_connection.get_mut(&connection_id) {
+                    client.subscription_count = subscription_count;
                 }
             }
 
@@ -113,17 +125,27 @@ impl Broker {
         packet: UnsubscribePacket,
     ) -> UnsubAckPacket {
         self.with_state(|state| {
-            if let Some(client_id) = state
+            if let Some((client_id, persistent_session)) = state
                 .clients_by_connection
                 .get(&connection_id)
-                .map(|client| client.client_id.clone())
+                .map(|client| (client.client_id.clone(), client.persistent_session))
             {
+                let subscription_count = state.subscriptions.len();
                 for filter in &packet.topic_filters {
                     state
                         .subscriptions
                         .retain(|sub| !(sub.client_id == client_id && sub.filter == *filter));
                 }
-                state.mark_subscriptions_changed();
+                let removed_count = subscription_count.saturating_sub(state.subscriptions.len());
+                if removed_count != 0 {
+                    if let Some(client) = state.clients_by_connection.get_mut(&connection_id) {
+                        client.subscription_count =
+                            client.subscription_count.saturating_sub(removed_count);
+                    }
+                    if persistent_session {
+                        state.mark_subscriptions_changed();
+                    }
+                }
             }
 
             UnsubAckPacket {
@@ -135,22 +157,17 @@ impl Broker {
     }
 }
 
-fn subscription_position_and_count(
+fn subscription_position(
     subscriptions: &[super::SubscriptionEntry],
     client_id: &str,
     topic_filter: &str,
-) -> (usize, Option<usize>) {
-    let mut count = 0;
-    let mut position = None;
+) -> Option<usize> {
     for (index, subscription) in subscriptions.iter().enumerate() {
-        if subscription.client_id == client_id {
-            count += 1;
-            if subscription.filter == topic_filter {
-                position = Some(index);
-            }
+        if subscription.client_id == client_id && subscription.filter == topic_filter {
+            return Some(index);
         }
     }
-    (count, position)
+    None
 }
 
 fn should_send_retained_on_subscribe(retain_handling: u8, inserted: bool) -> bool {

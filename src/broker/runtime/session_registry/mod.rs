@@ -1,13 +1,13 @@
-use std::collections::{HashMap, HashSet, VecDeque};
-
-use rs_netty::{
-    Channel,
-    codec::{MqttPacket, Will},
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::{Arc, atomic::AtomicU64},
 };
+
+use rs_netty::{Channel, codec::Will};
 
 use super::{
     message::PendingPublish, retained_store::RetainedStore, subscription_tree::SubscriptionEntry,
-    time::now_ms,
+    time::now_ms, write::BrokerWrite,
 };
 use crate::observability::metrics;
 
@@ -104,10 +104,15 @@ impl BrokerState {
             .retain(|(conn_id, _), _| *conn_id != connection_id);
         if !preserve_session && client.session_expiry_interval == 0 {
             self.sessions_by_client_id.remove(&client.client_id);
+            let subscription_count = self.subscriptions.len();
             self.subscriptions
                 .retain(|sub| sub.client_id != client.client_id);
-            self.mark_sessions_changed();
-            self.mark_subscriptions_changed();
+            if client.persistent_session {
+                self.mark_sessions_changed();
+                if self.subscriptions.len() != subscription_count {
+                    self.mark_subscriptions_changed();
+                }
+            }
         } else if !preserve_session {
             let expires_at_ms = session_expires_at_ms(client.session_expiry_interval);
             self.sessions_by_client_id
@@ -175,23 +180,28 @@ impl SessionEntry {
 
 pub(in crate::broker) struct ClientEntry {
     pub(in crate::broker) client_id: String,
-    pub(in crate::broker) channel: Channel<MqttPacket>,
+    pub(in crate::broker) channel: Channel<BrokerWrite>,
     pub(in crate::broker) will: Option<Will>,
     pub(in crate::broker) principal: Option<String>,
     pub(in crate::broker) session_expiry_interval: u32,
     pub(in crate::broker) receive_maximum: u16,
     pub(in crate::broker) maximum_packet_size: u32,
+    pub(in crate::broker) keep_alive_deadline_ms: Arc<AtomicU64>,
+    pub(in crate::broker) persistent_session: bool,
+    pub(in crate::broker) subscription_count: usize,
 }
 
 impl ClientEntry {
     pub(in crate::broker) fn new(
         client_id: String,
-        channel: Channel<MqttPacket>,
+        channel: Channel<BrokerWrite>,
         will: Option<Will>,
         principal: Option<String>,
         session_expiry_interval: u32,
         receive_maximum: u16,
         maximum_packet_size: u32,
+        persistent_session: bool,
+        subscription_count: usize,
     ) -> Self {
         Self {
             client_id,
@@ -201,6 +211,9 @@ impl ClientEntry {
             session_expiry_interval,
             receive_maximum,
             maximum_packet_size,
+            keep_alive_deadline_ms: Arc::new(AtomicU64::new(0)),
+            persistent_session,
+            subscription_count,
         }
     }
 }

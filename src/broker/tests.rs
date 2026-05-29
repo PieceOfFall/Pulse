@@ -24,6 +24,7 @@ use super::{
             MAX_SUBSCRIPTIONS_PER_CLIENT,
         },
         subscription_tree::{SubscriptionEntry, upsert_subscription},
+        write::PulseMqttCodec,
     },
 };
 use crate::protocol;
@@ -1907,6 +1908,46 @@ async fn retained_qos2_publish_replays_at_subscriber_qos() -> rs_netty::Result<(
 }
 
 #[tokio::test]
+async fn retained_replay_preserves_subscription_identifier() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut publisher = broker.connect("publisher").await?;
+    publisher
+        .write(publish_with_retain(
+            "devices/retained-identifier",
+            QoS::AtMostOnce,
+            None,
+            "sticky",
+            true,
+        ))
+        .await?;
+
+    let mut subscriber = broker.connect("subscriber").await?;
+    subscriber
+        .write(subscribe_with_subscription_identifier(
+            1,
+            "devices/retained-identifier",
+            QoS::AtMostOnce,
+            7,
+        ))
+        .await?;
+    assert!(matches!(subscriber.read().await?, MqttPacket::SubAck(_)));
+
+    let packet = subscriber
+        .expect_publish("expected retained publish")
+        .await?;
+    assert!(packet.retain);
+    assert_eq!(packet.payload, Bytes::from_static(b"sticky"));
+    assert!(
+        packet
+            .properties
+            .iter()
+            .any(|property| matches!(property, MqttProperty::SubscriptionIdentifier(7)))
+    );
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
 async fn retain_handling_one_replays_only_for_new_subscription() -> rs_netty::Result<()> {
     let broker = TestBroker::start().await?;
     let mut publisher = broker.connect("publisher").await?;
@@ -2022,7 +2063,7 @@ impl TestBroker {
             .life(BrokerLife::new(broker.clone()))
             .pipeline(move || {
                 pipeline()
-                    .codec(MqttCodec::with_max_packet_size(1024 * 1024))
+                    .codec(PulseMqttCodec::with_max_packet_size(1024 * 1024))
                     .handler(MqttHandler::new(broker_for_pipeline.clone()))
             })
             .start()

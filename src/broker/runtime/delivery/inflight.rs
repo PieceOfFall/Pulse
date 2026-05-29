@@ -12,6 +12,7 @@ use crate::broker::runtime::{
     message::{PendingPublish, is_message_expired},
     session_registry::{BrokerState, SessionEntry},
     time::now_ms,
+    write::BrokerWrite,
 };
 
 pub(in crate::broker) fn redeliveries_for_client(
@@ -50,7 +51,7 @@ pub(in crate::broker) fn redeliveries_for_client(
             packet.packet_id = Some(*packet_id);
             fits_maximum_packet_size(&packet, maximum_packet_size).then(|| Delivery {
                 channel: channel.clone(),
-                packet: MqttPacket::Publish(packet),
+                packet: MqttPacket::Publish(packet).into(),
             })
         })
         .collect();
@@ -115,7 +116,7 @@ pub(in crate::broker) fn retransmissions_for_connection(
             packet.packet_id = Some(*packet_id);
             fits_maximum_packet_size(&packet, maximum_packet_size).then(|| Delivery {
                 channel: channel.clone(),
-                packet: MqttPacket::Publish(packet),
+                packet: MqttPacket::Publish(packet).into(),
             })
         })
         .collect();
@@ -126,7 +127,8 @@ pub(in crate::broker) fn retransmissions_for_connection(
             .iter()
             .map(|packet_id| Delivery {
                 channel: channel.clone(),
-                packet: MqttPacket::PubRel(AckPacket::new(*packet_id, crate::protocol::SUCCESS)),
+                packet: MqttPacket::PubRel(AckPacket::new(*packet_id, crate::protocol::SUCCESS))
+                    .into(),
             }),
     );
 
@@ -228,13 +230,14 @@ pub(super) fn delivery_for_client(
             packet_id,
             false,
             subscription_identifier,
-        )),
+        ))
+        .into(),
     })
 }
 
 fn flush_queued_for_session(
     session: &mut SessionEntry,
-    channel: Channel<MqttPacket>,
+    channel: Channel<BrokerWrite>,
     receive_maximum: u16,
     maximum_packet_size: u32,
 ) -> Vec<Delivery> {
@@ -292,7 +295,7 @@ fn flush_queued_for_session(
         }
         deliveries.push(Delivery {
             channel: channel.clone(),
-            packet: MqttPacket::Publish(packet),
+            packet: MqttPacket::Publish(packet).into(),
         });
     }
 

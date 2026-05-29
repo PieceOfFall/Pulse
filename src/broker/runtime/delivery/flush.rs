@@ -1,9 +1,6 @@
 use super::Delivery;
-use crate::observability::metrics;
-use rs_netty::{
-    Context, Result,
-    codec::{MqttPacket, QoS},
-};
+use crate::{broker::runtime::write::BrokerWrite, observability::metrics};
+use rs_netty::{Context, Result, codec::QoS};
 use std::collections::HashSet;
 
 pub(in crate::broker) async fn flush_deliveries(deliveries: Vec<Delivery>) {
@@ -17,8 +14,8 @@ pub(in crate::broker) async fn flush_deliveries(deliveries: Vec<Delivery>) {
     let mut flush_channel_ids = HashSet::new();
 
     for delivery in deliveries {
-        if let MqttPacket::Publish(packet) = &delivery.packet {
-            metrics::publish_sent(qos_name(packet.qos));
+        if let Some(qos) = delivery.packet.publish_qos() {
+            metrics::publish_sent(qos_name(qos));
         }
 
         let channel = delivery.channel;
@@ -42,18 +39,33 @@ pub(in crate::broker) async fn flush_deliveries(deliveries: Vec<Delivery>) {
 }
 
 pub(in crate::broker) async fn flush_deliveries_to_context(
-    ctx: &mut Context<MqttPacket>,
+    ctx: &mut Context<BrokerWrite>,
     deliveries: Vec<Delivery>,
 ) -> Result<()> {
     if deliveries.is_empty() {
         return Ok(());
     }
 
+    if deliveries.len() == 1 {
+        let delivery = deliveries.into_iter().next().expect("single delivery");
+        if delivery.channel.id() == ctx.id() {
+            if let Some(qos) = delivery.packet.publish_qos() {
+                metrics::publish_sent(qos_name(qos));
+            }
+            ctx.write(delivery.packet).await?;
+            let _flush = ctx.flush();
+            return Ok(());
+        }
+
+        flush_single_delivery_via_channel(delivery).await;
+        return Ok(());
+    }
+
     let mut external = Vec::new();
     for delivery in deliveries {
         if delivery.channel.id() == ctx.id() {
-            if let MqttPacket::Publish(packet) = &delivery.packet {
-                metrics::publish_sent(qos_name(packet.qos));
+            if let Some(qos) = delivery.packet.publish_qos() {
+                metrics::publish_sent(qos_name(qos));
             }
             ctx.write(delivery.packet).await?;
         } else {
@@ -69,8 +81,8 @@ pub(in crate::broker) async fn flush_deliveries_to_context(
 }
 
 async fn flush_single_delivery_via_channel(delivery: Delivery) {
-    if let MqttPacket::Publish(packet) = &delivery.packet {
-        metrics::publish_sent(qos_name(packet.qos));
+    if let Some(qos) = delivery.packet.publish_qos() {
+        metrics::publish_sent(qos_name(qos));
     }
     let channel = delivery.channel;
     if channel.write(delivery.packet).await.is_err() {

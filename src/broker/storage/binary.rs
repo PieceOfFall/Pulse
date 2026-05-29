@@ -67,15 +67,12 @@ impl BrokerStorage for BinaryStorage {
         operation(&mut inner.state);
 
         let changes = inner.state.take_persistence_changes();
-        let records = if changes.is_empty() {
-            let next_snapshot = PersistentSnapshot::from_state(&inner.state);
-            let records = diff_records(&inner.snapshot, &next_snapshot);
-            inner.snapshot = next_snapshot;
-            records
-        } else {
-            let BinaryStorageInner { state, snapshot } = &mut *inner;
-            diff_records_for_changes(snapshot, state, changes)
-        };
+        if changes.is_empty() {
+            return;
+        }
+
+        let BinaryStorageInner { state, snapshot } = &mut *inner;
+        let records = diff_records_for_changes(snapshot, state, changes);
         if !records.is_empty() {
             self.log
                 .lock()
@@ -381,74 +378,6 @@ enum Record {
     },
 }
 
-fn diff_records(previous: &PersistentSnapshot, next: &PersistentSnapshot) -> Vec<Record> {
-    let mut records = Vec::new();
-
-    for (client_id, session) in &next.sessions {
-        if previous.sessions.get(client_id) != Some(session) {
-            records.push(Record::SessionUpsert {
-                client_id: client_id.clone(),
-                session: session.clone(),
-            });
-        }
-    }
-    for client_id in previous.sessions.keys() {
-        if !next.sessions.contains_key(client_id) {
-            records.push(Record::SessionDelete {
-                client_id: client_id.clone(),
-            });
-        }
-    }
-
-    for (key, subscription) in &next.subscriptions {
-        if previous.subscriptions.get(key) != Some(subscription) {
-            records.push(Record::SubscriptionUpsert(subscription.clone()));
-        }
-    }
-    for (client_id, filter) in previous.subscriptions.keys() {
-        if !next
-            .subscriptions
-            .contains_key(&(client_id.clone(), filter.clone()))
-        {
-            records.push(Record::SubscriptionDelete {
-                client_id: client_id.clone(),
-                filter: filter.clone(),
-            });
-        }
-    }
-
-    for (topic_name, message) in &next.retained {
-        if previous.retained.get(topic_name) != Some(message) {
-            records.push(Record::RetainedUpsert {
-                topic_name: topic_name.clone(),
-                message: message.clone(),
-            });
-        }
-    }
-    for topic_name in previous.retained.keys() {
-        if !next.retained.contains_key(topic_name) {
-            records.push(Record::RetainedDelete {
-                topic_name: topic_name.clone(),
-            });
-        }
-    }
-
-    for client_id in changed_keys(&previous.offline, &next.offline) {
-        records.push(Record::OfflineReplace {
-            queue: next.offline.get(&client_id).cloned().unwrap_or_default(),
-            client_id,
-        });
-    }
-    for client_id in changed_keys(&previous.outbound, &next.outbound) {
-        records.push(Record::OutboundReplace {
-            outbound: next.outbound.get(&client_id).cloned().unwrap_or_default(),
-            client_id,
-        });
-    }
-
-    records
-}
-
 fn diff_records_for_changes(
     snapshot: &mut PersistentSnapshot,
     state: &BrokerState,
@@ -663,24 +592,6 @@ fn sync_outbound_records(
         client_id: client_id.to_string(),
         outbound: next,
     }]
-}
-
-fn changed_keys<T: PartialEq>(
-    previous: &HashMap<String, T>,
-    next: &HashMap<String, T>,
-) -> Vec<String> {
-    let mut keys = Vec::new();
-    for (key, value) in next {
-        if previous.get(key) != Some(value) {
-            keys.push(key.clone());
-        }
-    }
-    for key in previous.keys() {
-        if !next.contains_key(key) {
-            keys.push(key.clone());
-        }
-    }
-    keys
 }
 
 fn replay_log(path: &Path) -> io::Result<BrokerState> {
@@ -1148,13 +1059,13 @@ fn encode_retained(message: &RetainedMessage) -> Vec<u8> {
 
 fn decode_retained(packet: &[u8]) -> Option<RetainedMessage> {
     let packet = decode_publish(packet)?;
-    Some(RetainedMessage {
-        qos: packet.qos,
-        topic_name: packet.topic_name,
-        properties: packet.properties,
-        payload: Bytes::copy_from_slice(&packet.payload),
-        expires_at_ms: None,
-    })
+    Some(RetainedMessage::new(
+        packet.qos,
+        packet.topic_name,
+        packet.properties,
+        Bytes::copy_from_slice(&packet.payload),
+        None,
+    ))
 }
 
 fn encode_publish(packet: &PublishPacket) -> Vec<u8> {
@@ -1276,14 +1187,19 @@ mod tests {
                 });
                 state.retained.insert(
                     "devices/retained".to_string(),
-                    RetainedMessage {
-                        qos: QoS::AtMostOnce,
-                        topic_name: "devices/retained".to_string(),
-                        properties: Vec::new(),
-                        payload: Bytes::from_static(b"retained"),
-                        expires_at_ms: Some(999),
-                    },
+                    RetainedMessage::new(
+                        QoS::AtMostOnce,
+                        "devices/retained".to_string(),
+                        Vec::new(),
+                        Bytes::from_static(b"retained"),
+                        Some(999),
+                    ),
                 );
+                state.mark_sessions_changed();
+                state.mark_subscriptions_changed();
+                state.mark_retained_changed();
+                state.mark_offline_changed("client");
+                state.mark_outbound_changed("client");
             });
         }
 
@@ -1311,6 +1227,7 @@ mod tests {
                 state
                     .sessions_by_client_id
                     .insert("client".to_string(), SessionEntry::disconnected(60, None));
+                state.mark_sessions_changed();
             });
         }
 
@@ -1337,6 +1254,7 @@ mod tests {
                 state
                     .sessions_by_client_id
                     .insert("client".to_string(), SessionEntry::disconnected(60, None));
+                state.mark_sessions_changed();
             });
         }
 

@@ -138,7 +138,7 @@ pub(in crate::broker) fn qos0_deliveries_for_publish_readonly(
 
         deliveries.push(Delivery {
             channel: client.channel.clone(),
-            packet: MqttPacket::Publish(publish),
+            packet: MqttPacket::Publish(publish).into(),
         });
     }
 

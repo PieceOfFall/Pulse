@@ -250,14 +250,14 @@ RSS values are MiB for the broker process.
 
 | Broker | Scenario | Count | Seconds | Rate/sec | Base RSS | Peak RSS | End RSS |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Pulse-wal | qos0-throughput | 10000 | 0.1169 | 85539.33 | 3.70 | 5.42 | 5.42 |
-| Pulse-wal | qos1-throughput | 10000 | 0.4276 | 23387.71 | 3.70 | 5.70 | 5.70 |
-| Pulse-wal | qos2-throughput | 10000 | 0.9196 | 10874.25 | 3.70 | 5.91 | 5.91 |
-| Pulse-wal | retained-fanout | 100 | 0.0095 | 10497.77 | 3.70 | 10.86 | 10.86 |
-| Mosquitto-persist | qos0-throughput | 10000 | 0.1187 | 84266.85 | 4.42 | 5.34 | 5.34 |
-| Mosquitto-persist | qos1-throughput | 10000 | 1.0698 | 9347.75 | 4.42 | 5.34 | 5.34 |
-| Mosquitto-persist | qos2-throughput | 10000 | 1.6935 | 5904.89 | 4.42 | 5.34 | 5.34 |
-| Mosquitto-persist | retained-fanout | 100 | 0.0089 | 11179.48 | 4.42 | 5.86 | 5.86 |
+| Pulse-wal | qos0-throughput | 10000 | 0.1067 | 93731.44 | 3.30 | 3.75 | 3.75 |
+| Pulse-wal | qos1-throughput | 10000 | 0.4401 | 22720.43 | 3.30 | 3.95 | 3.95 |
+| Pulse-wal | qos2-throughput | 10000 | 0.8511 | 11749.59 | 3.30 | 3.95 | 3.95 |
+| Pulse-wal | retained-fanout | 100 | 0.0115 | 8709.95 | 3.30 | 5.86 | 5.86 |
+| Mosquitto-persist | qos0-throughput | 10000 | 0.1177 | 84970.82 | 4.44 | 5.44 | 5.44 |
+| Mosquitto-persist | qos1-throughput | 10000 | 1.0956 | 9127.19 | 4.44 | 5.45 | 5.45 |
+| Mosquitto-persist | qos2-throughput | 10000 | 1.5980 | 6257.68 | 4.44 | 5.48 | 5.48 |
+| Mosquitto-persist | retained-fanout | 100 | 0.0101 | 9930.77 | 4.44 | 6.00 | 6.00 |
 
 ## Roadmap
 

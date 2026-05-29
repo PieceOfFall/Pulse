@@ -49,13 +49,13 @@ pub(super) fn decode_retained(packet: &[u8]) -> Option<RetainedMessage> {
         return None;
     };
 
-    Some(RetainedMessage {
-        qos: packet.qos,
-        topic_name: packet.topic_name,
-        properties: packet.properties,
-        payload: Bytes::copy_from_slice(&packet.payload),
-        expires_at_ms: None,
-    })
+    Some(RetainedMessage::new(
+        packet.qos,
+        packet.topic_name,
+        packet.properties,
+        Bytes::copy_from_slice(&packet.payload),
+        None,
+    ))
 }
 
 pub(super) fn decode_publish(packet: &[u8]) -> Option<PublishPacket> {

@@ -6,16 +6,41 @@ mod tls;
 
 use std::{fs, path::Path, sync::Arc, time::Duration};
 
-use broker::{Broker, BrokerLife, MqttHandler, runtime::auth::ConfiguredAuthenticator};
-use rs_netty::{Error, Result, TcpServer, codec::MqttCodec, pipeline};
+use broker::{
+    Broker, BrokerLife, MqttHandler,
+    runtime::{auth::ConfiguredAuthenticator, write::PulseMqttCodec},
+};
+use rs_netty::{Error, Result, TcpServer, pipeline};
 use settings::{AppConfig, StorageEngine};
 use tls::build_server_tls_context;
+use tokio::runtime::{Builder, Runtime};
 use tracing::info;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+const INITIAL_CONNECTION_BUFFER_BYTES: usize = 0;
+
+fn main() -> Result<()> {
     let config = AppConfig::load()
         .map_err(|error| Error::Pipeline(format!("load configuration: {error}")))?;
+    let runtime = build_runtime(config.server.worker_threads)?;
+    runtime.block_on(run(config))
+}
+
+fn build_runtime(worker_threads: usize) -> Result<Runtime> {
+    let mut builder = if worker_threads == 1 {
+        Builder::new_current_thread()
+    } else {
+        let mut builder = Builder::new_multi_thread();
+        builder.worker_threads(worker_threads);
+        builder
+    };
+
+    builder
+        .enable_all()
+        .build()
+        .map_err(|error| Error::Pipeline(format!("build tokio runtime: {error}")))
+}
+
+async fn run(config: AppConfig) -> Result<()> {
     observability::init(&config.observability)
         .map_err(|error| Error::Pipeline(format!("initialize observability: {error}")))?;
     let server_tls = build_server_tls_context(&config.server.tls)?;
@@ -58,8 +83,10 @@ async fn main() -> Result<()> {
         StorageEngine::Memory => Broker::with_config_and_auth(config.limits, authenticator),
     };
 
-    let server =
-        TcpServer::bind(config.server.bind).outbound_queue_size(config.server.outbound_queue_size);
+    let server = TcpServer::bind(config.server.bind)
+        .read_buffer_capacity(INITIAL_CONNECTION_BUFFER_BYTES)
+        .write_buffer_capacity(INITIAL_CONNECTION_BUFFER_BYTES)
+        .outbound_queue_size(config.server.outbound_queue_size);
     let server = if let Some(server_tls) = server_tls {
         server.tls(server_tls)
     } else {
@@ -67,11 +94,10 @@ async fn main() -> Result<()> {
     };
     let broker_for_pipeline = broker.clone();
     let server = server
-        .track_connection_stats()
         .life(BrokerLife::new(broker.clone()))
         .pipeline(move || {
             pipeline()
-                .codec(MqttCodec::with_max_packet_size(
+                .codec(PulseMqttCodec::with_max_packet_size(
                     broker_for_pipeline.config().server_maximum_packet_size as usize,
                 ))
                 .handler(MqttHandler::new(broker_for_pipeline.clone()))

@@ -1,7 +1,6 @@
-use rs_netty::{
-    Channel,
-    codec::{MqttPacket, Will},
-};
+use std::sync::{Arc, atomic::AtomicU64};
+
+use rs_netty::{Channel, codec::Will};
 
 use super::ConnectOptions;
 use crate::broker::{
@@ -10,14 +9,16 @@ use crate::broker::{
         delivery::{Delivery, redeliveries_for_client},
         session_registry::{ClientEntry, SessionEntry},
         time::now_ms,
+        write::BrokerWrite,
     },
 };
 
 pub(in crate::broker) struct ConnectOutcome {
     pub(in crate::broker) client_id: String,
     pub(in crate::broker) session_present: bool,
-    pub(in crate::broker) replaced_channel: Option<Channel<MqttPacket>>,
+    pub(in crate::broker) replaced_channel: Option<Channel<BrokerWrite>>,
     pub(in crate::broker) redeliveries: Vec<Delivery>,
+    pub(in crate::broker) keep_alive_deadline_ms: Arc<AtomicU64>,
 }
 
 pub(in crate::broker) struct RemoveConnectionOutcome {
@@ -30,7 +31,7 @@ impl Broker {
         &self,
         connection_id: u64,
         requested_client_id: String,
-        channel: Channel<MqttPacket>,
+        channel: Channel<BrokerWrite>,
         will: Option<Will>,
         principal: Option<String>,
         options: ConnectOptions,
@@ -45,10 +46,15 @@ impl Broker {
             state.expire_sessions(now_ms());
             let had_session = state.sessions_by_client_id.contains_key(&client_id);
             if options.clean_start {
-                state.sessions_by_client_id.remove(&client_id);
+                let removed_session = state.sessions_by_client_id.remove(&client_id).is_some();
+                let subscription_count = state.subscriptions.len();
                 state.subscriptions.retain(|sub| sub.client_id != client_id);
-                state.mark_sessions_changed();
-                state.mark_subscriptions_changed();
+                if removed_session {
+                    state.mark_sessions_changed();
+                }
+                if state.subscriptions.len() != subscription_count {
+                    state.mark_subscriptions_changed();
+                }
             }
 
             let replaced_channel = if let Some(previous_connection_id) = state
@@ -65,6 +71,13 @@ impl Broker {
                 None
             };
 
+            let persistent_session =
+                options.session_expiry_interval != 0 || (!options.clean_start && had_session);
+            let subscription_count = state
+                .subscriptions
+                .iter()
+                .filter(|subscription| subscription.client_id == client_id)
+                .count();
             state
                 .sessions_by_client_id
                 .entry(client_id.clone())
@@ -73,28 +86,32 @@ impl Broker {
                     session.session_expiry_interval = options.session_expiry_interval;
                 })
                 .or_insert_with(|| SessionEntry::connected(options.session_expiry_interval));
-            state.clients_by_connection.insert(
-                connection_id,
-                ClientEntry::new(
-                    client_id.clone(),
-                    channel,
-                    will,
-                    principal,
-                    options.session_expiry_interval,
-                    options.receive_maximum,
-                    options.maximum_packet_size,
-                ),
+            let client = ClientEntry::new(
+                client_id.clone(),
+                channel,
+                will,
+                principal,
+                options.session_expiry_interval,
+                options.receive_maximum,
+                options.maximum_packet_size,
+                persistent_session,
+                subscription_count,
             );
+            let keep_alive_deadline_ms = client.keep_alive_deadline_ms.clone();
+            state.clients_by_connection.insert(connection_id, client);
             let redeliveries = redeliveries_for_client(state, &client_id);
-            state.mark_sessions_changed();
-            state.mark_offline_changed(client_id.clone());
-            state.mark_outbound_changed(client_id.clone());
+            if persistent_session {
+                state.mark_sessions_changed();
+                state.mark_offline_changed(client_id.clone());
+                state.mark_outbound_changed(client_id.clone());
+            }
 
             ConnectOutcome {
                 client_id,
                 session_present: !options.clean_start && had_session,
                 replaced_channel,
                 redeliveries,
+                keep_alive_deadline_ms,
             }
         })
     }
@@ -103,13 +120,17 @@ impl Broker {
         &self,
         connection_id: u64,
     ) -> Option<RemoveConnectionOutcome> {
-        self.with_state(|state| {
+        let outcome = self.with_state(|state| {
             let client = state.remove_connection_state(connection_id, false)?;
             state.connection_by_client_id.remove(&client.client_id);
             Some(RemoveConnectionOutcome {
                 client_id: client.client_id,
                 will: client.will,
             })
-        })
+        });
+        if outcome.is_some() {
+            crate::broker::runtime::memory::release_allocator_pressure();
+        }
+        outcome
     }
 }

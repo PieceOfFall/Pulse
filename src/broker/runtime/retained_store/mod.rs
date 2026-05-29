@@ -1,8 +1,10 @@
 use std::{
     cmp::{Ordering, Reverse},
     collections::{BTreeMap, BinaryHeap, HashMap},
+    sync::Arc,
 };
 
+use bytes::{Bytes, BytesMut};
 use rs_netty::codec::{MqttProperty, PublishPacket, QoS};
 
 use super::{
@@ -11,6 +13,7 @@ use super::{
     session_registry::BrokerState,
     time::now_ms,
 };
+#[cfg(test)]
 use crate::protocol;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -18,16 +21,150 @@ pub(in crate::broker) struct RetainedMessage {
     pub(in crate::broker) qos: QoS,
     pub(in crate::broker) topic_name: String,
     pub(in crate::broker) properties: Vec<MqttProperty>,
-    pub(in crate::broker) payload: bytes::Bytes,
+    pub(in crate::broker) payload: Bytes,
     pub(in crate::broker) expires_at_ms: Option<u64>,
+    pub(in crate::broker) preencoded_qos0: Option<Bytes>,
+}
+
+impl RetainedMessage {
+    pub(in crate::broker) fn new(
+        qos: QoS,
+        topic_name: String,
+        properties: Vec<MqttProperty>,
+        payload: Bytes,
+        expires_at_ms: Option<u64>,
+    ) -> Self {
+        let preencoded_qos0 = if qos == QoS::AtMostOnce && properties.is_empty() {
+            encode_plain_qos0_retained(&topic_name, &payload)
+        } else {
+            None
+        };
+
+        Self {
+            qos,
+            topic_name,
+            properties,
+            payload,
+            expires_at_ms,
+            preencoded_qos0,
+        }
+    }
+}
+
+fn encode_plain_qos0_retained(topic_name: &str, payload: &Bytes) -> Option<Bytes> {
+    if topic_name.len() > u16::MAX as usize {
+        return None;
+    }
+
+    let remaining_len = 2usize
+        .checked_add(topic_name.len())?
+        .checked_add(1)?
+        .checked_add(payload.len())?;
+    if remaining_len > 268_435_455 {
+        return None;
+    }
+
+    let mut buffer =
+        BytesMut::with_capacity(1 + remaining_len_varint_len(remaining_len) + remaining_len);
+    buffer.extend_from_slice(&[0x31]);
+    write_remaining_len(remaining_len, &mut buffer);
+    buffer.extend_from_slice(&(topic_name.len() as u16).to_be_bytes());
+    buffer.extend_from_slice(topic_name.as_bytes());
+    buffer.extend_from_slice(&[0]);
+    buffer.extend_from_slice(payload);
+    Some(buffer.freeze())
+}
+
+fn write_remaining_len(mut value: usize, buffer: &mut BytesMut) {
+    loop {
+        let mut byte = (value % 128) as u8;
+        value /= 128;
+        if value > 0 {
+            byte |= 0x80;
+        }
+        buffer.extend_from_slice(&[byte]);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+fn remaining_len_varint_len(value: usize) -> usize {
+    match value {
+        0..=127 => 1,
+        128..=16_383 => 2,
+        16_384..=2_097_151 => 3,
+        _ => 4,
+    }
 }
 
 #[derive(Default)]
 pub(in crate::broker) struct RetainedStore {
-    messages: HashMap<String, RetainedMessage>,
+    messages: HashMap<String, Arc<RetainedMessage>>,
     payload_bytes: usize,
     trie: RetainedTrieNode,
     expirations: BinaryHeap<Reverse<ExpiryEntry>>,
+}
+
+pub(in crate::broker) enum RetainedMatches {
+    Empty,
+    One(Arc<RetainedMessage>),
+    Many(Vec<Arc<RetainedMessage>>),
+}
+
+impl RetainedMatches {
+    fn many(messages: Vec<Arc<RetainedMessage>>) -> Self {
+        if messages.is_empty() {
+            Self::Empty
+        } else {
+            Self::Many(messages)
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::One(_) => 1,
+            Self::Many(messages) => messages.len(),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+}
+
+pub(in crate::broker) enum RetainedMatchesIntoIter {
+    Empty,
+    One(Option<Arc<RetainedMessage>>),
+    Many(std::vec::IntoIter<Arc<RetainedMessage>>),
+}
+
+impl Iterator for RetainedMatchesIntoIter {
+    type Item = Arc<RetainedMessage>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Empty => None,
+            Self::One(message) => message.take(),
+            Self::Many(messages) => messages.next(),
+        }
+    }
+}
+
+impl IntoIterator for RetainedMatches {
+    type Item = Arc<RetainedMessage>;
+    type IntoIter = RetainedMatchesIntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            Self::Empty => RetainedMatchesIntoIter::Empty,
+            Self::One(message) => RetainedMatchesIntoIter::One(Some(message)),
+            Self::Many(messages) => RetainedMatchesIntoIter::Many(messages.into_iter()),
+        }
+    }
 }
 
 impl RetainedStore {
@@ -37,7 +174,7 @@ impl RetainedStore {
         message: RetainedMessage,
     ) -> Option<RetainedMessage> {
         debug_assert_eq!(topic_name, message.topic_name);
-        let previous = self.messages.insert(topic_name.clone(), message);
+        let previous = self.messages.insert(topic_name.clone(), Arc::new(message));
         if let Some(previous) = &previous {
             self.payload_bytes = self.payload_bytes.saturating_sub(previous.payload.len());
         } else {
@@ -55,18 +192,18 @@ impl RetainedStore {
                 topic_name,
             }));
         }
-        previous
+        previous.map(|message| (*message).clone())
     }
 
     pub(in crate::broker) fn remove(&mut self, topic_name: &str) -> Option<RetainedMessage> {
         let removed = self.messages.remove(topic_name)?;
         self.payload_bytes = self.payload_bytes.saturating_sub(removed.payload.len());
         self.trie.remove(topic_name);
-        Some(removed)
+        Some((*removed).clone())
     }
 
     pub(in crate::broker) fn get(&self, topic_name: &str) -> Option<&RetainedMessage> {
-        self.messages.get(topic_name)
+        self.messages.get(topic_name).map(Arc::as_ref)
     }
 
     pub(in crate::broker) fn contains_key(&self, topic_name: &str) -> bool {
@@ -82,7 +219,9 @@ impl RetainedStore {
     }
 
     pub(in crate::broker) fn iter(&self) -> impl Iterator<Item = (&String, &RetainedMessage)> {
-        self.messages.iter()
+        self.messages
+            .iter()
+            .map(|(topic_name, message)| (topic_name, message.as_ref()))
     }
 
     pub(in crate::broker) fn expire(&mut self, now_ms: u64) -> bool {
@@ -105,19 +244,34 @@ impl RetainedStore {
         removed_any
     }
 
-    pub(in crate::broker) fn matching(
-        &mut self,
-        filter: &str,
-        now_ms: u64,
-    ) -> Vec<RetainedMessage> {
+    #[cfg(test)]
+    pub(in crate::broker) fn matching(&mut self, filter: &str, now_ms: u64) -> RetainedMatches {
         self.expire(now_ms);
         let filter = protocol::shared_subscription_filter(filter).unwrap_or(filter);
         if !protocol::is_valid_topic_filter(filter) {
-            return Vec::new();
+            return RetainedMatches::Empty;
         }
 
+        self.matching_valid_filter_after_expire(filter)
+    }
+
+    pub(in crate::broker) fn matching_valid_filter(
+        &mut self,
+        filter: &str,
+        now_ms: u64,
+    ) -> RetainedMatches {
+        self.expire(now_ms);
+        self.matching_valid_filter_after_expire(filter)
+    }
+
+    fn matching_valid_filter_after_expire(&self, filter: &str) -> RetainedMatches {
         if !filter.contains('+') && !filter.contains('#') {
-            return self.messages.get(filter).into_iter().cloned().collect();
+            return self
+                .messages
+                .get(filter)
+                .cloned()
+                .map(RetainedMatches::One)
+                .unwrap_or(RetainedMatches::Empty);
         }
 
         let mut topic_names = Vec::new();
@@ -125,11 +279,12 @@ impl RetainedStore {
         self.trie.collect_matches(&levels, 0, &mut topic_names);
 
         let filter_matches_system = filter.starts_with('$');
-        topic_names
+        let messages = topic_names
             .into_iter()
             .filter(|topic_name| filter_matches_system || !topic_name.starts_with('$'))
             .filter_map(|topic_name| self.messages.get(&topic_name).cloned())
-            .collect()
+            .collect();
+        RetainedMatches::many(messages)
     }
 }
 
@@ -239,13 +394,13 @@ pub(in crate::broker) fn retain_publish(
     } else if can_store_retained(&state.retained, packet, config) {
         state.retained.insert(
             packet.topic_name.clone(),
-            RetainedMessage {
-                qos: packet.qos,
-                topic_name: packet.topic_name.clone(),
-                properties: packet.properties.clone(),
-                payload: packet.payload.clone(),
+            RetainedMessage::new(
+                packet.qos,
+                packet.topic_name.clone(),
+                packet.properties.clone(),
+                packet.payload.clone(),
                 expires_at_ms,
-            },
+            ),
         );
         state.mark_retained_changed();
     }
@@ -279,13 +434,35 @@ mod tests {
     use crate::broker::runtime::{config::BrokerConfig, session_registry::BrokerState};
 
     fn message(topic_name: &str, payload: &'static [u8]) -> RetainedMessage {
-        RetainedMessage {
-            qos: QoS::AtMostOnce,
-            topic_name: topic_name.to_string(),
-            properties: Vec::new(),
-            payload: Bytes::from_static(payload),
-            expires_at_ms: None,
-        }
+        RetainedMessage::new(
+            QoS::AtMostOnce,
+            topic_name.to_string(),
+            Vec::new(),
+            Bytes::from_static(payload),
+            None,
+        )
+    }
+
+    #[test]
+    fn plain_qos0_message_precomputes_retained_publish_bytes() {
+        let message = message("devices/a", b"hello");
+        assert_eq!(
+            message.preencoded_qos0.as_deref(),
+            Some(&b"\x31\x11\x00\x09devices/a\x00hello"[..])
+        );
+    }
+
+    #[test]
+    fn retained_message_with_properties_skips_plain_preencoding() {
+        let message = RetainedMessage::new(
+            QoS::AtMostOnce,
+            "devices/a".to_string(),
+            vec![rs_netty::codec::MqttProperty::MessageExpiryInterval(60)],
+            Bytes::from_static(b"hello"),
+            Some(60_000),
+        );
+
+        assert!(message.preencoded_qos0.is_none());
     }
 
     #[test]

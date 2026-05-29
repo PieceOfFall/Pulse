@@ -7,7 +7,7 @@ use super::{
 };
 use crate::broker::runtime::{
     config::BrokerConfig, retained_store::RetainedMessage, session_registry::BrokerState,
-    subscription_tree::SubscriptionEntry, time::now_ms,
+    subscription_tree::SubscriptionEntry, time::now_ms, write::BrokerWrite,
 };
 
 pub(in crate::broker) fn retained_for_subscription(
@@ -16,7 +16,9 @@ pub(in crate::broker) fn retained_for_subscription(
     config: &BrokerConfig,
 ) -> Vec<Delivery> {
     let now_ms = now_ms();
-    let retained = state.retained.matching(&subscription.match_filter, now_ms);
+    let retained = state
+        .retained
+        .matching_valid_filter(&subscription.match_filter, now_ms);
 
     let Some(connection_id) = state.connection_by_client_id.get(&subscription.client_id) else {
         return Vec::new();
@@ -29,6 +31,22 @@ pub(in crate::broker) fn retained_for_subscription(
         receive_maximum: client.receive_maximum,
         maximum_packet_size: client.maximum_packet_size,
     };
+
+    if subscription.options.maximum_qos == QoS::AtMostOnce {
+        let mut deliveries = Vec::new();
+        for message in retained {
+            if let Some(delivery) = qos0_retained_delivery_fast(
+                message.as_ref(),
+                &target,
+                subscription.options.maximum_qos,
+                subscription.subscription_identifier,
+            ) {
+                deliveries.push(delivery);
+            }
+        }
+        return deliveries;
+    }
+
     let Some(session) = state.sessions_by_client_id.get_mut(&subscription.client_id) else {
         return Vec::new();
     };
@@ -37,7 +55,7 @@ pub(in crate::broker) fn retained_for_subscription(
     let mut qos_state_changed = false;
     for message in retained {
         if let Some(delivery) = qos0_retained_delivery_fast(
-            &message,
+            message.as_ref(),
             &target,
             subscription.options.maximum_qos,
             subscription.subscription_identifier,
@@ -47,7 +65,7 @@ pub(in crate::broker) fn retained_for_subscription(
         }
 
         let expires_at_ms = message.expires_at_ms;
-        let packet = publish_packet(message);
+        let packet = publish_packet(message.as_ref());
         let delivery = delivery_for_client(
             session,
             target.clone(),
@@ -88,6 +106,18 @@ fn qos0_retained_delivery_fast(
         return None;
     }
 
+    if let (Some(bytes), None) = (&message.preencoded_qos0, subscription_identifier)
+        && bytes.len() <= target.maximum_packet_size as usize
+    {
+        return Some(Delivery {
+            channel: target.channel.clone(),
+            packet: BrokerWrite::Preencoded {
+                bytes: bytes.clone(),
+                publish_qos: Some(qos),
+            },
+        });
+    }
+
     let mut properties = message.properties.clone();
     if let Some(subscription_identifier) = subscription_identifier {
         properties.push(rs_netty::codec::MqttProperty::SubscriptionIdentifier(
@@ -104,7 +134,8 @@ fn qos0_retained_delivery_fast(
             packet_id: None,
             properties,
             payload: message.payload.clone(),
-        }),
+        })
+        .into(),
     })
 }
 
@@ -145,14 +176,14 @@ fn varint_len(value: usize) -> usize {
     }
 }
 
-fn publish_packet(message: RetainedMessage) -> PublishPacket {
+fn publish_packet(message: &RetainedMessage) -> PublishPacket {
     PublishPacket {
         dup: false,
         qos: message.qos,
         retain: true,
-        topic_name: message.topic_name,
+        topic_name: message.topic_name.clone(),
         packet_id: None,
-        properties: message.properties,
-        payload: message.payload,
+        properties: message.properties.clone(),
+        payload: message.payload.clone(),
     }
 }

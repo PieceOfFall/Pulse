@@ -440,13 +440,13 @@ mod tests {
             });
             state.retained.insert(
                 "devices/one".to_string(),
-                RetainedMessage {
-                    qos: QoS::AtLeastOnce,
-                    topic_name: "devices/one".to_string(),
-                    properties: Vec::new(),
-                    payload: Bytes::from_static(b"hello"),
-                    expires_at_ms: Some(999),
-                },
+                RetainedMessage::new(
+                    QoS::AtLeastOnce,
+                    "devices/one".to_string(),
+                    Vec::new(),
+                    Bytes::from_static(b"hello"),
+                    Some(999),
+                ),
             );
         });
         drop(storage);
