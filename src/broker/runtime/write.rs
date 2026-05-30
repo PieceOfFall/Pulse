@@ -1,7 +1,10 @@
 use bytes::{Bytes, BytesMut};
 use rs_netty::{
     Error, Result,
-    codec::{Decoder, Encoder, MqttCodec, MqttPacket, QoS},
+    codec::{
+        Decoder, Encoder, HttpResponse, HttpWsOutbound, MqttCodec, MqttPacket, QoS, WebSocketClose,
+        WebSocketHandshakeResponse, WebSocketMessage,
+    },
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -11,6 +14,10 @@ pub enum BrokerWrite {
         bytes: Bytes,
         publish_qos: Option<QoS>,
     },
+    HttpResponse(HttpResponse),
+    WebSocketHandshake(WebSocketHandshakeResponse),
+    WebSocketPong(Bytes),
+    WebSocketClose(Option<WebSocketClose>),
 }
 
 impl BrokerWrite {
@@ -21,6 +28,10 @@ impl BrokerWrite {
                 _ => None,
             },
             Self::Preencoded { publish_qos, .. } => *publish_qos,
+            Self::HttpResponse(_)
+            | Self::WebSocketHandshake(_)
+            | Self::WebSocketPong(_)
+            | Self::WebSocketClose(_) => None,
         }
     }
 }
@@ -67,6 +78,52 @@ impl Encoder<BrokerWrite> for PulseMqttCodec {
                 dst.reserve(bytes.len());
                 dst.extend_from_slice(&bytes);
                 Ok(())
+            }
+            BrokerWrite::HttpResponse(_)
+            | BrokerWrite::WebSocketHandshake(_)
+            | BrokerWrite::WebSocketPong(_)
+            | BrokerWrite::WebSocketClose(_) => Err(Error::Encode(
+                "websocket write cannot be encoded on raw MQTT listener".to_string(),
+            )),
+        }
+    }
+}
+
+pub(crate) struct WebSocketBrokerWrite {
+    mqtt: PulseMqttCodec,
+}
+
+impl WebSocketBrokerWrite {
+    pub(crate) fn with_max_packet_size(max_packet_size: usize) -> Self {
+        Self {
+            mqtt: PulseMqttCodec::with_max_packet_size(max_packet_size),
+        }
+    }
+}
+
+impl rs_netty::Outbound<BrokerWrite> for WebSocketBrokerWrite {
+    type Out = HttpWsOutbound;
+
+    async fn write(
+        &mut self,
+        _ctx: &mut rs_netty::OutboundContext,
+        msg: BrokerWrite,
+    ) -> Result<rs_netty::Flow<Self::Out>> {
+        match msg {
+            BrokerWrite::HttpResponse(response) => Ok(rs_netty::Flow::Next(response.into())),
+            BrokerWrite::WebSocketHandshake(response) => Ok(rs_netty::Flow::Next(response.into())),
+            BrokerWrite::WebSocketPong(bytes) => Ok(rs_netty::Flow::Next(
+                HttpWsOutbound::WebSocket(WebSocketMessage::Pong(bytes)),
+            )),
+            BrokerWrite::WebSocketClose(close) => Ok(rs_netty::Flow::Next(
+                HttpWsOutbound::WebSocket(WebSocketMessage::Close(close)),
+            )),
+            BrokerWrite::Packet(_) | BrokerWrite::Preencoded { .. } => {
+                let mut bytes = BytesMut::new();
+                self.mqtt.encode(msg, &mut bytes)?;
+                Ok(rs_netty::Flow::Next(HttpWsOutbound::WebSocket(
+                    WebSocketMessage::Binary(bytes.freeze()),
+                )))
             }
         }
     }

@@ -152,6 +152,20 @@ The matching environment variables are `MQTT_RS_TLS_ENABLED`,
 `MQTT_RS_TLS_CERTIFICATE_CHAIN`, `MQTT_RS_TLS_PRIVATE_KEY`,
 `MQTT_RS_TLS_CLIENT_AUTH`, and `MQTT_RS_TLS_CLIENT_CA`.
 
+Enable MQTT over WebSocket on a separate listener:
+
+```toml
+[websocket]
+enabled = true
+bind = "0.0.0.0:8083"
+path = "/mqtt"
+```
+
+WebSocket clients must connect with `Sec-WebSocket-Protocol: mqtt` and send MQTT
+control packets in binary frames. The legacy `mqttv3.1` subprotocol is also
+accepted. To serve `wss://`, set `tls = true` under `[websocket]`; Pulse reuses
+the certificate settings from `[server.tls]`.
+
 Enable the static username/password and ACL backend:
 
 ```toml
@@ -201,7 +215,7 @@ Pulse already covers the core broker paths:
 src/main.rs                         server startup and graceful shutdown
 src/settings.rs                     file/env/CLI configuration
 src/protocol.rs                     MQTT reason codes and topic matching
-src/broker/runtime/connection       MQTT packet handler and lifecycle
+src/broker/runtime/connection       TCP and WebSocket MQTT handlers
 src/broker/runtime/delivery         publish routing, QoS, offline queues
 src/broker/runtime/subscription_tree subscriptions and shared groups
 src/broker/storage                  in-memory, SQLite, and MySQL state

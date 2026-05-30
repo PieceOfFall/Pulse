@@ -20,12 +20,14 @@ pub(in crate::broker) use router::{deliveries_for_publish, qos0_deliveries_for_p
 
 #[derive(Clone)]
 pub(in crate::broker) struct Delivery {
+    pub(super) connection_id: u64,
     pub(super) channel: Channel<BrokerWrite>,
     pub(super) packet: BrokerWrite,
 }
 
 #[derive(Clone)]
 pub(super) struct DeliveryTarget {
+    pub(super) connection_id: u64,
     pub(super) channel: Channel<BrokerWrite>,
     pub(super) receive_maximum: u16,
     pub(super) maximum_packet_size: u32,

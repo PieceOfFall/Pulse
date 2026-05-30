@@ -7,10 +7,16 @@ mod tls;
 use std::{fs, path::Path, sync::Arc, time::Duration};
 
 use broker::{
-    Broker, BrokerLife, MqttHandler,
-    runtime::{auth::ConfiguredAuthenticator, write::PulseMqttCodec},
+    Broker, BrokerLife, ConnectionIdAllocator, ConnectionIdMap, MqttHandler, WebSocketMqttHandler,
+    runtime::{
+        auth::ConfiguredAuthenticator,
+        write::{PulseMqttCodec, WebSocketBrokerWrite},
+    },
 };
-use rs_netty::{Error, Result, TcpServer, pipeline};
+use rs_netty::{
+    Error, Result, ServerTlsContext, TcpServer, codec::HttpWsCodec, pipeline,
+    transport::tcp::server::TcpServerHandle,
+};
 use settings::{AppConfig, StorageEngine};
 use tls::build_server_tls_context;
 use tokio::runtime::{Builder, Runtime};
@@ -44,6 +50,7 @@ async fn run(config: AppConfig) -> Result<()> {
     observability::init(&config.observability)
         .map_err(|error| Error::Pipeline(format!("initialize observability: {error}")))?;
     let server_tls = build_server_tls_context(&config.server.tls)?;
+    let websocket_tls = build_websocket_tls_context(&config)?;
     let authenticator = Arc::new(ConfiguredAuthenticator::new(config.auth.clone()));
 
     let broker = match config.storage.engine {
@@ -84,29 +91,34 @@ async fn run(config: AppConfig) -> Result<()> {
         StorageEngine::Memory => Broker::with_config_and_auth(config.limits, authenticator),
     };
 
-    let server = TcpServer::bind(config.server.bind)
-        .read_buffer_capacity(INITIAL_CONNECTION_BUFFER_BYTES)
-        .write_buffer_capacity(INITIAL_CONNECTION_BUFFER_BYTES)
-        .outbound_queue_size(config.server.outbound_queue_size);
-    let server = if let Some(server_tls) = server_tls {
-        server.tls(server_tls)
-    } else {
-        server
-    };
-    let broker_for_pipeline = broker.clone();
-    let server = server
-        .life(BrokerLife::new(broker.clone()))
-        .pipeline(move || {
-            pipeline()
-                .codec(PulseMqttCodec::with_max_packet_size(
-                    broker_for_pipeline.config().server_maximum_packet_size as usize,
-                ))
-                .handler(MqttHandler::new(broker_for_pipeline.clone()))
-        })
-        .start()
-        .await?;
-
+    let connection_ids = ConnectionIdAllocator::default();
+    let server = start_mqtt_listener(
+        &config,
+        broker.clone(),
+        server_tls,
+        connection_ids.listener(),
+    )
+    .await?;
     info!(bind_addr = %server.local_addr(), "Pulse listening");
+
+    let websocket_server = if config.websocket.enabled {
+        let server = start_websocket_listener(
+            &config,
+            broker.clone(),
+            websocket_tls,
+            connection_ids.listener(),
+        )
+        .await?;
+        info!(
+            bind_addr = %server.local_addr(),
+            path = %config.websocket.path,
+            tls = config.websocket.tls,
+            "Pulse websocket listener ready"
+        );
+        Some(server)
+    } else {
+        None
+    };
 
     tokio::signal::ctrl_c()
         .await
@@ -119,7 +131,105 @@ async fn run(config: AppConfig) -> Result<()> {
         ))
         .await;
     server.shutdown();
-    server.wait().await
+    if let Some(websocket_server) = &websocket_server {
+        websocket_server.shutdown();
+    }
+
+    if let Some(websocket_server) = websocket_server {
+        let (mqtt, websocket) = tokio::join!(server.wait(), websocket_server.wait());
+        mqtt?;
+        websocket
+    } else {
+        server.wait().await
+    }
+}
+
+async fn start_mqtt_listener(
+    config: &AppConfig,
+    broker: Broker,
+    server_tls: Option<ServerTlsContext>,
+    connection_ids: ConnectionIdMap,
+) -> Result<TcpServerHandle> {
+    let server = TcpServer::bind(config.server.bind.as_str())
+        .read_buffer_capacity(INITIAL_CONNECTION_BUFFER_BYTES)
+        .write_buffer_capacity(INITIAL_CONNECTION_BUFFER_BYTES)
+        .outbound_queue_size(config.server.outbound_queue_size);
+    let server = if let Some(server_tls) = server_tls {
+        server.tls(server_tls)
+    } else {
+        server
+    };
+    let broker_for_pipeline = broker.clone();
+    let handler_connection_ids = connection_ids.clone();
+    let server = server
+        .life(BrokerLife::with_connection_ids(
+            broker.clone(),
+            connection_ids,
+        ))
+        .pipeline(move || {
+            pipeline()
+                .codec(PulseMqttCodec::with_max_packet_size(
+                    broker_for_pipeline.config().server_maximum_packet_size as usize,
+                ))
+                .handler(MqttHandler::with_connection_ids(
+                    broker_for_pipeline.clone(),
+                    handler_connection_ids.clone(),
+                ))
+        })
+        .start()
+        .await?;
+
+    Ok(server)
+}
+
+async fn start_websocket_listener(
+    config: &AppConfig,
+    broker: Broker,
+    server_tls: Option<ServerTlsContext>,
+    connection_ids: ConnectionIdMap,
+) -> Result<TcpServerHandle> {
+    let server = TcpServer::bind(config.websocket.bind.as_str())
+        .read_buffer_capacity(INITIAL_CONNECTION_BUFFER_BYTES)
+        .write_buffer_capacity(INITIAL_CONNECTION_BUFFER_BYTES)
+        .outbound_queue_size(config.server.outbound_queue_size);
+    let server = if let Some(server_tls) = server_tls {
+        server.tls(server_tls)
+    } else {
+        server
+    };
+    let broker_for_pipeline = broker.clone();
+    let handler_connection_ids = connection_ids.clone();
+    let websocket_path = config.websocket.path.clone();
+    let server = server
+        .life(BrokerLife::with_connection_ids(
+            broker.clone(),
+            connection_ids,
+        ))
+        .pipeline(move || {
+            let max_packet_size = broker_for_pipeline.config().server_maximum_packet_size as usize;
+            pipeline()
+                .codec(HttpWsCodec::server().max_frame_len(max_packet_size))
+                .handler(WebSocketMqttHandler::with_connection_ids(
+                    broker_for_pipeline.clone(),
+                    websocket_path.clone(),
+                    handler_connection_ids.clone(),
+                ))
+                .outbound(WebSocketBrokerWrite::with_max_packet_size(max_packet_size))
+        })
+        .start()
+        .await?;
+
+    Ok(server)
+}
+
+fn build_websocket_tls_context(config: &AppConfig) -> Result<Option<ServerTlsContext>> {
+    if !config.websocket.enabled || !config.websocket.tls {
+        return Ok(None);
+    }
+
+    let mut tls = config.server.tls.clone();
+    tls.enabled = true;
+    build_server_tls_context(&tls)
 }
 
 fn ensure_sqlite_parent_dir(path: &str) -> Result<()> {

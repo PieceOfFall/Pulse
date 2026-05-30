@@ -22,7 +22,8 @@ pub(in crate::broker) fn redeliveries_for_client(
     let Some(connection_id) = state.connection_by_client_id.get(client_id) else {
         return Vec::new();
     };
-    let Some(client) = state.clients_by_connection.get(connection_id) else {
+    let connection_id = *connection_id;
+    let Some(client) = state.clients_by_connection.get(&connection_id) else {
         return Vec::new();
     };
     let channel = client.channel.clone();
@@ -50,6 +51,7 @@ pub(in crate::broker) fn redeliveries_for_client(
             packet.dup = true;
             packet.packet_id = Some(*packet_id);
             fits_maximum_packet_size(&packet, maximum_packet_size).then(|| Delivery {
+                connection_id,
                 channel: channel.clone(),
                 packet: MqttPacket::Publish(packet).into(),
             })
@@ -58,6 +60,7 @@ pub(in crate::broker) fn redeliveries_for_client(
 
     redeliveries.extend(flush_queued_for_session(
         session,
+        connection_id,
         channel,
         receive_maximum,
         maximum_packet_size,
@@ -73,7 +76,8 @@ pub(in crate::broker) fn queued_deliveries_for_client(
     let Some(connection_id) = state.connection_by_client_id.get(client_id) else {
         return Vec::new();
     };
-    let Some(client) = state.clients_by_connection.get(connection_id) else {
+    let connection_id = *connection_id;
+    let Some(client) = state.clients_by_connection.get(&connection_id) else {
         return Vec::new();
     };
     let channel = client.channel.clone();
@@ -83,7 +87,13 @@ pub(in crate::broker) fn queued_deliveries_for_client(
         return Vec::new();
     };
 
-    flush_queued_for_session(session, channel, receive_maximum, maximum_packet_size)
+    flush_queued_for_session(
+        session,
+        connection_id,
+        channel,
+        receive_maximum,
+        maximum_packet_size,
+    )
 }
 
 pub(in crate::broker) fn retransmissions_for_connection(
@@ -115,6 +125,7 @@ pub(in crate::broker) fn retransmissions_for_connection(
             packet.dup = true;
             packet.packet_id = Some(*packet_id);
             fits_maximum_packet_size(&packet, maximum_packet_size).then(|| Delivery {
+                connection_id,
                 channel: channel.clone(),
                 packet: MqttPacket::Publish(packet).into(),
             })
@@ -126,6 +137,7 @@ pub(in crate::broker) fn retransmissions_for_connection(
             .outbound_qos2_pubrel
             .iter()
             .map(|packet_id| Delivery {
+                connection_id,
                 channel: channel.clone(),
                 packet: MqttPacket::PubRel(AckPacket::new(*packet_id, crate::protocol::SUCCESS))
                     .into(),
@@ -222,6 +234,7 @@ pub(super) fn delivery_for_client(
     };
 
     Some(Delivery {
+        connection_id: target.connection_id,
         channel: target.channel,
         packet: MqttPacket::Publish(pending_publish(
             packet,
@@ -237,6 +250,7 @@ pub(super) fn delivery_for_client(
 
 fn flush_queued_for_session(
     session: &mut SessionEntry,
+    connection_id: u64,
     channel: Channel<BrokerWrite>,
     receive_maximum: u16,
     maximum_packet_size: u32,
@@ -294,6 +308,7 @@ fn flush_queued_for_session(
             continue;
         }
         deliveries.push(Delivery {
+            connection_id,
             channel: channel.clone(),
             packet: MqttPacket::Publish(packet).into(),
         });

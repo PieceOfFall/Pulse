@@ -1,11 +1,12 @@
 use std::{sync::Arc, time::Duration};
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use rs_netty::{
     TcpServer,
     codec::{
-        ConnectPacket, Decoder, Encoder, MqttCodec, MqttPacket, MqttProperty, PublishPacket, QoS,
-        SubscribePacket, Subscription, SubscriptionOptions, Will, mqtt::AckPacket,
+        ConnectPacket, Decoder, Encoder, HttpWsCodec, MqttCodec, MqttPacket, MqttProperty,
+        PublishPacket, QoS, SubscribePacket, Subscription, SubscriptionOptions, Will,
+        mqtt::AckPacket,
     },
     pipeline,
     transport::tcp::server::TcpServerHandle,
@@ -16,7 +17,7 @@ use tokio::{
 };
 
 use super::{
-    Broker, BrokerLife, MqttHandler,
+    Broker, BrokerLife, ConnectionIdAllocator, MqttHandler, WebSocketMqttHandler,
     runtime::{
         auth::{AuthAclConfig, AuthAction, AuthConfig, AuthUserConfig, ConfiguredAuthenticator},
         config::{
@@ -24,7 +25,7 @@ use super::{
             MAX_SUBSCRIPTIONS_PER_CLIENT,
         },
         subscription_tree::{SubscriptionEntry, upsert_subscription},
-        write::PulseMqttCodec,
+        write::{PulseMqttCodec, WebSocketBrokerWrite},
     },
 };
 use crate::protocol;
@@ -41,6 +42,52 @@ async fn duplicate_client_id_closes_previous_connection() -> rs_netty::Result<()
         .expect("previous connection should close")?;
     assert_eq!(read, 0);
 
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn websocket_publish_reaches_tcp_subscriber() -> rs_netty::Result<()> {
+    let broker = TestBroker::start_with_websocket().await?;
+    let mut subscriber = broker.connect("tcp-subscriber").await?;
+    subscriber
+        .subscribe(1, "devices/ws", QoS::AtMostOnce)
+        .await?;
+
+    let mut publisher = broker.connect_websocket("ws-publisher").await?;
+    publisher
+        .write(publish("devices/ws", QoS::AtMostOnce, None, "hello-ws"))
+        .await?;
+
+    let packet = subscriber
+        .expect_publish("expected websocket publish over tcp")
+        .await?;
+    assert_eq!(packet.payload, Bytes::from_static(b"hello-ws"));
+
+    drop(publisher);
+    drop(subscriber);
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn tcp_publish_reaches_websocket_subscriber() -> rs_netty::Result<()> {
+    let broker = TestBroker::start_with_websocket().await?;
+    let mut subscriber = broker.connect_websocket("ws-subscriber").await?;
+    subscriber
+        .subscribe(1, "devices/tcp", QoS::AtMostOnce)
+        .await?;
+
+    let mut publisher = broker.connect("tcp-publisher").await?;
+    publisher
+        .write(publish("devices/tcp", QoS::AtMostOnce, None, "hello-tcp"))
+        .await?;
+
+    let packet = subscriber
+        .expect_publish("expected tcp publish over websocket")
+        .await?;
+    assert_eq!(packet.payload, Bytes::from_static(b"hello-tcp"));
+
+    drop(publisher);
+    drop(subscriber);
     broker.shutdown().await
 }
 
@@ -2049,6 +2096,7 @@ async fn non_expired_message_expiry_is_delivered() -> rs_netty::Result<()> {
 
 struct TestBroker {
     server: TcpServerHandle,
+    websocket_server: Option<TcpServerHandle>,
     broker: Broker,
 }
 
@@ -2058,18 +2106,66 @@ impl TestBroker {
     }
 
     async fn start_with_broker(broker: Broker) -> rs_netty::Result<Self> {
+        Self::start_with_options(broker, false).await
+    }
+
+    async fn start_with_websocket() -> rs_netty::Result<Self> {
+        Self::start_with_options(Broker::new(), true).await
+    }
+
+    async fn start_with_options(broker: Broker, websocket: bool) -> rs_netty::Result<Self> {
+        let connection_ids = ConnectionIdAllocator::default();
+        let mqtt_connection_ids = connection_ids.listener();
         let broker_for_pipeline = broker.clone();
+        let handler_connection_ids = mqtt_connection_ids.clone();
         let server = TcpServer::bind("127.0.0.1:0")
-            .life(BrokerLife::new(broker.clone()))
+            .life(BrokerLife::with_connection_ids(
+                broker.clone(),
+                mqtt_connection_ids,
+            ))
             .pipeline(move || {
                 pipeline()
                     .codec(PulseMqttCodec::with_max_packet_size(1024 * 1024))
-                    .handler(MqttHandler::new(broker_for_pipeline.clone()))
+                    .handler(MqttHandler::with_connection_ids(
+                        broker_for_pipeline.clone(),
+                        handler_connection_ids.clone(),
+                    ))
             })
             .start()
             .await?;
 
-        Ok(Self { server, broker })
+        let websocket_server = if websocket {
+            let websocket_connection_ids = connection_ids.listener();
+            let broker_for_pipeline = broker.clone();
+            let handler_connection_ids = websocket_connection_ids.clone();
+            Some(
+                TcpServer::bind("127.0.0.1:0")
+                    .life(BrokerLife::with_connection_ids(
+                        broker.clone(),
+                        websocket_connection_ids,
+                    ))
+                    .pipeline(move || {
+                        pipeline()
+                            .codec(HttpWsCodec::server().max_frame_len(1024 * 1024))
+                            .handler(WebSocketMqttHandler::with_connection_ids(
+                                broker_for_pipeline.clone(),
+                                "/mqtt".to_string(),
+                                handler_connection_ids.clone(),
+                            ))
+                            .outbound(WebSocketBrokerWrite::with_max_packet_size(1024 * 1024))
+                    })
+                    .start()
+                    .await?,
+            )
+        } else {
+            None
+        };
+
+        Ok(Self {
+            server,
+            websocket_server,
+            broker,
+        })
     }
 
     async fn connect(&self, client_id: &str) -> rs_netty::Result<TestClient> {
@@ -2079,9 +2175,27 @@ impl TestBroker {
         Ok(client)
     }
 
+    async fn connect_websocket(&self, client_id: &str) -> rs_netty::Result<WebSocketTestClient> {
+        let mut client = self.open_websocket_client().await?;
+        client.write(connect(client_id)).await?;
+        client.expect_connack().await?;
+        Ok(client)
+    }
+
     async fn open_client(&self) -> rs_netty::Result<TestClient> {
         let stream = TcpStream::connect(self.server.local_addr()).await?;
         Ok(TestClient::new(stream))
+    }
+
+    async fn open_websocket_client(&self) -> rs_netty::Result<WebSocketTestClient> {
+        let server = self
+            .websocket_server
+            .as_ref()
+            .expect("websocket test server");
+        let mut stream = TcpStream::connect(server.local_addr()).await?;
+        write_websocket_handshake(&mut stream, "127.0.0.1", "/mqtt", "mqtt").await?;
+        read_websocket_handshake(&mut stream).await?;
+        Ok(WebSocketTestClient::new(stream))
     }
 
     async fn connect_raw(&self, client_id: &str) -> rs_netty::Result<TcpStream> {
@@ -2093,13 +2207,31 @@ impl TestBroker {
 
     async fn shutdown(self) -> rs_netty::Result<()> {
         self.server.shutdown();
-        self.server.wait().await
+        if let Some(websocket_server) = &self.websocket_server {
+            websocket_server.shutdown();
+        }
+        if let Some(websocket_server) = self.websocket_server {
+            let (mqtt, websocket) = tokio::join!(self.server.wait(), websocket_server.wait());
+            mqtt?;
+            websocket
+        } else {
+            self.server.wait().await
+        }
     }
 
     async fn graceful_shutdown(self, timeout: Duration) -> rs_netty::Result<()> {
         self.broker.shutdown_active_sessions(timeout).await;
         self.server.shutdown();
-        self.server.wait().await
+        if let Some(websocket_server) = &self.websocket_server {
+            websocket_server.shutdown();
+        }
+        if let Some(websocket_server) = self.websocket_server {
+            let (mqtt, websocket) = tokio::join!(self.server.wait(), websocket_server.wait());
+            mqtt?;
+            websocket
+        } else {
+            self.server.wait().await
+        }
     }
 
     fn begin_shutdown(&self) {
@@ -2309,6 +2441,66 @@ impl TestClient {
                 if packet.packet_id == packet_id && packet.reason_code == reason_code
         ));
         Ok(())
+    }
+}
+
+struct WebSocketTestClient {
+    stream: TcpStream,
+    buf: BytesMut,
+}
+
+impl WebSocketTestClient {
+    fn new(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            buf: BytesMut::new(),
+        }
+    }
+
+    async fn write(&mut self, packet: MqttPacket) -> rs_netty::Result<()> {
+        let mut codec = MqttCodec::new();
+        let mut bytes = BytesMut::new();
+        codec.encode(packet, &mut bytes)?;
+        write_websocket_binary(&mut self.stream, bytes.freeze()).await
+    }
+
+    async fn read(&mut self) -> rs_netty::Result<MqttPacket> {
+        let payload = read_websocket_binary(&mut self.stream, &mut self.buf).await?;
+        let mut codec = MqttCodec::new();
+        let mut bytes = BytesMut::from(payload.as_ref());
+        let Some(packet) = codec.decode(&mut bytes)? else {
+            panic!("websocket binary frame did not contain a complete MQTT packet");
+        };
+        assert!(
+            bytes.is_empty(),
+            "websocket frame contained extra MQTT bytes"
+        );
+        Ok(packet)
+    }
+
+    async fn subscribe(
+        &mut self,
+        packet_id: u16,
+        topic_filter: &str,
+        maximum_qos: QoS,
+    ) -> rs_netty::Result<()> {
+        self.write(subscribe(packet_id, topic_filter, maximum_qos))
+            .await?;
+        assert!(matches!(self.read().await?, MqttPacket::SubAck(_)));
+        Ok(())
+    }
+
+    async fn expect_connack(&mut self) -> rs_netty::Result<()> {
+        assert!(matches!(self.read().await?, MqttPacket::ConnAck(_)));
+        Ok(())
+    }
+
+    async fn expect_publish(&mut self, message: &str) -> rs_netty::Result<PublishPacket> {
+        let delivered = self.read().await?;
+        let MqttPacket::Publish(packet) = delivered else {
+            panic!("{message}, got {delivered:?}");
+        };
+        Ok(packet)
     }
 }
 
@@ -2581,5 +2773,148 @@ async fn read_packet_with_buf(
         let read = stream.read(&mut chunk).await?;
         assert_ne!(read, 0, "connection closed before next MQTT packet");
         buf.extend_from_slice(&chunk[..read]);
+    }
+}
+
+async fn write_websocket_handshake(
+    stream: &mut TcpStream,
+    host: &str,
+    path: &str,
+    protocol: &str,
+) -> rs_netty::Result<()> {
+    let request = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Protocol: {protocol}\r\n\
+         \r\n"
+    );
+    stream.write_all(request.as_bytes()).await?;
+    Ok(())
+}
+
+async fn read_websocket_handshake(stream: &mut TcpStream) -> rs_netty::Result<()> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 128];
+    loop {
+        let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut chunk))
+            .await
+            .expect("websocket handshake response timed out")?;
+        assert_ne!(read, 0, "websocket closed before handshake response");
+        bytes.extend_from_slice(&chunk[..read]);
+        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    let response = String::from_utf8(bytes).expect("handshake response is utf-8");
+    assert!(response.starts_with("HTTP/1.1 101"), "{response}");
+    assert!(
+        response.contains("Sec-WebSocket-Protocol: mqtt\r\n"),
+        "{response}"
+    );
+    Ok(())
+}
+
+async fn write_websocket_binary(stream: &mut TcpStream, payload: Bytes) -> rs_netty::Result<()> {
+    let mut frame = Vec::new();
+    frame.push(0x82);
+    let len = payload.len();
+    if len < 126 {
+        frame.push(0x80 | len as u8);
+    } else if len <= u16::MAX as usize {
+        frame.push(0x80 | 126);
+        frame.extend_from_slice(&(len as u16).to_be_bytes());
+    } else {
+        frame.push(0x80 | 127);
+        frame.extend_from_slice(&(len as u64).to_be_bytes());
+    }
+    let mask = [0x11, 0x22, 0x33, 0x44];
+    frame.extend_from_slice(&mask);
+    for (index, byte) in payload.iter().enumerate() {
+        frame.push(byte ^ mask[index % 4]);
+    }
+    stream.write_all(&frame).await?;
+    Ok(())
+}
+
+async fn read_websocket_binary(
+    stream: &mut TcpStream,
+    buf: &mut BytesMut,
+) -> rs_netty::Result<Bytes> {
+    loop {
+        if let Some(payload) = try_decode_websocket_binary(buf) {
+            return Ok(payload);
+        }
+
+        let mut chunk = [0; 1024];
+        let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut chunk))
+            .await
+            .expect("websocket frame timed out")?;
+        assert_ne!(read, 0, "connection closed before next websocket frame");
+        buf.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn try_decode_websocket_binary(buf: &mut BytesMut) -> Option<Bytes> {
+    if buf.len() < 2 {
+        return None;
+    }
+    let opcode = buf[0] & 0x0f;
+    let masked = buf[1] & 0x80 != 0;
+    let mut len = usize::from(buf[1] & 0x7f);
+    let mut header_len = 2usize;
+    if len == 126 {
+        if buf.len() < 4 {
+            return None;
+        }
+        len = usize::from(u16::from_be_bytes([buf[2], buf[3]]));
+        header_len = 4;
+    } else if len == 127 {
+        if buf.len() < 10 {
+            return None;
+        }
+        len = u64::from_be_bytes([
+            buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
+        ]) as usize;
+        header_len = 10;
+    }
+    let mask_len = if masked { 4 } else { 0 };
+    let total_len = header_len + mask_len + len;
+    if buf.len() < total_len {
+        return None;
+    }
+    let mut frame = buf.split_to(total_len);
+    frame.advance(header_len);
+    let mask = if masked {
+        Some([frame[0], frame[1], frame[2], frame[3]])
+    } else {
+        None
+    };
+    if masked {
+        frame.advance(4);
+    }
+    let payload = frame.copy_to_bytes(len);
+    if let Some(mask) = mask {
+        let mut bytes = payload.to_vec();
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte ^= mask[index % 4];
+        }
+        return match opcode {
+            0x2 => Some(Bytes::from(bytes)),
+            0x9 | 0xA => try_decode_websocket_binary(buf),
+            0x8 => panic!("unexpected websocket close frame"),
+            _ => panic!("unexpected websocket opcode {opcode}"),
+        };
+    }
+
+    match opcode {
+        0x2 => Some(payload),
+        0x9 | 0xA => try_decode_websocket_binary(buf),
+        0x8 => panic!("unexpected websocket close frame"),
+        _ => panic!("unexpected websocket opcode {opcode}"),
     }
 }

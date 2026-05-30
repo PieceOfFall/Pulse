@@ -32,6 +32,26 @@ client_auth = "disabled"
 # Required when client_auth is optional or required.
 # client_ca = "certs/client-ca.pem"
 
+[websocket]
+# Enable MQTT over WebSocket on a separate listener. This does not replace the
+# MQTT TCP listener above: when enabled, Pulse serves MQTT TCP on 1883 and MQTT
+# over WebSocket on 8083 at the same time.
+enabled = false
+
+# WebSocket listen address. The default follows the common Mosquitto-style
+# convention of using 8083 for MQTT over WebSocket.
+bind = "0.0.0.0:8083"
+
+# HTTP request path accepted for the WebSocket upgrade. Clients should connect
+# to ws://host:8083/mqtt, send Sec-WebSocket-Protocol: mqtt, and carry each
+# MQTT packet in a binary WebSocket frame. The legacy mqttv3.1 subprotocol is
+# also accepted for compatibility.
+path = "/mqtt"
+
+# Enable wss:// on the WebSocket listener by reusing [server.tls] material.
+# When true, certificate_chain and private_key under [server.tls] are required.
+tls = false
+
 [storage]
 # Storage engine: memory, wal, sqlite, or mysql.
 # memory is volatile and best for local testing. wal is the recommended

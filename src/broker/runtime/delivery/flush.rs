@@ -19,7 +19,7 @@ pub(in crate::broker) async fn flush_deliveries(deliveries: Vec<Delivery>) {
         }
 
         let channel = delivery.channel;
-        let channel_id = channel.id();
+        let channel_id = delivery.connection_id;
         if channel.write(delivery.packet).await.is_err() {
             metrics::delivery_flush_failed();
             continue;
@@ -39,6 +39,7 @@ pub(in crate::broker) async fn flush_deliveries(deliveries: Vec<Delivery>) {
 }
 
 pub(in crate::broker) async fn flush_deliveries_to_context(
+    connection_id: u64,
     ctx: &mut Context<BrokerWrite>,
     deliveries: Vec<Delivery>,
 ) -> Result<()> {
@@ -48,7 +49,7 @@ pub(in crate::broker) async fn flush_deliveries_to_context(
 
     if deliveries.len() == 1 {
         let delivery = deliveries.into_iter().next().expect("single delivery");
-        if delivery.channel.id() == ctx.id() {
+        if delivery.connection_id == connection_id {
             if let Some(qos) = delivery.packet.publish_qos() {
                 metrics::publish_sent(qos_name(qos));
             }
@@ -63,7 +64,7 @@ pub(in crate::broker) async fn flush_deliveries_to_context(
 
     let mut external = Vec::new();
     for delivery in deliveries {
-        if delivery.channel.id() == ctx.id() {
+        if delivery.connection_id == connection_id {
             if let Some(qos) = delivery.packet.publish_qos() {
                 metrics::publish_sent(qos_name(qos));
             }

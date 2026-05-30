@@ -23,6 +23,7 @@ const CONFIG_FILE_NAME: &str = "Broker.toml";
 #[derive(Clone, Debug)]
 pub(crate) struct AppConfig {
     pub(crate) server: ServerConfig,
+    pub(crate) websocket: WebSocketConfig,
     pub(crate) storage: StorageConfig,
     pub(crate) limits: BrokerConfig,
     pub(crate) auth: AuthConfig,
@@ -45,6 +46,14 @@ pub(crate) struct ServerTlsConfig {
     pub(crate) private_key: Option<PathBuf>,
     pub(crate) client_auth: TlsClientAuth,
     pub(crate) client_ca: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WebSocketConfig {
+    pub(crate) enabled: bool,
+    pub(crate) bind: String,
+    pub(crate) path: String,
+    pub(crate) tls: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -150,6 +159,7 @@ pub(crate) struct ObservabilityConfig {
 #[derive(Default, Deserialize)]
 struct FileConfig {
     server: Option<ServerFileConfig>,
+    websocket: Option<WebSocketFileConfig>,
     storage: Option<StorageFileConfig>,
     limits: Option<LimitsFileConfig>,
     auth: Option<AuthConfig>,
@@ -172,6 +182,14 @@ struct ServerTlsFileConfig {
     private_key: Option<PathBuf>,
     client_auth: Option<TlsClientAuth>,
     client_ca: Option<PathBuf>,
+}
+
+#[derive(Default, Deserialize)]
+struct WebSocketFileConfig {
+    enabled: Option<bool>,
+    bind: Option<String>,
+    path: Option<String>,
+    tls: Option<bool>,
 }
 
 #[derive(Default, Deserialize)]
@@ -208,6 +226,7 @@ struct ObservabilityFileConfig {
 struct CliConfig {
     config_path: Option<PathBuf>,
     server: ServerFileConfig,
+    websocket: WebSocketFileConfig,
     storage: StorageFileConfig,
     limits: LimitsFileConfig,
     observability: ObservabilityFileConfig,
@@ -222,6 +241,12 @@ impl Default for AppConfig {
                 outbound_queue_size: 1,
                 shutdown_drain_timeout_ms: 5_000,
                 tls: ServerTlsConfig::default(),
+            },
+            websocket: WebSocketConfig {
+                enabled: false,
+                bind: "0.0.0.0:8083".to_string(),
+                path: "/mqtt".to_string(),
+                tls: false,
             },
             storage: default_storage_config(),
             limits: BrokerConfig::default(),
@@ -257,6 +282,9 @@ impl AppConfig {
         if let Some(server) = file.server {
             self.apply_server(server);
         }
+        if let Some(websocket) = file.websocket {
+            self.apply_websocket(websocket);
+        }
         if let Some(storage) = file.storage {
             self.apply_storage(storage);
         }
@@ -284,6 +312,12 @@ impl AppConfig {
                 client_auth: env_parse("MQTT_RS_TLS_CLIENT_AUTH")?,
                 client_ca: env_path("MQTT_RS_TLS_CLIENT_CA"),
             }),
+        });
+        self.apply_websocket(WebSocketFileConfig {
+            enabled: env_parse("MQTT_RS_WEBSOCKET_ENABLED")?,
+            bind: env_string("MQTT_RS_WEBSOCKET_BIND"),
+            path: env_string("MQTT_RS_WEBSOCKET_PATH"),
+            tls: env_parse("MQTT_RS_WEBSOCKET_TLS_ENABLED")?,
         });
         self.apply_storage(StorageFileConfig {
             engine: env_parse("MQTT_RS_STORAGE_ENGINE")?,
@@ -314,6 +348,7 @@ impl AppConfig {
 
     fn apply_cli(&mut self, cli: CliConfig) {
         self.apply_server(cli.server);
+        self.apply_websocket(cli.websocket);
         self.apply_storage(cli.storage);
         self.apply_limits(cli.limits);
         self.apply_observability(cli.observability);
@@ -352,6 +387,21 @@ impl AppConfig {
         }
         if let Some(client_ca) = tls.client_ca {
             self.server.tls.client_ca = Some(client_ca);
+        }
+    }
+
+    fn apply_websocket(&mut self, websocket: WebSocketFileConfig) {
+        if let Some(enabled) = websocket.enabled {
+            self.websocket.enabled = enabled;
+        }
+        if let Some(bind) = websocket.bind {
+            self.websocket.bind = bind;
+        }
+        if let Some(path) = websocket.path {
+            self.websocket.path = path;
+        }
+        if let Some(tls) = websocket.tls {
+            self.websocket.tls = tls;
         }
     }
 
@@ -431,6 +481,12 @@ impl AppConfig {
         if self.server.shutdown_drain_timeout_ms == 0 {
             return Err("server.shutdown_drain_timeout_ms must be greater than 0".into());
         }
+        if self.websocket.enabled && self.websocket.bind.is_empty() {
+            return Err("websocket.bind must not be empty when websocket.enabled is true".into());
+        }
+        if self.websocket.enabled && !self.websocket.path.starts_with('/') {
+            return Err("websocket.path must start with / when websocket.enabled is true".into());
+        }
         if self.limits.server_receive_maximum == 0 {
             return Err("limits.server_receive_maximum must be greater than 0".into());
         }
@@ -451,16 +507,16 @@ impl AppConfig {
             StorageEngine::Wal => {}
             StorageEngine::Sqlite | StorageEngine::Mysql => {}
         }
-        if self.server.tls.enabled {
+        if self.server.tls.enabled || (self.websocket.enabled && self.websocket.tls) {
             if self.server.tls.certificate_chain.is_none() {
                 return Err(
-                    "server.tls.certificate_chain is required when server.tls.enabled is true"
+                    "server.tls.certificate_chain is required when server.tls.enabled or websocket.tls is true"
                         .into(),
                 );
             }
             if self.server.tls.private_key.is_none() {
                 return Err(
-                    "server.tls.private_key is required when server.tls.enabled is true".into(),
+                    "server.tls.private_key is required when server.tls.enabled or websocket.tls is true".into(),
                 );
             }
             if matches!(
@@ -567,6 +623,16 @@ fn parse_cli(
             "--worker-threads" => {
                 config.server.worker_threads = Some(next_parse(&mut args, arg.as_ref())?)
             }
+            "--websocket" => config.websocket.enabled = Some(true),
+            "--no-websocket" => config.websocket.enabled = Some(false),
+            "--websocket-bind" => {
+                config.websocket.bind = Some(next_string(&mut args, arg.as_ref())?)
+            }
+            "--websocket-path" => {
+                config.websocket.path = Some(next_string(&mut args, arg.as_ref())?)
+            }
+            "--websocket-tls" => config.websocket.tls = Some(true),
+            "--no-websocket-tls" => config.websocket.tls = Some(false),
             "--tls" => tls_config_mut(&mut config.server).enabled = Some(true),
             "--no-tls" => tls_config_mut(&mut config.server).enabled = Some(false),
             "--tls-certificate-chain" => {
@@ -715,6 +781,10 @@ mod tests {
         "MQTT_RS_WORKER_THREADS",
         "MQTT_RS_OUTBOUND_QUEUE_SIZE",
         "MQTT_RS_SHUTDOWN_DRAIN_TIMEOUT_MS",
+        "MQTT_RS_WEBSOCKET_ENABLED",
+        "MQTT_RS_WEBSOCKET_BIND",
+        "MQTT_RS_WEBSOCKET_PATH",
+        "MQTT_RS_WEBSOCKET_TLS_ENABLED",
         "MQTT_RS_TLS_ENABLED",
         "MQTT_RS_TLS_CERTIFICATE_CHAIN",
         "MQTT_RS_TLS_PRIVATE_KEY",
@@ -816,6 +886,10 @@ mod tests {
         assert!(config.server.tls.private_key.is_none());
         assert_eq!(config.server.tls.client_auth, TlsClientAuth::Disabled);
         assert!(config.server.tls.client_ca.is_none());
+        assert!(!config.websocket.enabled);
+        assert_eq!(config.websocket.bind, "0.0.0.0:8083");
+        assert_eq!(config.websocket.path, "/mqtt");
+        assert!(!config.websocket.tls);
         #[cfg(not(windows))]
         assert_eq!(config.storage.engine, StorageEngine::Memory);
         assert_eq!(config.storage.commit_policy, CommitPolicy::Balanced);
@@ -850,6 +924,82 @@ mod tests {
         );
         assert_eq!(config.server.shutdown_drain_timeout_ms, 5_000);
         assert!(!config.auth.enabled);
+    }
+
+    #[test]
+    fn file_config_enables_websocket_listener() {
+        let file: FileConfig = toml::from_str(
+            r#"
+            [websocket]
+            enabled = true
+            bind = "127.0.0.1:8084"
+            path = "/custom"
+            tls = true
+
+            [server.tls]
+            certificate_chain = "certs/server-chain.pem"
+            private_key = "certs/server-key.pem"
+            "#,
+        )
+        .expect("parse config");
+
+        let mut config = AppConfig::default();
+        config.apply_file(file);
+        config.validate().expect("valid websocket config");
+
+        assert!(config.websocket.enabled);
+        assert_eq!(config.websocket.bind, "127.0.0.1:8084");
+        assert_eq!(config.websocket.path, "/custom");
+        assert!(config.websocket.tls);
+        assert!(!config.server.tls.enabled);
+    }
+
+    #[test]
+    fn env_and_cli_override_websocket_config() {
+        let _env = EnvGuard::set_tls(&[
+            ("MQTT_RS_WEBSOCKET_ENABLED", "true"),
+            ("MQTT_RS_WEBSOCKET_BIND", "127.0.0.1:8085"),
+            ("MQTT_RS_WEBSOCKET_PATH", "/env"),
+            ("MQTT_RS_WEBSOCKET_TLS_ENABLED", "true"),
+        ]);
+        let args = [
+            "Pulse",
+            "--websocket-bind",
+            "127.0.0.1:8086",
+            "--websocket-path",
+            "/cli",
+            "--no-websocket-tls",
+        ]
+        .into_iter()
+        .map(OsString::from);
+        let config = AppConfig::load_from_args(args).expect("load config");
+
+        assert!(config.websocket.enabled);
+        assert_eq!(config.websocket.bind, "127.0.0.1:8086");
+        assert_eq!(config.websocket.path, "/cli");
+        assert!(!config.websocket.tls);
+    }
+
+    #[test]
+    fn rejects_invalid_websocket_path() {
+        let _env = EnvGuard::clear_tls();
+        let args = ["Pulse", "--websocket", "--websocket-path", "mqtt"]
+            .into_iter()
+            .map(OsString::from);
+        let error = AppConfig::load_from_args(args).expect_err("invalid websocket config");
+
+        assert!(error.to_string().contains("websocket.path"));
+    }
+
+    #[test]
+    fn websocket_tls_reuses_server_tls_material() {
+        let _env = EnvGuard::clear_tls();
+        let args = ["Pulse", "--websocket", "--websocket-tls"]
+            .into_iter()
+            .map(OsString::from);
+        let error = AppConfig::load_from_args(args).expect_err("invalid websocket TLS config");
+
+        assert!(error.to_string().contains("server.tls.certificate_chain"));
     }
 
     #[test]

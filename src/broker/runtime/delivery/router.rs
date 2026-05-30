@@ -51,6 +51,7 @@ pub(in crate::broker) fn deliveries_for_publish(
                 Some(connection_id) => {
                     let client = state.clients_by_connection.get(connection_id)?;
                     let target = DeliveryTarget {
+                        connection_id: *connection_id,
                         channel: client.channel.clone(),
                         receive_maximum: client.receive_maximum,
                         maximum_packet_size: client.maximum_packet_size,
@@ -137,6 +138,7 @@ pub(in crate::broker) fn qos0_deliveries_for_publish_readonly(
         );
 
         deliveries.push(Delivery {
+            connection_id: *connection_id,
             channel: client.channel.clone(),
             packet: MqttPacket::Publish(publish).into(),
         });

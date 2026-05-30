@@ -27,6 +27,7 @@ pub(in crate::broker) fn retained_for_subscription(
         return Vec::new();
     };
     let target = DeliveryTarget {
+        connection_id: *connection_id,
         channel: client.channel.clone(),
         receive_maximum: client.receive_maximum,
         maximum_packet_size: client.maximum_packet_size,
@@ -110,6 +111,7 @@ fn qos0_retained_delivery_fast(
         && bytes.len() <= target.maximum_packet_size as usize
     {
         return Some(Delivery {
+            connection_id: target.connection_id,
             channel: target.channel.clone(),
             packet: BrokerWrite::Preencoded {
                 bytes: bytes.clone(),
@@ -125,6 +127,7 @@ fn qos0_retained_delivery_fast(
         ));
     }
     Some(Delivery {
+        connection_id: target.connection_id,
         channel: target.channel.clone(),
         packet: MqttPacket::Publish(PublishPacket {
             dup: false,

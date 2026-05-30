@@ -12,6 +12,9 @@ use std::sync::{
 use std::{path::Path, time::Duration};
 
 pub use runtime::connection::{BrokerLife, MqttHandler};
+pub(crate) use runtime::connection::{
+    ConnectionIdAllocator, ConnectionIdMap, WebSocketMqttHandler,
+};
 
 use rs_netty::{
     Channel,
