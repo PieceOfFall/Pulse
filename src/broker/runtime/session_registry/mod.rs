@@ -192,6 +192,7 @@ pub(in crate::broker) struct ClientEntry {
 }
 
 impl ClientEntry {
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::broker) fn new(
         client_id: String,
         channel: Channel<BrokerWrite>,

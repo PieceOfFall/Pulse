@@ -530,9 +530,11 @@ mod tests {
     #[test]
     fn enforces_message_and_payload_limits() {
         let mut state = BrokerState::default();
-        let mut config = BrokerConfig::default();
-        config.max_retained_messages = 1;
-        config.max_retained_payload_bytes = 4;
+        let config = BrokerConfig {
+            max_retained_messages: 1,
+            max_retained_payload_bytes: 4,
+            ..BrokerConfig::default()
+        };
 
         retain_publish(
             &mut state,

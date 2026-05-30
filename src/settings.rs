@@ -10,12 +10,11 @@ use std::{
 use serde::Deserialize;
 
 use crate::broker::{
-    WalCompactConfig,
+    CommitPolicy, WalCompactConfig,
     runtime::{
         auth::AuthConfig,
         config::{BrokerConfig, SlowConsumerPolicy},
     },
-    vnext::CommitPolicy,
 };
 
 const CONFIG_FILE_NAME: &str = "Broker.toml";
@@ -768,12 +767,12 @@ mod tests {
 
     use super::{AppConfig, FileConfig, StorageEngine, TlsClientAuth};
     use crate::broker::{
+        CommitPolicy,
         runtime::config::{
             INFLIGHT_RETRANSMIT_INTERVAL_MS, MAX_OFFLINE_QUEUE_LEN, MAX_RETAINED_MESSAGES,
             MAX_RETAINED_PAYLOAD_BYTES, MAX_SUBSCRIPTIONS_PER_CLIENT, SERVER_MAXIMUM_PACKET_SIZE,
             SERVER_RECEIVE_MAXIMUM, SERVER_TOPIC_ALIAS_MAXIMUM, SlowConsumerPolicy,
         },
-        vnext::CommitPolicy,
     };
 
     const CONFIG_ENV_KEYS: &[&str] = &[
@@ -1003,7 +1002,7 @@ mod tests {
     }
 
     #[test]
-    fn file_config_enables_vnext_wal_knobs() {
+    fn file_config_enables_wal_knobs() {
         let file: FileConfig = toml::from_str(
             r#"
             [server]
@@ -1024,7 +1023,7 @@ mod tests {
 
         let mut config = AppConfig::default();
         config.apply_file(file);
-        config.validate().expect("valid vNext config");
+        config.validate().expect("valid WAL config");
 
         assert_eq!(config.server.worker_threads, 2);
         assert_eq!(config.storage.engine, StorageEngine::Wal);
@@ -1039,7 +1038,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_accepts_vnext_wal_knobs() {
+    fn cli_accepts_wal_knobs() {
         let _env = EnvGuard::clear_tls();
         let args = [
             "Pulse",

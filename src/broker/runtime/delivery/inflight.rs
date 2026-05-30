@@ -147,6 +147,7 @@ pub(in crate::broker) fn retransmissions_for_connection(
     Some(deliveries)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn delivery_for_client(
     session: &mut SessionEntry,
     target: DeliveryTarget,

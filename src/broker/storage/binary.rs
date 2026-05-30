@@ -1,8 +1,11 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    error::Error,
+    fmt,
     fs::{self, File, OpenOptions},
     io::{self, ErrorKind, Read, Write},
     path::{Path, PathBuf},
+    str::FromStr,
     sync::{Mutex, mpsc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -12,16 +15,14 @@ use bytes::{Bytes, BytesMut};
 use rs_netty::codec::{
     Decoder, Encoder, MqttCodec, MqttPacket, PublishPacket, QoS, SubscriptionOptions,
 };
+use serde::Deserialize;
 
 use super::BrokerStorage;
-use crate::broker::{
-    runtime::{
-        message::PendingPublish,
-        retained_store::RetainedMessage,
-        session_registry::{BrokerState, PersistenceChange, SessionEntry},
-        subscription_tree::SubscriptionEntry,
-    },
-    vnext::CommitPolicy,
+use crate::broker::runtime::{
+    message::PendingPublish,
+    retained_store::RetainedMessage,
+    session_registry::{BrokerState, PersistenceChange, SessionEntry},
+    subscription_tree::SubscriptionEntry,
 };
 use tracing::warn;
 
@@ -32,6 +33,47 @@ const CHECKPOINT_FILE_NAME: &str = "broker.checkpoint";
 const TMP_SUFFIX: &str = ".tmp";
 const DEFAULT_WAL_COMPACT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_WAL_COMPACT_INTERVAL_MS: u64 = 10 * 60 * 1000;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum CommitPolicy {
+    Strict,
+    #[default]
+    Balanced,
+    Fast,
+}
+
+#[derive(Debug)]
+pub(crate) struct ParseCommitPolicyError {
+    value: String,
+}
+
+impl fmt::Display for ParseCommitPolicyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "storage.commit_policy must be one of strict, balanced, fast; got `{}`",
+            self.value
+        )
+    }
+}
+
+impl Error for ParseCommitPolicyError {}
+
+impl FromStr for CommitPolicy {
+    type Err = ParseCommitPolicyError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "strict" => Ok(Self::Strict),
+            "balanced" => Ok(Self::Balanced),
+            "fast" => Ok(Self::Fast),
+            _ => Err(ParseCommitPolicyError {
+                value: value.to_string(),
+            }),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WalCompactConfig {
@@ -68,6 +110,7 @@ struct BinaryStorageInner {
 }
 
 impl BinaryStorage {
+    #[cfg(test)]
     pub(crate) fn open(dir: impl AsRef<Path>, commit_policy: CommitPolicy) -> io::Result<Self> {
         Self::open_with_options(dir, commit_policy, WalCompactConfig::default())
     }
@@ -581,7 +624,6 @@ fn open_wal_file(path: &Path) -> io::Result<File> {
 
 fn create_wal_file(path: &Path) -> io::Result<File> {
     let mut file = OpenOptions::new()
-        .write(true)
         .append(true)
         .read(true)
         .create_new(true)
@@ -967,9 +1009,10 @@ fn sync_subscription_records(
         && let Some(subscription) = state.subscriptions.last()
     {
         let key = (subscription.client_id.clone(), subscription.filter.clone());
-        if !snapshot.subscriptions.contains_key(&key) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = snapshot.subscriptions.entry(key)
+        {
             let subscription = SubscriptionSnapshot::from_subscription(subscription);
-            snapshot.subscriptions.insert(key, subscription.clone());
+            entry.insert(subscription.clone());
             return vec![Record::SubscriptionUpsert(subscription)];
         }
     }

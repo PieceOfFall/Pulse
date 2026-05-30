@@ -1,6 +1,5 @@
 pub(crate) mod runtime;
 mod storage;
-pub(crate) mod vnext;
 
 #[cfg(test)]
 mod tests;
@@ -28,10 +27,9 @@ use self::runtime::session_registry::BrokerState;
 use self::runtime::time::now_ms;
 use self::runtime::write::BrokerWrite;
 use self::storage::{BinaryStorage, BrokerStorage, InMemoryStorage, MysqlStorage, SqliteStorage};
-use self::vnext::CommitPolicy;
 use crate::{observability::metrics, protocol};
 
-pub(crate) use self::storage::WalCompactConfig;
+pub(crate) use self::storage::{CommitPolicy, WalCompactConfig};
 
 const KEEP_ALIVE_MONITOR_INTERVAL: Duration = Duration::from_millis(100);
 const METRICS_RECORD_INTERVAL_MS: u64 = 1_000;

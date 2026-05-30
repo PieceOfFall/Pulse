@@ -2267,8 +2267,10 @@ fn auth_broker(mut acl: Vec<AuthAclConfig>, mut extra_users: Vec<AuthUserConfig>
 }
 
 fn retransmit_broker(interval_ms: u64) -> Broker {
-    let mut config = BrokerConfig::default();
-    config.inflight_retransmit_interval_ms = interval_ms;
+    let config = BrokerConfig {
+        inflight_retransmit_interval_ms: interval_ms,
+        ..BrokerConfig::default()
+    };
     Broker::with_config(config)
 }
 

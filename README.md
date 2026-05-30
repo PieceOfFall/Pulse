@@ -29,9 +29,6 @@ message fabrics that need durable sessions without dragging in a giant service.
   print-debug archaeology.
 - Graceful shutdown through `rs-netty` server handles: Pulse listens for Ctrl-C,
   asks the server to stop accepting work, and waits for the server task to exit.
-- vNext groundwork for a higher-throughput broker core: sharded runtimes, a
-  trie-based router index, and append-only durable log events are now present
-  behind the current stable broker runtime.
 
 ## Quick Start
 
@@ -116,9 +113,8 @@ Operational knobs include `MQTT_RS_SHUTDOWN_DRAIN_TIMEOUT_MS` /
 `--shutdown-drain-timeout-ms` and `MQTT_RS_INFLIGHT_RETRANSMIT_INTERVAL_MS` /
 `--inflight-retransmit-interval-ms`.
 
-vNext performance knobs are accepted by the configuration layer so deployments
-can start standardizing on the next storage/routing model while the stable
-runtime remains available:
+WAL persistence knobs are accepted by the configuration layer for deployments
+that want lightweight durable state without SQLite or MySQL:
 
 ```toml
 [server]
@@ -219,7 +215,6 @@ src/broker/runtime/connection       TCP and WebSocket MQTT handlers
 src/broker/runtime/delivery         publish routing, QoS, offline queues
 src/broker/runtime/subscription_tree subscriptions and shared groups
 src/broker/storage                  in-memory, SQLite, and MySQL state
-src/broker/vnext                    sharded core, trie router, WAL event log
 src/observability                   tracing and Prometheus metrics
 ```
 
@@ -256,7 +251,7 @@ This single local run used:
 python3 benchmark/run.py --messages 10000 --timeout 60
 ```
 
-Environment: macOS 26.5 arm64, Python 3.9.6, Pulse 1.2.0 release build,
+Environment: macOS 26.5 arm64, Python 3.9.6, Pulse 1.3.2 release build,
 Pulse binary WAL temporary storage in `fast` commit mode, Mosquitto 2.1.2
 temporary persistence, 128-byte payloads, 100 retained-fanout subscribers, and
 10 ms RSS sampling.
@@ -264,14 +259,14 @@ RSS values are MiB for the broker process.
 
 | Broker | Scenario | Count | Seconds | Rate/sec | Base RSS | Peak RSS | End RSS |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Pulse-wal | qos0-throughput | 10000 | 0.1067 | 93731.44 | 3.30 | 3.75 | 3.75 |
-| Pulse-wal | qos1-throughput | 10000 | 0.4401 | 22720.43 | 3.30 | 3.95 | 3.95 |
-| Pulse-wal | qos2-throughput | 10000 | 0.8511 | 11749.59 | 3.30 | 3.95 | 3.95 |
-| Pulse-wal | retained-fanout | 100 | 0.0115 | 8709.95 | 3.30 | 5.86 | 5.86 |
-| Mosquitto-persist | qos0-throughput | 10000 | 0.1177 | 84970.82 | 4.44 | 5.44 | 5.44 |
-| Mosquitto-persist | qos1-throughput | 10000 | 1.0956 | 9127.19 | 4.44 | 5.45 | 5.45 |
-| Mosquitto-persist | qos2-throughput | 10000 | 1.5980 | 6257.68 | 4.44 | 5.48 | 5.48 |
-| Mosquitto-persist | retained-fanout | 100 | 0.0101 | 9930.77 | 4.44 | 6.00 | 6.00 |
+| Pulse-wal | qos0-throughput | 10000 | 0.1008 | 99236.87 | 3.48 | 4.00 | 4.00 |
+| Pulse-wal | qos1-throughput | 10000 | 0.4124 | 24250.89 | 3.48 | 4.23 | 4.23 |
+| Pulse-wal | qos2-throughput | 10000 | 0.8311 | 12031.69 | 3.48 | 4.23 | 4.23 |
+| Pulse-wal | retained-fanout | 100 | 0.0113 | 8871.18 | 3.48 | 6.61 | 6.61 |
+| Mosquitto-persist | qos0-throughput | 10000 | 0.1166 | 85742.37 | 4.44 | 5.41 | 5.41 |
+| Mosquitto-persist | qos1-throughput | 10000 | 1.0624 | 9412.80 | 4.44 | 5.42 | 5.42 |
+| Mosquitto-persist | qos2-throughput | 10000 | 1.6111 | 6206.93 | 4.44 | 5.42 | 5.42 |
+| Mosquitto-persist | retained-fanout | 100 | 0.0097 | 10282.20 | 4.44 | 5.94 | 5.94 |
 
 ## Roadmap
 
@@ -279,8 +274,6 @@ Pulse is still young. The next high-value areas are:
 
 - Hashed password storage and external authentication providers.
 - Interop testing with common MQTT v5 clients.
-- Wire `broker::vnext` into the live MQTT handler once the WAL recovery and
-  sharded session model have completed crash/restart coverage.
 - Clear documentation of supported and intentionally unsupported MQTT v5
   features.
 

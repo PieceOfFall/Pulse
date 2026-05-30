@@ -130,7 +130,7 @@ impl Broker {
                 .map(|client| client.client_id.clone())?;
             let session = state.sessions_by_client_id.get_mut(&client_id)?;
             let removed = session.outbound_qos1.remove(&packet_id).is_some();
-            removed.then(|| (client_id, !session.offline_queue.is_empty()))
+            removed.then_some((client_id, !session.offline_queue.is_empty()))
         })?;
 
         if outcome.1 {
