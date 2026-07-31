@@ -4,6 +4,8 @@ version = "1.3.2"
 edition = "2024"
 authors = ["FAll"]
 repository = "https://github.com/PieceOfFall/Pulse"
+homepage = "https://github.com/PieceOfFall/Pulse"
+description = "Fast, persistent MQTT v5 broker for Rust-powered systems"
 exclude = ["benchmark/**"]
 
 [package.metadata.wix]
