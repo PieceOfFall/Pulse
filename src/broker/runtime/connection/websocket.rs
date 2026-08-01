@@ -1,6 +1,6 @@
 use bytes::{Bytes, BytesMut};
 use rs_netty::{
-    Context, Error, Handler, Result,
+    Context, Handler, Result,
     codec::{
         Decoder, HttpResponse, HttpWsInbound, MqttCodec, MqttPacket, WebSocketClose,
         WebSocketHandshake, WebSocketMessage,
@@ -18,6 +18,7 @@ pub(crate) struct WebSocketMqttHandler {
     accepted: bool,
     mqtt: MqttHandler,
     decoder: MqttCodec,
+    mqtt_buffer: BytesMut,
 }
 
 impl WebSocketMqttHandler {
@@ -37,6 +38,7 @@ impl WebSocketMqttHandler {
             accepted: false,
             mqtt: MqttHandler::with_connection_ids(broker, connection_ids),
             decoder: MqttCodec::with_max_packet_size(max_packet_size),
+            mqtt_buffer: BytesMut::new(),
         }
     }
 
@@ -77,19 +79,8 @@ impl WebSocketMqttHandler {
         ctx.close().await
     }
 
-    fn decode_mqtt_packet(&mut self, bytes: Bytes) -> Result<MqttPacket> {
-        let mut frame = BytesMut::from(bytes.as_ref());
-        let Some(packet) = self.decoder.decode(&mut frame)? else {
-            return Err(Error::Decode(
-                "websocket binary frame did not contain a complete MQTT packet".to_string(),
-            ));
-        };
-        if !frame.is_empty() {
-            return Err(Error::Decode(
-                "websocket binary frame must contain exactly one MQTT packet".to_string(),
-            ));
-        }
-        Ok(packet)
+    fn decode_mqtt_packet(&mut self) -> Result<Option<MqttPacket>> {
+        self.decoder.decode(&mut self.mqtt_buffer)
     }
 }
 
@@ -107,8 +98,11 @@ impl Handler<HttpWsInbound> for WebSocketMqttHandler {
                     .await
             }
             HttpWsInbound::WebSocket(WebSocketMessage::Binary(bytes)) => {
-                let packet = self.decode_mqtt_packet(bytes)?;
-                self.mqtt.read(ctx, packet).await
+                self.mqtt_buffer.extend_from_slice(&bytes);
+                while let Some(packet) = self.decode_mqtt_packet()? {
+                    self.mqtt.read(ctx, packet).await?;
+                }
+                Ok(())
             }
             HttpWsInbound::WebSocket(WebSocketMessage::Text(_)) => {
                 self.close_websocket(

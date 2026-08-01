@@ -91,6 +91,46 @@ async fn tcp_publish_reaches_websocket_subscriber() -> rs_netty::Result<()> {
     broker.shutdown().await
 }
 
+#[tokio::test]
+async fn websocket_connect_can_span_binary_messages() -> rs_netty::Result<()> {
+    let broker = TestBroker::start_with_websocket().await?;
+    let mut client = broker.open_websocket_client().await?;
+    let connect = connect_packet("ws-fragmented-connect");
+    let split = connect.len() / 2;
+
+    write_websocket_binary(
+        &mut client.stream,
+        Bytes::copy_from_slice(&connect[..split]),
+    )
+    .await?;
+    write_websocket_binary(
+        &mut client.stream,
+        Bytes::copy_from_slice(&connect[split..]),
+    )
+    .await?;
+    client.expect_connack().await?;
+
+    drop(client);
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn websocket_binary_message_can_contain_multiple_mqtt_packets() -> rs_netty::Result<()> {
+    let broker = TestBroker::start_with_websocket().await?;
+    let mut client = broker.open_websocket_client().await?;
+    let mut codec = MqttCodec::new();
+    let mut bytes = BytesMut::new();
+    codec.encode(connect("ws-batched-packets"), &mut bytes)?;
+    codec.encode(MqttPacket::PingReq, &mut bytes)?;
+
+    write_websocket_binary(&mut client.stream, bytes.freeze()).await?;
+    client.expect_connack().await?;
+    assert!(matches!(client.read().await?, MqttPacket::PingResp));
+
+    drop(client);
+    broker.shutdown().await
+}
+
 #[test]
 fn upsert_subscription_returns_updated_subscription_index() {
     let mut subscriptions = vec![
