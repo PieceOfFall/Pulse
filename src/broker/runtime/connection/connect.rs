@@ -28,7 +28,6 @@ pub(in crate::broker) fn connack_capabilities(config: &BrokerConfig) -> Vec<Mqtt
         MqttProperty::ReceiveMaximum(config.server_receive_maximum),
         MqttProperty::MaximumPacketSize(config.server_maximum_packet_size),
         MqttProperty::TopicAliasMaximum(config.server_topic_alias_maximum),
-        MqttProperty::MaximumQoS(2),
         MqttProperty::RetainAvailable(1),
         MqttProperty::WildcardSubscriptionAvailable(1),
         MqttProperty::SubscriptionIdentifierAvailable(1),

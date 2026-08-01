@@ -136,6 +136,30 @@ fn upsert_subscription_returns_updated_subscription_index() {
 }
 
 #[tokio::test]
+async fn connack_omits_maximum_qos_when_qos_2_is_supported() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut stream = TcpStream::connect(broker.server.local_addr()).await?;
+
+    stream.write_all(&connect_packet("connack-client")).await?;
+
+    let mut fixed_header = [0; 2];
+    stream.read_exact(&mut fixed_header).await?;
+    assert_eq!(fixed_header, [0x20, 0x16]);
+
+    let mut body = [0; 22];
+    stream.read_exact(&mut body).await?;
+    assert_eq!(
+        body,
+        [
+            0x00, 0x00, 0x13, 0x21, 0x04, 0x00, 0x27, 0x01, 0x00, 0x00, 0x00, 0x22, 0x04, 0x00,
+            0x25, 0x01, 0x28, 0x01, 0x29, 0x01, 0x2a, 0x01,
+        ]
+    );
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
 async fn connect_rejects_empty_client_id_without_clean_start() -> rs_netty::Result<()> {
     let broker = TestBroker::start().await?;
     let mut client = broker.open_client().await?;
