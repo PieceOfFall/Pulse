@@ -1,9 +1,9 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     error::Error,
     fmt,
     fs::{self, File, OpenOptions},
-    io::{self, ErrorKind, Read, Write},
+    io::{self, BufReader, ErrorKind, Read, Write},
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Mutex, mpsc},
@@ -12,27 +12,47 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
-use rs_netty::codec::{
-    Decoder, Encoder, MqttCodec, MqttPacket, PublishPacket, QoS, SubscriptionOptions,
-};
+use rs_netty::codec::{Decoder, Encoder, MqttCodec, MqttPacket, PublishPacket, QoS};
 use serde::Deserialize;
 
-use super::BrokerStorage;
-use crate::broker::runtime::{
-    message::PendingPublish,
-    retained_store::RetainedMessage,
-    session_registry::{BrokerState, PersistenceChange, SessionEntry},
-    subscription_tree::SubscriptionEntry,
+use super::{
+    BrokerStorage,
+    delta::{
+        CLIENT_PATCH_VERSION, ClientPatch, ClientPatchMode, PendingSnapshot, PersistentProjection,
+        QueuedSnapshot, RetainedPatch, SessionSnapshot, StoragePatch, SubscriptionSnapshot,
+        prepare_patches,
+    },
 };
-use tracing::warn;
+use crate::broker::runtime::{
+    retained_store::RetainedMessage,
+    session_registry::{BrokerState, QueuedPublish, SessionEntry},
+};
 
-const MAGIC: &[u8] = b"PBIN1\n";
-const LOG_FILE_NAME: &str = "broker.binlog";
+const V1_MAGIC: &[u8] = b"PBIN1\n";
+const V2_MAGIC: &[u8] = b"PBIN2\n";
+const LEGACY_LOG_FILE_NAME: &str = "broker.binlog";
+const LEGACY_CHECKPOINT_FILE_NAME: &str = "broker.checkpoint";
 const MANIFEST_FILE_NAME: &str = "broker.manifest";
-const CHECKPOINT_FILE_NAME: &str = "broker.checkpoint";
+const V2_FORMAT: &str = "pbin2";
+const V2_CHECKPOINT_PREFIX: &str = "broker.pbin2.checkpoint.";
+const V2_WAL_PREFIX: &str = "broker.pbin2.wal.";
 const TMP_SUFFIX: &str = ".tmp";
+const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_WAL_COMPACT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_WAL_COMPACT_INTERVAL_MS: u64 = 10 * 60 * 1000;
+
+const CLIENT_PATCH: u8 = 1;
+const RETAINED_PATCH: u8 = 2;
+const CHECKPOINT_END_PAYLOAD: &[u8] = b"\x03PEND2";
+
+const V1_SESSION_UPSERT: u8 = 1;
+const V1_SESSION_DELETE: u8 = 2;
+const V1_SUBSCRIPTION_UPSERT: u8 = 3;
+const V1_SUBSCRIPTION_DELETE: u8 = 4;
+const V1_RETAINED_UPSERT: u8 = 5;
+const V1_RETAINED_DELETE: u8 = 6;
+const V1_OFFLINE_REPLACE: u8 = 7;
+const V1_OUTBOUND_REPLACE: u8 = 8;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
@@ -90,15 +110,6 @@ impl Default for WalCompactConfig {
     }
 }
 
-const SESSION_UPSERT: u8 = 1;
-const SESSION_DELETE: u8 = 2;
-const SUBSCRIPTION_UPSERT: u8 = 3;
-const SUBSCRIPTION_DELETE: u8 = 4;
-const RETAINED_UPSERT: u8 = 5;
-const RETAINED_DELETE: u8 = 6;
-const OFFLINE_REPLACE: u8 = 7;
-const OUTBOUND_REPLACE: u8 = 8;
-
 pub(crate) struct BinaryStorage {
     inner: Mutex<BinaryStorageInner>,
     log: Mutex<BinaryLog>,
@@ -106,7 +117,7 @@ pub(crate) struct BinaryStorage {
 
 struct BinaryStorageInner {
     state: BrokerState,
-    snapshot: PersistentSnapshot,
+    projection: PersistentProjection,
 }
 
 impl BinaryStorage {
@@ -123,8 +134,7 @@ impl BinaryStorage {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
         let recovered = recover_storage(dir)?;
-        let state = recovered.state;
-        let snapshot = PersistentSnapshot::from_state(&state);
+        let state = recovered.projection.clone().into_state();
         let log = BinaryLog::open(
             dir.to_path_buf(),
             recovered.active_path,
@@ -132,9 +142,11 @@ impl BinaryStorage {
             commit_policy,
             compact,
         )?;
-
         Ok(Self {
-            inner: Mutex::new(BinaryStorageInner { state, snapshot }),
+            inner: Mutex::new(BinaryStorageInner {
+                state,
+                projection: recovered.projection,
+            }),
             log: Mutex::new(log),
         })
     }
@@ -144,26 +156,29 @@ impl BrokerStorage for BinaryStorage {
     fn with_state(&self, operation: &mut dyn FnMut(&mut BrokerState)) {
         let mut inner = self.inner.lock().expect("broker state lock poisoned");
         operation(&mut inner.state);
-
-        let changes = inner.state.take_persistence_changes();
+        let changes = inner.state.persistence_changes();
         if changes.is_empty() {
             return;
         }
 
-        let BinaryStorageInner { state, snapshot } = &mut *inner;
-        let records = diff_records_for_changes(snapshot, state, changes);
-        if !records.is_empty() {
-            let mut log = self.log.lock().expect("binary log lock poisoned");
-            log.append_many(&records)
-                .expect("persist broker state to binary log");
-            log.compact_if_needed(snapshot)
-                .expect("compact binary log checkpoint");
+        let patches = prepare_patches(&inner.projection, &inner.state, &changes);
+        if patches.is_empty() {
+            inner.state.take_persistence_changes();
+            return;
         }
-    }
 
-    fn with_transient_state(&self, operation: &mut dyn FnMut(&mut BrokerState)) {
-        let mut inner = self.inner.lock().expect("broker state lock poisoned");
-        operation(&mut inner.state);
+        let mut log = self.log.lock().expect("binary log lock poisoned");
+        log.append_many(&patches)
+            .expect("persist broker state to PBIN2 log");
+        for patch in &patches {
+            inner
+                .projection
+                .apply_patch(patch)
+                .expect("apply generated PBIN2 patch");
+        }
+        inner.state.take_persistence_changes();
+        log.compact_if_needed(&inner.projection)
+            .expect("compact PBIN2 checkpoint");
     }
 
     fn read_state(&self, operation: &mut dyn FnMut(&BrokerState)) {
@@ -175,7 +190,7 @@ impl BrokerStorage for BinaryStorage {
 struct BinaryLog {
     dir: PathBuf,
     active_path: PathBuf,
-    active_epoch: Option<u64>,
+    active_epoch: u64,
     file: Option<File>,
     commit_policy: CommitPolicy,
     compact: WalCompactConfig,
@@ -183,7 +198,7 @@ struct BinaryLog {
     last_compacted_at: Instant,
     records_since_checkpoint: usize,
     pending_balanced_records: usize,
-    fast_tx: Option<mpsc::Sender<Vec<Record>>>,
+    fast_tx: Option<mpsc::Sender<Vec<StoragePatch>>>,
     fast_thread: Option<JoinHandle<io::Result<()>>>,
 }
 
@@ -191,11 +206,14 @@ impl BinaryLog {
     fn open(
         dir: PathBuf,
         active_path: PathBuf,
-        active_epoch: Option<u64>,
+        active_epoch: u64,
         commit_policy: CommitPolicy,
         compact: WalCompactConfig,
     ) -> io::Result<Self> {
-        let file = open_wal_file(&active_path)?;
+        let file = OpenOptions::new()
+            .append(true)
+            .read(true)
+            .open(&active_path)?;
         let current_bytes = file.metadata()?.len();
         let mut log = Self {
             dir,
@@ -215,20 +233,20 @@ impl BinaryLog {
         Ok(log)
     }
 
-    fn append_many(&mut self, records: &[Record]) -> io::Result<()> {
-        let encoded_bytes = encoded_records_len(records);
+    fn append_many(&mut self, patches: &[StoragePatch]) -> io::Result<()> {
+        let encoded_bytes = encoded_patches_len(patches)?;
         if let Some(tx) = &self.fast_tx {
-            tx.send(records.to_vec())
-                .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "binary log writer stopped"))?;
+            tx.send(patches.to_vec())
+                .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "PBIN2 writer stopped"))?;
             self.current_bytes += encoded_bytes;
-            self.records_since_checkpoint += records.len();
+            self.records_since_checkpoint += patches.len();
             return Ok(());
         }
 
-        let file = self.file.as_mut().expect("sync binary log file");
-        self.current_bytes += write_records(file, records)?;
-        self.records_since_checkpoint += records.len();
-        self.pending_balanced_records += records.len();
+        let file = self.file.as_mut().expect("sync PBIN2 log file");
+        self.current_bytes += write_patches(file, patches)?;
+        self.records_since_checkpoint += patches.len();
+        self.pending_balanced_records += patches.len();
         match self.commit_policy {
             CommitPolicy::Strict => {
                 file.flush()?;
@@ -245,52 +263,49 @@ impl BinaryLog {
         Ok(())
     }
 
-    fn compact_if_needed(&mut self, snapshot: &PersistentSnapshot) -> io::Result<()> {
+    fn compact_if_needed(&mut self, projection: &PersistentProjection) -> io::Result<()> {
         let size_triggered =
             self.compact.max_bytes != 0 && self.current_bytes > self.compact.max_bytes;
         let time_triggered = self.compact.interval_ms != 0
             && self.records_since_checkpoint > 0
             && self.last_compacted_at.elapsed() >= Duration::from_millis(self.compact.interval_ms);
-        if !size_triggered && !time_triggered {
-            return Ok(());
+        if size_triggered || time_triggered {
+            self.compact(projection)?;
         }
-
-        self.compact(snapshot)
+        Ok(())
     }
 
-    fn compact(&mut self, snapshot: &PersistentSnapshot) -> io::Result<()> {
+    fn compact(&mut self, projection: &PersistentProjection) -> io::Result<()> {
         self.close_writer()?;
+        let next_epoch = next_v2_epoch(&self.dir)?.max(self.active_epoch.saturating_add(1));
+        let checkpoint_path = v2_checkpoint_path(&self.dir, next_epoch);
+        let wal_path = v2_wal_path(&self.dir, next_epoch);
+        write_checkpoint(&checkpoint_path, projection)?;
+        let new_file = create_v2_wal(&wal_path)?;
+        sync_dir(&self.dir)?;
 
-        let checkpoint_path = self.dir.join(CHECKPOINT_FILE_NAME);
-        write_checkpoint(&checkpoint_path, snapshot)?;
-
-        let next_epoch = self.active_epoch.unwrap_or(0) + 1;
-        let next_path = wal_epoch_path(&self.dir, next_epoch);
-        remove_file_if_exists(&next_path)?;
-        let new_file = create_wal_file(&next_path)?;
-
-        let manifest = WalManifest::new(next_epoch);
+        let manifest = WalManifest::v2(next_epoch);
         write_manifest(&self.dir, &manifest)?;
         sync_dir(&self.dir)?;
 
-        self.active_path = next_path;
-        self.active_epoch = Some(next_epoch);
-        self.current_bytes = MAGIC.len() as u64;
+        self.active_path = wal_path;
+        self.active_epoch = next_epoch;
+        self.current_bytes = V2_MAGIC.len() as u64;
         self.records_since_checkpoint = 0;
         self.pending_balanced_records = 0;
         self.last_compacted_at = Instant::now();
         self.start_writer(new_file);
-        cleanup_unreferenced(&self.dir, self.active_epoch)?;
+        cleanup_after_v2_commit(&self.dir, &manifest)?;
         Ok(())
     }
 
     fn start_writer(&mut self, file: File) {
         if matches!(self.commit_policy, CommitPolicy::Fast) {
-            let (tx, rx) = mpsc::channel::<Vec<Record>>();
+            let (tx, rx) = mpsc::channel::<Vec<StoragePatch>>();
             let fast_thread = thread::spawn(move || {
                 let mut file = file;
-                while let Ok(records) = rx.recv() {
-                    write_records(&mut file, &records)?;
+                while let Ok(patches) = rx.recv() {
+                    write_patches(&mut file, &patches)?;
                 }
                 file.flush()?;
                 file.sync_data()
@@ -298,20 +313,19 @@ impl BinaryLog {
             self.file = None;
             self.fast_tx = Some(tx);
             self.fast_thread = Some(fast_thread);
-            return;
+        } else {
+            self.file = Some(file);
+            self.fast_tx = None;
+            self.fast_thread = None;
         }
-
-        self.file = Some(file);
-        self.fast_tx = None;
-        self.fast_thread = None;
     }
 
     fn close_writer(&mut self) -> io::Result<()> {
         self.fast_tx.take();
         if let Some(thread) = self.fast_thread.take() {
-            thread.join().map_err(|_| {
-                io::Error::new(ErrorKind::BrokenPipe, "binary log writer panicked")
-            })??;
+            thread
+                .join()
+                .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "PBIN2 writer panicked"))??;
         }
         if let Some(mut file) = self.file.take() {
             file.flush()?;
@@ -327,56 +341,87 @@ impl Drop for BinaryLog {
     }
 }
 
-fn write_records(file: &mut File, records: &[Record]) -> io::Result<u64> {
+fn write_patches(file: &mut File, patches: &[StoragePatch]) -> io::Result<u64> {
     let mut written = 0;
-    for record in records {
-        let payload = encode_record(record);
-        let checksum = crc32(&payload);
-        file.write_all(&(payload.len() as u32).to_le_bytes())?;
-        file.write_all(&payload)?;
-        file.write_all(&checksum.to_le_bytes())?;
-        written += record_encoded_len(payload.len());
+    for patch in patches {
+        validate_storage_patch(patch)?;
+        let payload = encode_patch(patch);
+        written += write_frame(file, &payload)?;
     }
     Ok(written)
 }
 
-fn encoded_records_len(records: &[Record]) -> u64 {
-    records
-        .iter()
-        .map(|record| record_encoded_len(encode_record(record).len()))
-        .sum()
+fn write_frame(file: &mut File, payload: &[u8]) -> io::Result<u64> {
+    if payload.len() > MAX_FRAME_BYTES || payload.len() > u32::MAX as usize {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "PBIN2 frame exceeds the maximum size",
+        ));
+    }
+    let checksum = crc32(payload);
+    file.write_all(&(payload.len() as u32).to_le_bytes())?;
+    file.write_all(payload)?;
+    file.write_all(&checksum.to_le_bytes())?;
+    Ok(frame_encoded_len(payload.len()))
 }
 
-fn record_encoded_len(payload_len: usize) -> u64 {
+fn encoded_patches_len(patches: &[StoragePatch]) -> io::Result<u64> {
+    patches.iter().try_fold(0u64, |total, patch| {
+        validate_storage_patch(patch)?;
+        let payload_len = encode_patch(patch).len();
+        if payload_len > MAX_FRAME_BYTES || payload_len > u32::MAX as usize {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "PBIN2 frame exceeds the maximum size",
+            ));
+        }
+        Ok(total + frame_encoded_len(payload_len))
+    })
+}
+
+fn validate_storage_patch(patch: &StoragePatch) -> io::Result<()> {
+    patch.validate().map_err(invalid_data)
+}
+
+fn frame_encoded_len(payload_len: usize) -> u64 {
     (4 + payload_len + 4) as u64
 }
 
 struct RecoveredStorage {
-    state: BrokerState,
+    projection: PersistentProjection,
     active_path: PathBuf,
-    active_epoch: Option<u64>,
+    active_epoch: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct WalManifest {
+    version: u32,
+    format: Option<String>,
     checkpoint: String,
     active_log: String,
     active_epoch: u64,
 }
 
 impl WalManifest {
-    fn new(active_epoch: u64) -> Self {
+    fn v2(active_epoch: u64) -> Self {
         Self {
-            checkpoint: CHECKPOINT_FILE_NAME.to_string(),
-            active_log: wal_epoch_file_name(active_epoch),
+            version: 2,
+            format: Some(V2_FORMAT.to_string()),
+            checkpoint: v2_checkpoint_file_name(active_epoch),
+            active_log: v2_wal_file_name(active_epoch),
             active_epoch,
         }
     }
 
     fn encode(&self) -> String {
+        let format = self
+            .format
+            .as_deref()
+            .map(|format| format!("format={format}\n"))
+            .unwrap_or_default();
         format!(
-            "version=1\ncheckpoint={}\nactive_log={}\nactive_epoch={}\n",
-            self.checkpoint, self.active_log, self.active_epoch
+            "version={}\n{format}checkpoint={}\nactive_log={}\nactive_epoch={}\n",
+            self.version, self.checkpoint, self.active_log, self.active_epoch
         )
     }
 }
@@ -384,160 +429,186 @@ impl WalManifest {
 fn recover_storage(dir: &Path) -> io::Result<RecoveredStorage> {
     let manifest_path = dir.join(MANIFEST_FILE_NAME);
     if manifest_path.exists() {
-        match recover_from_manifest(dir, &manifest_path) {
-            Ok(recovered) => {
-                cleanup_unreferenced(dir, recovered.active_epoch)?;
-                return Ok(recovered);
+        let manifest = read_manifest(&manifest_path)?;
+        return match manifest.version {
+            2 => recover_v2_manifest(dir, manifest),
+            1 => {
+                let state = recover_v1_manifest(dir, &manifest)?;
+                migrate_v1_state(dir, state)
             }
-            Err(error) => {
-                let legacy_path = dir.join(LOG_FILE_NAME);
-                if legacy_path.exists() {
-                    let legacy_state = replay_log(&legacy_path).map_err(|legacy_error| {
-                        io::Error::new(
-                            ErrorKind::InvalidData,
-                            format!(
-                                "recover manifest WAL failed: {error}; legacy broker.binlog fallback also failed: {legacy_error}"
-                            ),
-                        )
-                    })?;
-                    warn!(
-                        error = %error,
-                        legacy_path = %legacy_path.display(),
-                        "recover manifest WAL failed; falling back to legacy binary log"
-                    );
-                    cleanup_unreferenced(dir, None)?;
-                    return Ok(RecoveredStorage {
-                        state: legacy_state,
-                        active_path: legacy_path,
-                        active_epoch: None,
-                    });
-                }
-
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    format!(
-                        "recover manifest WAL failed: {error}; no legacy broker.binlog fallback exists"
-                    ),
-                ));
-            }
-        }
+            _ => Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "unsupported Pulse binary manifest version {}",
+                    manifest.version
+                ),
+            )),
+        };
     }
 
-    cleanup_unreferenced(dir, None)?;
-    let active_path = dir.join(LOG_FILE_NAME);
+    let legacy_path = dir.join(LEGACY_LOG_FILE_NAME);
+    let state = if legacy_path.exists() {
+        replay_v1_log(&legacy_path, ReplayMode::AllowPhysicalTail)?
+    } else {
+        BrokerState::default()
+    };
+    migrate_v1_state(dir, state)
+}
+
+fn recover_v2_manifest(dir: &Path, manifest: WalManifest) -> io::Result<RecoveredStorage> {
+    if manifest.format.as_deref() != Some(V2_FORMAT) {
+        return Err(invalid_data("PBIN2 manifest has an unsupported format"));
+    }
+    if manifest.checkpoint != v2_checkpoint_file_name(manifest.active_epoch)
+        || manifest.active_log != v2_wal_file_name(manifest.active_epoch)
+    {
+        return Err(invalid_data(
+            "PBIN2 manifest files do not match active_epoch",
+        ));
+    }
+    let checkpoint_path = manifest_file_path(dir, &manifest.checkpoint)?;
+    let active_path = manifest_file_path(dir, &manifest.active_log)?;
+    require_file(&checkpoint_path, "PBIN2 checkpoint")?;
+    require_file(&active_path, "PBIN2 active WAL")?;
+
+    let mut projection = replay_v2(&checkpoint_path, ReplayMode::Strict)?;
+    let replay = replay_v2_into(&active_path, &mut projection, ReplayMode::AllowPhysicalTail)?;
+    if replay.truncated_tail {
+        truncate_wal(&active_path, replay.valid_len)?;
+    }
+    if projection.canonicalize_for_offline_recovery() {
+        return install_canonical_v2_generation(dir, projection);
+    }
+    cleanup_after_v2_commit(dir, &manifest)?;
     Ok(RecoveredStorage {
-        state: replay_log(&active_path)?,
+        projection,
         active_path,
-        active_epoch: None,
+        active_epoch: manifest.active_epoch,
     })
 }
 
-fn recover_from_manifest(dir: &Path, manifest_path: &Path) -> io::Result<RecoveredStorage> {
-    let manifest = read_manifest(manifest_path)?;
+fn install_canonical_v2_generation(
+    dir: &Path,
+    projection: PersistentProjection,
+) -> io::Result<RecoveredStorage> {
+    let active_epoch = next_v2_epoch(dir)?;
+    let checkpoint_path = v2_checkpoint_path(dir, active_epoch);
+    let active_path = v2_wal_path(dir, active_epoch);
+    write_checkpoint(&checkpoint_path, &projection)?;
+    drop(create_v2_wal(&active_path)?);
+    sync_dir(dir)?;
+
+    let manifest = WalManifest::v2(active_epoch);
+    write_manifest(dir, &manifest)?;
+    sync_dir(dir)?;
+    cleanup_after_v2_commit(dir, &manifest)?;
+    Ok(RecoveredStorage {
+        projection,
+        active_path,
+        active_epoch,
+    })
+}
+
+fn recover_v1_manifest(dir: &Path, manifest: &WalManifest) -> io::Result<BrokerState> {
+    if manifest.format.is_some() {
+        return Err(invalid_data(
+            "PBIN1 manifest unexpectedly declares a format",
+        ));
+    }
+    if manifest.active_log != legacy_wal_file_name(manifest.active_epoch) {
+        return Err(invalid_data(
+            "PBIN1 manifest active_log does not match active_epoch",
+        ));
+    }
     let checkpoint_path = manifest_file_path(dir, &manifest.checkpoint)?;
     let active_path = manifest_file_path(dir, &manifest.active_log)?;
+    require_file(&checkpoint_path, "PBIN1 checkpoint")?;
+    require_file(&active_path, "PBIN1 active WAL")?;
+    let mut state = replay_v1_log(&checkpoint_path, ReplayMode::Strict)?;
+    replay_v1_into(&active_path, &mut state, ReplayMode::AllowPhysicalTail)?;
+    Ok(state)
+}
 
-    if !checkpoint_path.exists() {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            format!(
-                "manifest checkpoint is missing: {}",
-                checkpoint_path.display()
-            ),
-        ));
-    }
-    if !active_path.exists() {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            format!("manifest active WAL is missing: {}", active_path.display()),
-        ));
-    }
+fn migrate_v1_state(dir: &Path, state: BrokerState) -> io::Result<RecoveredStorage> {
+    let mut projection = PersistentProjection::from_state(&state);
+    projection.canonicalize_for_offline_recovery();
+    let active_epoch = next_v2_epoch(dir)?;
+    let checkpoint_path = v2_checkpoint_path(dir, active_epoch);
+    let active_path = v2_wal_path(dir, active_epoch);
 
-    let expected_active = wal_epoch_file_name(manifest.active_epoch);
-    if manifest.active_log != expected_active {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            format!(
-                "manifest active_log {} does not match active_epoch {}",
-                manifest.active_log, manifest.active_epoch
-            ),
-        ));
-    }
-
-    let mut state = replay_checkpoint(&checkpoint_path)?;
-    replay_log_into(&active_path, &mut state, ReplayMode::AllowCorruptTail)?;
+    write_checkpoint(&checkpoint_path, &projection)?;
+    create_v2_wal(&active_path)?;
+    sync_dir(dir)?;
+    let manifest = WalManifest::v2(active_epoch);
+    write_manifest(dir, &manifest)?;
+    sync_dir(dir)?;
+    cleanup_after_v2_commit(dir, &manifest)?;
     Ok(RecoveredStorage {
-        state,
+        projection,
         active_path,
-        active_epoch: Some(manifest.active_epoch),
+        active_epoch,
     })
 }
 
 fn read_manifest(path: &Path) -> io::Result<WalManifest> {
     let contents = fs::read_to_string(path)?;
     let mut version = None;
+    let mut format = None;
     let mut checkpoint = None;
     let mut active_log = None;
     let mut active_epoch = None;
-
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
-                format!("invalid manifest line: {line}"),
-            ));
-        };
+    for line in contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| invalid_data(format!("invalid manifest line: {line}")))?;
         match key {
-            "version" => {
-                version = Some(value.parse::<u32>().map_err(|error| {
-                    io::Error::new(
-                        ErrorKind::InvalidData,
-                        format!("invalid manifest version: {error}"),
-                    )
-                })?)
-            }
-            "checkpoint" => checkpoint = Some(value.to_string()),
-            "active_log" => active_log = Some(value.to_string()),
-            "active_epoch" => {
-                active_epoch = Some(value.parse::<u64>().map_err(|error| {
-                    io::Error::new(
-                        ErrorKind::InvalidData,
-                        format!("invalid manifest active_epoch: {error}"),
-                    )
-                })?)
-            }
-            _ => {}
+            "version" => set_once(
+                &mut version,
+                value
+                    .parse::<u32>()
+                    .map_err(|error| invalid_data(format!("invalid manifest version: {error}")))?,
+                "version",
+            )?,
+            "format" => set_once(&mut format, value.to_string(), "format")?,
+            "checkpoint" => set_once(&mut checkpoint, value.to_string(), "checkpoint")?,
+            "active_log" => set_once(&mut active_log, value.to_string(), "active_log")?,
+            "active_epoch" => set_once(
+                &mut active_epoch,
+                value.parse::<u64>().map_err(|error| {
+                    invalid_data(format!("invalid manifest active_epoch: {error}"))
+                })?,
+                "active_epoch",
+            )?,
+            _ => return Err(invalid_data(format!("unknown manifest field: {key}"))),
         }
     }
-
-    if version != Some(1) {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "unsupported manifest version",
-        ));
-    }
-
     Ok(WalManifest {
-        checkpoint: checkpoint
-            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "manifest missing checkpoint"))?,
-        active_log: active_log
-            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "manifest missing active_log"))?,
-        active_epoch: active_epoch.ok_or_else(|| {
-            io::Error::new(ErrorKind::InvalidData, "manifest missing active_epoch")
-        })?,
+        version: version.ok_or_else(|| invalid_data("manifest missing version"))?,
+        format,
+        checkpoint: checkpoint.ok_or_else(|| invalid_data("manifest missing checkpoint"))?,
+        active_log: active_log.ok_or_else(|| invalid_data("manifest missing active_log"))?,
+        active_epoch: active_epoch.ok_or_else(|| invalid_data("manifest missing active_epoch"))?,
     })
 }
 
-fn write_checkpoint(path: &Path, snapshot: &PersistentSnapshot) -> io::Result<()> {
-    let tmp = tmp_path(path);
+fn set_once<T>(slot: &mut Option<T>, value: T, field: &str) -> io::Result<()> {
+    if slot.replace(value).is_some() {
+        return Err(invalid_data(format!("duplicate manifest field: {field}")));
+    }
+    Ok(())
+}
+
+fn write_checkpoint(path: &Path, projection: &PersistentProjection) -> io::Result<()> {
+    let tmp = tmp_path(path)?;
     remove_file_if_exists(&tmp)?;
     let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-    file.write_all(MAGIC)?;
-    write_records(&mut file, &checkpoint_records(snapshot))?;
+    file.write_all(V2_MAGIC)?;
+    write_patches(&mut file, &checkpoint_patches(projection))?;
+    write_frame(&mut file, CHECKPOINT_END_PAYLOAD)?;
     file.flush()?;
     file.sync_all()?;
     fs::rename(&tmp, path)?;
@@ -547,9 +618,23 @@ fn write_checkpoint(path: &Path, snapshot: &PersistentSnapshot) -> io::Result<()
     Ok(())
 }
 
+fn checkpoint_patches(projection: &PersistentProjection) -> Vec<StoragePatch> {
+    let mut patches = Vec::with_capacity(projection.clients.len() + projection.retained.len());
+    patches.extend(projection.clients.iter().map(|(client_id, client)| {
+        StoragePatch::Client(ClientPatch::reset(client_id.clone(), client))
+    }));
+    patches.extend(projection.retained.iter().map(|(topic_name, message)| {
+        StoragePatch::Retained(RetainedPatch {
+            topic_name: topic_name.clone(),
+            message: Some(message.clone()),
+        })
+    }));
+    patches
+}
+
 fn write_manifest(dir: &Path, manifest: &WalManifest) -> io::Result<()> {
     let path = dir.join(MANIFEST_FILE_NAME);
-    let tmp = tmp_path(&path);
+    let tmp = tmp_path(&path)?;
     remove_file_if_exists(&tmp)?;
     let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
     file.write_all(manifest.encode().as_bytes())?;
@@ -559,116 +644,63 @@ fn write_manifest(dir: &Path, manifest: &WalManifest) -> io::Result<()> {
     Ok(())
 }
 
-fn checkpoint_records(snapshot: &PersistentSnapshot) -> Vec<Record> {
-    let mut records = Vec::new();
-    records.extend(
-        snapshot
-            .sessions
-            .iter()
-            .map(|(client_id, session)| Record::SessionUpsert {
-                client_id: client_id.clone(),
-                session: session.clone(),
-            }),
-    );
-    records.extend(
-        snapshot
-            .subscriptions
-            .values()
-            .cloned()
-            .map(Record::SubscriptionUpsert),
-    );
-    records.extend(
-        snapshot
-            .retained
-            .iter()
-            .map(|(topic_name, message)| Record::RetainedUpsert {
-                topic_name: topic_name.clone(),
-                message: message.clone(),
-            }),
-    );
-    records.extend(
-        snapshot
-            .offline
-            .iter()
-            .map(|(client_id, queue)| Record::OfflineReplace {
-                client_id: client_id.clone(),
-                queue: queue.clone(),
-            }),
-    );
-    records.extend(
-        snapshot
-            .outbound
-            .iter()
-            .map(|(client_id, outbound)| Record::OutboundReplace {
-                client_id: client_id.clone(),
-                outbound: outbound.clone(),
-            }),
-    );
-    records
-}
-
-fn open_wal_file(path: &Path) -> io::Result<File> {
-    let new_file = !path.exists() || fs::metadata(path)?.len() == 0;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .read(true)
-        .open(path)?;
-    if new_file {
-        file.write_all(MAGIC)?;
-        file.flush()?;
-        file.sync_data()?;
-    }
-    Ok(file)
-}
-
-fn create_wal_file(path: &Path) -> io::Result<File> {
+fn create_v2_wal(path: &Path) -> io::Result<File> {
     let mut file = OpenOptions::new()
         .append(true)
         .read(true)
         .create_new(true)
         .open(path)?;
-    file.write_all(MAGIC)?;
+    file.write_all(V2_MAGIC)?;
     file.flush()?;
     file.sync_data()?;
     Ok(file)
 }
 
-fn cleanup_unreferenced(dir: &Path, active_epoch: Option<u64>) -> io::Result<()> {
+fn cleanup_after_v2_commit(dir: &Path, manifest: &WalManifest) -> io::Result<()> {
     if !dir.exists() {
         return Ok(());
     }
-
     for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
+        let path = entry?.path();
         if !path.is_file() {
             continue;
         }
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-
-        if name.ends_with(TMP_SUFFIX) {
-            remove_file_if_exists(&path)?;
-            continue;
-        }
-
-        if name == LOG_FILE_NAME {
-            if active_epoch.is_some() {
-                remove_file_if_exists(&path)?;
-            }
-            continue;
-        }
-
-        if let Some(epoch) = wal_epoch_from_file_name(name)
-            && Some(epoch) != active_epoch
-        {
+        let stale_tmp = name.ends_with(TMP_SUFFIX);
+        let stale_v2_checkpoint =
+            v2_epoch_from_name(name, V2_CHECKPOINT_PREFIX).is_some() && name != manifest.checkpoint;
+        let stale_v2_wal =
+            v2_epoch_from_name(name, V2_WAL_PREFIX).is_some() && name != manifest.active_log;
+        let legacy = name == LEGACY_LOG_FILE_NAME
+            || name == LEGACY_CHECKPOINT_FILE_NAME
+            || legacy_wal_epoch_from_file_name(name).is_some();
+        if stale_tmp || stale_v2_checkpoint || stale_v2_wal || legacy {
             remove_file_if_exists(&path)?;
         }
     }
+    sync_dir(dir)
+}
 
-    Ok(())
+fn next_v2_epoch(dir: &Path) -> io::Result<u64> {
+    let mut maximum = 0u64;
+    if dir.exists() {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if let Some(epoch) = v2_epoch_from_name(&name, V2_CHECKPOINT_PREFIX)
+                .or_else(|| v2_epoch_from_name(&name, V2_WAL_PREFIX))
+            {
+                maximum = maximum.max(epoch);
+            }
+        }
+    }
+    maximum
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("PBIN2 epoch exhausted"))
 }
 
 fn manifest_file_path(dir: &Path, file_name: &str) -> io::Result<PathBuf> {
@@ -677,36 +709,59 @@ fn manifest_file_path(dir: &Path, file_name: &str) -> io::Result<PathBuf> {
         .and_then(|name| name.to_str())
         != Some(file_name)
     {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            format!("manifest path must be a file name: {file_name}"),
-        ));
+        return Err(invalid_data(format!(
+            "manifest path must be a file name: {file_name}"
+        )));
     }
     Ok(dir.join(file_name))
 }
 
-fn wal_epoch_path(dir: &Path, epoch: u64) -> PathBuf {
-    dir.join(wal_epoch_file_name(epoch))
+fn require_file(path: &Path, label: &str) -> io::Result<()> {
+    if !path.is_file() {
+        return Err(invalid_data(format!(
+            "{label} is missing: {}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
-fn wal_epoch_file_name(epoch: u64) -> String {
-    format!("{LOG_FILE_NAME}.{epoch}")
+fn v2_checkpoint_path(dir: &Path, epoch: u64) -> PathBuf {
+    dir.join(v2_checkpoint_file_name(epoch))
 }
 
-fn wal_epoch_from_file_name(name: &str) -> Option<u64> {
-    name.strip_prefix(&format!("{LOG_FILE_NAME}."))?
+fn v2_checkpoint_file_name(epoch: u64) -> String {
+    format!("{V2_CHECKPOINT_PREFIX}{epoch}")
+}
+
+fn v2_wal_path(dir: &Path, epoch: u64) -> PathBuf {
+    dir.join(v2_wal_file_name(epoch))
+}
+
+fn v2_wal_file_name(epoch: u64) -> String {
+    format!("{V2_WAL_PREFIX}{epoch}")
+}
+
+fn v2_epoch_from_name(name: &str, prefix: &str) -> Option<u64> {
+    name.strip_prefix(prefix)?.parse().ok()
+}
+
+fn legacy_wal_file_name(epoch: u64) -> String {
+    format!("{LEGACY_LOG_FILE_NAME}.{epoch}")
+}
+
+fn legacy_wal_epoch_from_file_name(name: &str) -> Option<u64> {
+    name.strip_prefix(&format!("{LEGACY_LOG_FILE_NAME}."))?
         .parse()
         .ok()
 }
 
-fn tmp_path(path: &Path) -> PathBuf {
-    let mut file_name = path
+fn tmp_path(path: &Path) -> io::Result<PathBuf> {
+    let name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .expect("WAL file name")
-        .to_string();
-    file_name.push_str(TMP_SUFFIX);
-    path.with_file_name(file_name)
+        .ok_or_else(|| invalid_data("invalid PBIN2 file name"))?;
+    Ok(path.with_file_name(format!("{name}{TMP_SUFFIX}")))
 }
 
 fn remove_file_if_exists(path: &Path) -> io::Result<()> {
@@ -732,167 +787,427 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
-#[derive(Clone, Default, PartialEq)]
-struct PersistentSnapshot {
-    sessions: HashMap<String, SessionSnapshot>,
-    subscriptions: HashMap<(String, String), SubscriptionSnapshot>,
-    retained: HashMap<String, RetainedMessage>,
-    offline: HashMap<String, Vec<PendingSnapshot>>,
-    outbound: HashMap<String, OutboundSnapshot>,
+#[derive(Clone, Copy)]
+enum ReplayMode {
+    AllowPhysicalTail,
+    Strict,
 }
 
-impl PersistentSnapshot {
-    fn from_state(state: &BrokerState) -> Self {
-        let mut snapshot = Self::default();
-        for (client_id, session) in &state.sessions_by_client_id {
-            snapshot.sessions.insert(
-                client_id.clone(),
-                SessionSnapshot {
-                    session_expiry_interval: session.session_expiry_interval,
-                    expires_at_ms: session.expires_at_ms,
-                    next_packet_id: session.next_packet_id,
-                },
-            );
+fn replay_v2(path: &Path, mode: ReplayMode) -> io::Result<PersistentProjection> {
+    let mut projection = PersistentProjection::default();
+    replay_v2_into(path, &mut projection, mode)?;
+    Ok(projection)
+}
 
-            if !session.offline_queue.is_empty() {
-                snapshot.offline.insert(
-                    client_id.clone(),
-                    session
-                        .offline_queue
-                        .iter()
-                        .map(PendingSnapshot::from_pending)
-                        .collect(),
-                );
+struct ReplayOutcome {
+    valid_len: u64,
+    truncated_tail: bool,
+}
+
+fn replay_v2_into(
+    path: &Path,
+    projection: &mut PersistentProjection,
+    mode: ReplayMode,
+) -> io::Result<ReplayOutcome> {
+    let mut reader = BufReader::new(File::open(path)?);
+    read_header(&mut reader, V2_MAGIC, "PBIN2")?;
+    let mut valid_len = V2_MAGIC.len() as u64;
+    loop {
+        let frame = match read_frame(&mut reader, mode, "PBIN2")? {
+            FrameRead::Complete(frame) => frame,
+            FrameRead::End => {
+                if matches!(mode, ReplayMode::Strict) {
+                    return Err(invalid_data("PBIN2 checkpoint end marker is missing"));
+                }
+                return Ok(ReplayOutcome {
+                    valid_len,
+                    truncated_tail: false,
+                });
             }
+            FrameRead::Truncated => {
+                return Ok(ReplayOutcome {
+                    valid_len,
+                    truncated_tail: true,
+                });
+            }
+        };
+        if crc32(&frame.payload) != frame.checksum {
+            return Err(invalid_data("PBIN2 frame checksum mismatch"));
+        }
+        if frame.payload == CHECKPOINT_END_PAYLOAD {
+            if !matches!(mode, ReplayMode::Strict) {
+                return Err(invalid_data("PBIN2 WAL contains a checkpoint end marker"));
+            }
+            valid_len += frame_encoded_len(frame.payload.len());
+            return match read_frame(&mut reader, ReplayMode::Strict, "PBIN2")? {
+                FrameRead::End => Ok(ReplayOutcome {
+                    valid_len,
+                    truncated_tail: false,
+                }),
+                FrameRead::Complete(_) => Err(invalid_data(
+                    "PBIN2 checkpoint contains data after its end marker",
+                )),
+                FrameRead::Truncated => unreachable!("strict replay rejects truncated frames"),
+            };
+        }
+        let patch = decode_patch(&frame.payload).map_err(invalid_data)?;
+        projection.apply_patch(&patch).map_err(invalid_data)?;
+        valid_len += frame_encoded_len(frame.payload.len());
+    }
+}
 
-            let outbound = OutboundSnapshot::from_session(session);
-            if !outbound.is_empty() {
-                snapshot.outbound.insert(client_id.clone(), outbound);
+fn read_header(reader: &mut impl Read, magic: &[u8], label: &str) -> io::Result<()> {
+    let mut actual = vec![0; magic.len()];
+    reader
+        .read_exact(&mut actual)
+        .map_err(|error| match error.kind() {
+            ErrorKind::UnexpectedEof => invalid_data(format!("incomplete {label} header")),
+            _ => error,
+        })?;
+    if actual != magic {
+        return Err(invalid_data(format!("invalid {label} header")));
+    }
+    Ok(())
+}
+
+struct Frame {
+    payload: Vec<u8>,
+    checksum: u32,
+}
+
+enum FrameRead {
+    Complete(Frame),
+    End,
+    Truncated,
+}
+
+fn read_frame(reader: &mut impl Read, mode: ReplayMode, label: &str) -> io::Result<FrameRead> {
+    let mut length = [0u8; 4];
+    match reader.read_exact(&mut length[..1]) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(FrameRead::End),
+        Err(error) => return Err(error),
+    }
+    if !read_tail_part(reader, &mut length[1..], mode, label, "frame length")? {
+        return Ok(FrameRead::Truncated);
+    }
+    let length = u32::from_le_bytes(length) as usize;
+    if length > MAX_FRAME_BYTES {
+        return Err(invalid_data(format!(
+            "{label} frame exceeds the maximum size"
+        )));
+    }
+    let mut payload = vec![0; length];
+    if !read_tail_part(reader, &mut payload, mode, label, "frame payload")? {
+        return Ok(FrameRead::Truncated);
+    }
+    let mut checksum = [0u8; 4];
+    if !read_tail_part(reader, &mut checksum, mode, label, "frame checksum")? {
+        return Ok(FrameRead::Truncated);
+    }
+    Ok(FrameRead::Complete(Frame {
+        payload,
+        checksum: u32::from_le_bytes(checksum),
+    }))
+}
+
+fn read_tail_part(
+    reader: &mut impl Read,
+    buffer: &mut [u8],
+    mode: ReplayMode,
+    label: &str,
+    part: &str,
+) -> io::Result<bool> {
+    match reader.read_exact(buffer) {
+        Ok(()) => Ok(true),
+        Err(error)
+            if error.kind() == ErrorKind::UnexpectedEof
+                && matches!(mode, ReplayMode::AllowPhysicalTail) =>
+        {
+            Ok(false)
+        }
+        Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+            Err(invalid_data(format!("incomplete {label} {part}")))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn truncate_wal(path: &Path, valid_len: u64) -> io::Result<()> {
+    let file = OpenOptions::new().write(true).open(path)?;
+    file.set_len(valid_len)?;
+    file.sync_data()
+}
+
+fn encode_patch(patch: &StoragePatch) -> Vec<u8> {
+    let mut writer = Writer::default();
+    match patch {
+        StoragePatch::Client(patch) => encode_client_patch(&mut writer, patch),
+        StoragePatch::Retained(patch) => {
+            writer.u8(RETAINED_PATCH);
+            writer.string(&patch.topic_name);
+            writer.bool(patch.message.is_some());
+            if let Some(message) = &patch.message {
+                writer.opt_u64(message.expires_at_ms);
+                writer.bytes(&encode_retained(message));
             }
         }
+    }
+    writer.into_inner()
+}
 
-        for subscription in &state.subscriptions {
-            snapshot.subscriptions.insert(
-                (subscription.client_id.clone(), subscription.filter.clone()),
-                SubscriptionSnapshot::from_subscription(subscription),
-            );
+fn encode_client_patch(writer: &mut Writer, patch: &ClientPatch) {
+    writer.u8(CLIENT_PATCH);
+    writer.u8(patch.version);
+    writer.u8(match patch.mode {
+        ClientPatchMode::Merge => 1,
+        ClientPatchMode::Reset => 2,
+        ClientPatchMode::Delete => 3,
+    });
+    writer.string(&patch.client_id);
+    writer.bool(patch.session.is_some());
+    if let Some(session) = &patch.session {
+        encode_session(writer, session);
+    }
+    writer.len(patch.subscription_upserts.len());
+    for subscription in &patch.subscription_upserts {
+        encode_subscription(writer, subscription);
+    }
+    writer.len(patch.subscription_deletes.len());
+    for filter in &patch.subscription_deletes {
+        writer.string(filter);
+    }
+    writer.opt_u64(patch.offline_remove_through);
+    writer.len(patch.offline_append.len());
+    for queued in &patch.offline_append {
+        writer.u64(queued.sequence);
+        encode_pending(writer, &queued.pending);
+    }
+    encode_pending_map(writer, &patch.qos1_upserts);
+    encode_u16_set(writer, &patch.qos1_deletes);
+    encode_pending_map(writer, &patch.qos2_publish_upserts);
+    encode_u16_set(writer, &patch.qos2_publish_deletes);
+    encode_u16_set(writer, &patch.pubrel_add);
+    encode_u16_set(writer, &patch.pubrel_remove);
+}
+
+fn decode_patch(payload: &[u8]) -> Result<StoragePatch, String> {
+    let mut reader = Reader::new(payload);
+    let patch = match reader.u8()? {
+        CLIENT_PATCH => StoragePatch::Client(decode_client_patch(&mut reader)?),
+        RETAINED_PATCH => {
+            let topic_name = reader.string()?;
+            let message = if reader.bool()? {
+                let expires_at_ms = reader.opt_u64()?;
+                let mut message = decode_retained(reader.bytes()?)
+                    .ok_or_else(|| "invalid retained MQTT packet".to_string())?;
+                if message.topic_name != topic_name {
+                    return Err("retained patch topic does not match packet".to_string());
+                }
+                message.expires_at_ms = expires_at_ms;
+                Some(message)
+            } else {
+                None
+            };
+            StoragePatch::Retained(RetainedPatch {
+                topic_name,
+                message,
+            })
         }
+        _ => return Err("unknown PBIN2 frame tag".to_string()),
+    };
+    reader.finish()?;
+    patch.validate().map_err(str::to_string)?;
+    Ok(patch)
+}
 
-        for (topic_name, message) in state.retained.iter() {
-            snapshot
-                .retained
-                .insert(topic_name.clone(), message.clone());
+fn decode_client_patch(reader: &mut Reader<'_>) -> Result<ClientPatch, String> {
+    let version = reader.u8()?;
+    if version != CLIENT_PATCH_VERSION {
+        return Err("unsupported client patch version".to_string());
+    }
+    let mode = match reader.u8()? {
+        1 => ClientPatchMode::Merge,
+        2 => ClientPatchMode::Reset,
+        3 => ClientPatchMode::Delete,
+        _ => return Err("unknown client patch mode".to_string()),
+    };
+    let client_id = reader.string()?;
+    let session = reader.bool()?.then(|| decode_session(reader)).transpose()?;
+
+    let mut subscription_upserts = Vec::new();
+    let mut upsert_filters = BTreeSet::new();
+    for _ in 0..reader.count()? {
+        let subscription = decode_subscription(reader, &client_id)?;
+        if !upsert_filters.insert(subscription.filter.clone()) {
+            return Err("duplicate subscription upsert".to_string());
         }
+        subscription_upserts.push(subscription);
+    }
+    let mut subscription_deletes = Vec::new();
+    let mut delete_filters = BTreeSet::new();
+    for _ in 0..reader.count()? {
+        let filter = reader.string()?;
+        if !delete_filters.insert(filter.clone()) {
+            return Err("duplicate subscription delete".to_string());
+        }
+        subscription_deletes.push(filter);
+    }
+    if !upsert_filters.is_disjoint(&delete_filters) {
+        return Err("subscription is both upserted and deleted".to_string());
+    }
 
-        snapshot
+    let offline_remove_through = reader.opt_u64()?;
+    let mut offline_append = Vec::new();
+    let mut offline_sequences = BTreeSet::new();
+    for _ in 0..reader.count()? {
+        let sequence = reader.u64()?;
+        if !offline_sequences.insert(sequence) {
+            return Err("duplicate offline sequence".to_string());
+        }
+        offline_append.push(QueuedSnapshot {
+            sequence,
+            pending: decode_offline_pending(reader)?,
+        });
+    }
+    let qos1_upserts = decode_pending_map(reader)?;
+    let qos1_deletes = decode_u16_set(reader)?;
+    let qos2_publish_upserts = decode_pending_map(reader)?;
+    let qos2_publish_deletes = decode_u16_set(reader)?;
+    let pubrel_add = decode_u16_set(reader)?;
+    let pubrel_remove = decode_u16_set(reader)?;
+    if !qos1_upserts.keys().all(|key| !qos1_deletes.contains(key))
+        || !qos2_publish_upserts
+            .keys()
+            .all(|key| !qos2_publish_deletes.contains(key))
+        || !pubrel_add.is_disjoint(&pubrel_remove)
+    {
+        return Err("client patch has conflicting operations".to_string());
+    }
+
+    let patch = ClientPatch {
+        version,
+        client_id,
+        mode,
+        session,
+        subscription_upserts,
+        subscription_deletes,
+        offline_remove_through,
+        offline_append,
+        qos1_upserts,
+        qos1_deletes,
+        qos2_publish_upserts,
+        qos2_publish_deletes,
+        pubrel_add,
+        pubrel_remove,
+    };
+    patch.validate().map_err(str::to_string)?;
+    Ok(patch)
+}
+
+fn encode_session(writer: &mut Writer, session: &SessionSnapshot) {
+    writer.u32(session.session_expiry_interval);
+    writer.opt_u64(session.expires_at_ms);
+    writer.u16(session.next_packet_id);
+    writer.u64(session.next_offline_sequence);
+}
+
+fn decode_session(reader: &mut Reader<'_>) -> Result<SessionSnapshot, String> {
+    Ok(SessionSnapshot {
+        session_expiry_interval: reader.u32()?,
+        expires_at_ms: reader.opt_u64()?,
+        next_packet_id: reader.u16()?,
+        next_offline_sequence: reader.u64()?,
+    })
+}
+
+fn encode_subscription(writer: &mut Writer, subscription: &SubscriptionSnapshot) {
+    writer.string(&subscription.filter);
+    writer.string(&subscription.match_filter);
+    writer.opt_string(subscription.shared_group.as_deref());
+    writer.u8(qos_to_u8(subscription.maximum_qos));
+    writer.bool(subscription.no_local);
+    writer.bool(subscription.retain_as_published);
+    writer.u8(subscription.retain_handling);
+    writer.opt_u32(subscription.subscription_identifier);
+}
+
+fn decode_subscription(
+    reader: &mut Reader<'_>,
+    client_id: &str,
+) -> Result<SubscriptionSnapshot, String> {
+    Ok(SubscriptionSnapshot {
+        client_id: client_id.to_string(),
+        filter: reader.string()?,
+        match_filter: reader.string()?,
+        shared_group: reader.opt_string()?,
+        maximum_qos: qos_from_u8(reader.u8()?)?,
+        no_local: reader.bool()?,
+        retain_as_published: reader.bool()?,
+        retain_handling: reader.u8()?,
+        subscription_identifier: reader.opt_u32()?,
+    })
+}
+
+fn encode_pending(writer: &mut Writer, pending: &PendingSnapshot) {
+    writer.opt_u64(pending.expires_at_ms);
+    writer.bytes(&encode_publish(&pending.packet));
+}
+
+fn decode_pending(reader: &mut Reader<'_>) -> Result<PendingSnapshot, String> {
+    let expires_at_ms = reader.opt_u64()?;
+    let packet = decode_publish(reader.bytes()?)
+        .ok_or_else(|| "invalid outbound MQTT packet".to_string())?;
+    Ok(PendingSnapshot {
+        packet,
+        expires_at_ms,
+    })
+}
+
+fn decode_offline_pending(reader: &mut Reader<'_>) -> Result<PendingSnapshot, String> {
+    let mut pending = decode_pending(reader)?;
+    pending.packet.packet_id = None;
+    Ok(pending)
+}
+
+fn encode_pending_map(writer: &mut Writer, values: &BTreeMap<u16, PendingSnapshot>) {
+    writer.len(values.len());
+    for (packet_id, pending) in values {
+        writer.u16(*packet_id);
+        encode_pending(writer, pending);
     }
 }
 
-#[derive(Clone, PartialEq)]
-struct SessionSnapshot {
-    session_expiry_interval: u32,
-    expires_at_ms: Option<u64>,
-    next_packet_id: u16,
-}
-
-#[derive(Clone, PartialEq)]
-struct SubscriptionSnapshot {
-    client_id: String,
-    filter: String,
-    match_filter: String,
-    shared_group: Option<String>,
-    maximum_qos: QoS,
-    no_local: bool,
-    retain_as_published: bool,
-    retain_handling: u8,
-    subscription_identifier: Option<u32>,
-}
-
-impl SubscriptionSnapshot {
-    fn from_subscription(subscription: &SubscriptionEntry) -> Self {
-        Self {
-            client_id: subscription.client_id.clone(),
-            filter: subscription.filter.clone(),
-            match_filter: subscription.match_filter.clone(),
-            shared_group: subscription.shared_group.clone(),
-            maximum_qos: subscription.options.maximum_qos,
-            no_local: subscription.options.no_local,
-            retain_as_published: subscription.options.retain_as_published,
-            retain_handling: subscription.options.retain_handling,
-            subscription_identifier: subscription.subscription_identifier,
+fn decode_pending_map(reader: &mut Reader<'_>) -> Result<BTreeMap<u16, PendingSnapshot>, String> {
+    let mut values = BTreeMap::new();
+    for _ in 0..reader.count()? {
+        let packet_id = reader.u16()?;
+        if values.insert(packet_id, decode_pending(reader)?).is_some() {
+            return Err("duplicate packet identifier".to_string());
         }
     }
+    Ok(values)
+}
 
-    fn into_subscription(self) -> SubscriptionEntry {
-        SubscriptionEntry {
-            client_id: self.client_id,
-            filter: self.filter,
-            match_filter: self.match_filter,
-            shared_group: self.shared_group,
-            options: SubscriptionOptions {
-                maximum_qos: self.maximum_qos,
-                no_local: self.no_local,
-                retain_as_published: self.retain_as_published,
-                retain_handling: self.retain_handling,
-            },
-            subscription_identifier: self.subscription_identifier,
-        }
+fn encode_u16_set(writer: &mut Writer, values: &BTreeSet<u16>) {
+    writer.len(values.len());
+    for value in values {
+        writer.u16(*value);
     }
 }
 
-#[derive(Clone, PartialEq)]
-struct PendingSnapshot {
-    packet: PublishPacket,
-    expires_at_ms: Option<u64>,
-}
-
-impl PendingSnapshot {
-    fn from_pending(pending: &PendingPublish) -> Self {
-        Self {
-            packet: pending.packet.clone(),
-            expires_at_ms: pending.expires_at_ms,
+fn decode_u16_set(reader: &mut Reader<'_>) -> Result<BTreeSet<u16>, String> {
+    let mut values = BTreeSet::new();
+    for _ in 0..reader.count()? {
+        if !values.insert(reader.u16()?) {
+            return Err("duplicate packet identifier".to_string());
         }
     }
-
-    fn into_pending(self) -> PendingPublish {
-        PendingPublish {
-            packet: self.packet,
-            expires_at_ms: self.expires_at_ms,
-        }
-    }
-}
-
-#[derive(Clone, Default, PartialEq)]
-struct OutboundSnapshot {
-    qos1: HashMap<u16, PendingSnapshot>,
-    qos2_publish: HashMap<u16, PendingSnapshot>,
-    qos2_pubrel: HashSet<u16>,
-}
-
-impl OutboundSnapshot {
-    fn from_session(session: &SessionEntry) -> Self {
-        Self {
-            qos1: session
-                .outbound_qos1
-                .iter()
-                .map(|(packet_id, pending)| (*packet_id, PendingSnapshot::from_pending(pending)))
-                .collect(),
-            qos2_publish: session
-                .outbound_qos2_publish
-                .iter()
-                .map(|(packet_id, pending)| (*packet_id, PendingSnapshot::from_pending(pending)))
-                .collect(),
-            qos2_pubrel: session.outbound_qos2_pubrel.clone(),
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.qos1.is_empty() && self.qos2_publish.is_empty() && self.qos2_pubrel.is_empty()
-    }
+    Ok(values)
 }
 
 #[derive(Clone)]
-enum Record {
+enum V1Record {
     SessionUpsert {
         client_id: String,
         session: SessionSnapshot,
@@ -918,337 +1233,42 @@ enum Record {
     },
     OutboundReplace {
         client_id: String,
-        outbound: OutboundSnapshot,
+        outbound: V1OutboundSnapshot,
     },
 }
 
-fn diff_records_for_changes(
-    snapshot: &mut PersistentSnapshot,
-    state: &BrokerState,
-    changes: Vec<PersistenceChange>,
-) -> Vec<Record> {
-    let mut sync_sessions = false;
-    let mut sync_subscriptions = false;
-    let mut sync_retained = false;
-    let mut offline_clients = HashSet::new();
-    let mut outbound_clients = HashSet::new();
-
-    for change in changes {
-        match change {
-            PersistenceChange::Sessions => sync_sessions = true,
-            PersistenceChange::Subscriptions => sync_subscriptions = true,
-            PersistenceChange::Retained => sync_retained = true,
-            PersistenceChange::Offline(client_id) => {
-                offline_clients.insert(client_id);
-            }
-            PersistenceChange::Outbound(client_id) => {
-                outbound_clients.insert(client_id);
-            }
-        }
-    }
-
-    let mut records = Vec::new();
-    if sync_sessions {
-        records.extend(sync_session_records(snapshot, state));
-    }
-    if sync_subscriptions {
-        records.extend(sync_subscription_records(snapshot, state));
-    }
-    if sync_retained {
-        records.extend(sync_retained_records(snapshot, state));
-    }
-    for client_id in offline_clients {
-        records.extend(sync_offline_records(snapshot, state, &client_id));
-    }
-    for client_id in outbound_clients {
-        records.extend(sync_outbound_records(snapshot, state, &client_id));
-    }
-    records
+#[derive(Clone, Default)]
+struct V1OutboundSnapshot {
+    qos1: HashMap<u16, PendingSnapshot>,
+    qos2_publish: HashMap<u16, PendingSnapshot>,
+    qos2_pubrel: HashSet<u16>,
 }
 
-fn sync_session_records(snapshot: &mut PersistentSnapshot, state: &BrokerState) -> Vec<Record> {
-    let next: HashMap<String, SessionSnapshot> = state
-        .sessions_by_client_id
-        .iter()
-        .map(|(client_id, session)| {
-            (
-                client_id.clone(),
-                SessionSnapshot {
-                    session_expiry_interval: session.session_expiry_interval,
-                    expires_at_ms: session.expires_at_ms,
-                    next_packet_id: session.next_packet_id,
-                },
-            )
-        })
-        .collect();
-    let mut records = Vec::new();
-    for (client_id, session) in &next {
-        if snapshot.sessions.get(client_id) != Some(session) {
-            records.push(Record::SessionUpsert {
-                client_id: client_id.clone(),
-                session: session.clone(),
-            });
-        }
-    }
-    for client_id in snapshot.sessions.keys() {
-        if !next.contains_key(client_id) {
-            records.push(Record::SessionDelete {
-                client_id: client_id.clone(),
-            });
-        }
-    }
-    snapshot.sessions = next;
-    records
-}
-
-fn sync_subscription_records(
-    snapshot: &mut PersistentSnapshot,
-    state: &BrokerState,
-) -> Vec<Record> {
-    if state.subscriptions.len() == snapshot.subscriptions.len() + 1
-        && let Some(subscription) = state.subscriptions.last()
-    {
-        let key = (subscription.client_id.clone(), subscription.filter.clone());
-        if let std::collections::hash_map::Entry::Vacant(entry) = snapshot.subscriptions.entry(key)
-        {
-            let subscription = SubscriptionSnapshot::from_subscription(subscription);
-            entry.insert(subscription.clone());
-            return vec![Record::SubscriptionUpsert(subscription)];
-        }
-    }
-
-    let next: HashMap<(String, String), SubscriptionSnapshot> = state
-        .subscriptions
-        .iter()
-        .map(|subscription| {
-            (
-                (subscription.client_id.clone(), subscription.filter.clone()),
-                SubscriptionSnapshot::from_subscription(subscription),
-            )
-        })
-        .collect();
-    let mut records = Vec::new();
-    for (key, subscription) in &next {
-        if snapshot.subscriptions.get(key) != Some(subscription) {
-            records.push(Record::SubscriptionUpsert(subscription.clone()));
-        }
-    }
-    for (client_id, filter) in snapshot.subscriptions.keys() {
-        if !next.contains_key(&(client_id.clone(), filter.clone())) {
-            records.push(Record::SubscriptionDelete {
-                client_id: client_id.clone(),
-                filter: filter.clone(),
-            });
-        }
-    }
-    snapshot.subscriptions = next;
-    records
-}
-
-fn sync_retained_records(snapshot: &mut PersistentSnapshot, state: &BrokerState) -> Vec<Record> {
-    let next: HashMap<String, RetainedMessage> = state
-        .retained
-        .iter()
-        .map(|(topic_name, message)| (topic_name.clone(), message.clone()))
-        .collect();
-    let mut records = Vec::new();
-    for (topic_name, message) in &next {
-        if snapshot.retained.get(topic_name) != Some(message) {
-            records.push(Record::RetainedUpsert {
-                topic_name: topic_name.clone(),
-                message: message.clone(),
-            });
-        }
-    }
-    for topic_name in snapshot.retained.keys() {
-        if !next.contains_key(topic_name) {
-            records.push(Record::RetainedDelete {
-                topic_name: topic_name.clone(),
-            });
-        }
-    }
-    snapshot.retained = next;
-    records
-}
-
-fn sync_offline_records(
-    snapshot: &mut PersistentSnapshot,
-    state: &BrokerState,
-    client_id: &str,
-) -> Vec<Record> {
-    let next = state
-        .sessions_by_client_id
-        .get(client_id)
-        .map(|session| {
-            session
-                .offline_queue
-                .iter()
-                .map(PendingSnapshot::from_pending)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if next.is_empty() {
-        if snapshot.offline.remove(client_id).is_some() {
-            return vec![Record::OfflineReplace {
-                client_id: client_id.to_string(),
-                queue: Vec::new(),
-            }];
-        }
-        return Vec::new();
-    }
-
-    if snapshot.offline.get(client_id) == Some(&next) {
-        return Vec::new();
-    }
-    snapshot.offline.insert(client_id.to_string(), next.clone());
-    vec![Record::OfflineReplace {
-        client_id: client_id.to_string(),
-        queue: next,
-    }]
-}
-
-fn sync_outbound_records(
-    snapshot: &mut PersistentSnapshot,
-    state: &BrokerState,
-    client_id: &str,
-) -> Vec<Record> {
-    let next = state
-        .sessions_by_client_id
-        .get(client_id)
-        .map(OutboundSnapshot::from_session)
-        .unwrap_or_default();
-    if next.is_empty() {
-        if snapshot.outbound.remove(client_id).is_some() {
-            return vec![Record::OutboundReplace {
-                client_id: client_id.to_string(),
-                outbound: OutboundSnapshot::default(),
-            }];
-        }
-        return Vec::new();
-    }
-
-    if snapshot.outbound.get(client_id) == Some(&next) {
-        return Vec::new();
-    }
-    snapshot
-        .outbound
-        .insert(client_id.to_string(), next.clone());
-    vec![Record::OutboundReplace {
-        client_id: client_id.to_string(),
-        outbound: next,
-    }]
-}
-
-#[derive(Clone, Copy)]
-enum ReplayMode {
-    AllowCorruptTail,
-    Strict,
-}
-
-fn replay_log(path: &Path) -> io::Result<BrokerState> {
-    replay_log_with_mode(path, ReplayMode::AllowCorruptTail)
-}
-
-fn replay_checkpoint(path: &Path) -> io::Result<BrokerState> {
-    replay_log_with_mode(path, ReplayMode::Strict)
-}
-
-fn replay_log_with_mode(path: &Path, mode: ReplayMode) -> io::Result<BrokerState> {
+fn replay_v1_log(path: &Path, mode: ReplayMode) -> io::Result<BrokerState> {
     let mut state = BrokerState::default();
-    if !path.exists() {
-        return Ok(state);
-    }
-    replay_log_into(path, &mut state, mode)?;
+    replay_v1_into(path, &mut state, mode)?;
     Ok(state)
 }
 
-fn replay_log_into(path: &Path, state: &mut BrokerState, mode: ReplayMode) -> io::Result<()> {
-    let mut file = File::open(path)?;
-    let mut magic = [0u8; MAGIC.len()];
-    match file.read_exact(&mut magic) {
-        Ok(()) if magic == MAGIC => {}
-        Ok(()) => {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
-                "invalid Pulse binary log header",
-            ));
-        }
-        Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
-            return match mode {
-                ReplayMode::AllowCorruptTail => Ok(()),
-                ReplayMode::Strict => Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "incomplete Pulse binary log header",
-                )),
-            };
-        }
-        Err(error) => return Err(error),
-    }
-
+fn replay_v1_into(path: &Path, state: &mut BrokerState, mode: ReplayMode) -> io::Result<()> {
+    let mut reader = BufReader::new(File::open(path)?);
+    read_header(&mut reader, V1_MAGIC, "PBIN1")?;
     loop {
-        let mut length = [0u8; 4];
-        match file.read_exact(&mut length) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::UnexpectedEof => break,
-            Err(error) => return Err(error),
-        }
-
-        let length = u32::from_le_bytes(length) as usize;
-        let mut payload = vec![0u8; length];
-        if let Err(error) = file.read_exact(&mut payload) {
-            if error.kind() == ErrorKind::UnexpectedEof {
-                return match mode {
-                    ReplayMode::AllowCorruptTail => Ok(()),
-                    ReplayMode::Strict => Err(io::Error::new(
-                        ErrorKind::InvalidData,
-                        "incomplete Pulse binary log payload",
-                    )),
-                };
-            }
-            return Err(error);
-        }
-
-        let mut checksum = [0u8; 4];
-        if let Err(error) = file.read_exact(&mut checksum) {
-            if error.kind() == ErrorKind::UnexpectedEof {
-                return match mode {
-                    ReplayMode::AllowCorruptTail => Ok(()),
-                    ReplayMode::Strict => Err(io::Error::new(
-                        ErrorKind::InvalidData,
-                        "incomplete Pulse binary log checksum",
-                    )),
-                };
-            }
-            return Err(error);
-        }
-        if crc32(&payload) != u32::from_le_bytes(checksum) {
-            return match mode {
-                ReplayMode::AllowCorruptTail => Ok(()),
-                ReplayMode::Strict => Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "Pulse binary log checksum mismatch",
-                )),
-            };
-        }
-
-        let Some(record) = decode_record(&payload) else {
-            return match mode {
-                ReplayMode::AllowCorruptTail => Ok(()),
-                ReplayMode::Strict => Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "invalid Pulse binary log record",
-                )),
-            };
+        let frame = match read_frame(&mut reader, mode, "PBIN1")? {
+            FrameRead::Complete(frame) => frame,
+            FrameRead::End | FrameRead::Truncated => return Ok(()),
         };
-        apply_record(state, record);
+        if crc32(&frame.payload) != frame.checksum {
+            return Err(invalid_data("PBIN1 frame checksum mismatch"));
+        }
+        let record = decode_v1_record(&frame.payload).map_err(invalid_data)?;
+        apply_v1_record(state, record);
     }
-
-    Ok(())
 }
 
-fn apply_record(state: &mut BrokerState, record: Record) {
+fn apply_v1_record(state: &mut BrokerState, record: V1Record) {
     match record {
-        Record::SessionUpsert { client_id, session } => {
+        V1Record::SessionUpsert { client_id, session } => {
             let entry = state
                 .sessions_by_client_id
                 .entry(client_id)
@@ -1262,13 +1282,13 @@ fn apply_record(state: &mut BrokerState, record: Record) {
             entry.expires_at_ms = session.expires_at_ms;
             entry.next_packet_id = session.next_packet_id;
         }
-        Record::SessionDelete { client_id } => {
+        V1Record::SessionDelete { client_id } => {
             state.sessions_by_client_id.remove(&client_id);
             state
                 .subscriptions
                 .retain(|subscription| subscription.client_id != client_id);
         }
-        Record::SubscriptionUpsert(subscription) => {
+        V1Record::SubscriptionUpsert(subscription) => {
             let subscription = subscription.into_subscription();
             if let Some(existing) = state.subscriptions.iter_mut().find(|existing| {
                 existing.client_id == subscription.client_id
@@ -1279,29 +1299,34 @@ fn apply_record(state: &mut BrokerState, record: Record) {
                 state.subscriptions.push(subscription);
             }
         }
-        Record::SubscriptionDelete { client_id, filter } => {
+        V1Record::SubscriptionDelete { client_id, filter } => {
             state.subscriptions.retain(|subscription| {
                 !(subscription.client_id == client_id && subscription.filter == filter)
             });
         }
-        Record::RetainedUpsert {
+        V1Record::RetainedUpsert {
             topic_name,
             message,
         } => {
             state.retained.insert(topic_name, message);
         }
-        Record::RetainedDelete { topic_name } => {
+        V1Record::RetainedDelete { topic_name } => {
             state.retained.remove(&topic_name);
         }
-        Record::OfflineReplace { client_id, queue } => {
+        V1Record::OfflineReplace { client_id, queue } => {
             if let Some(session) = state.sessions_by_client_id.get_mut(&client_id) {
                 session.offline_queue = queue
                     .into_iter()
-                    .map(PendingSnapshot::into_pending)
+                    .enumerate()
+                    .map(|(sequence, pending)| QueuedPublish {
+                        sequence: sequence as u64,
+                        pending: pending.into_pending(),
+                    })
                     .collect::<VecDeque<_>>();
+                session.next_offline_sequence = session.offline_queue.len() as u64;
             }
         }
-        Record::OutboundReplace {
+        V1Record::OutboundReplace {
             client_id,
             outbound,
         } => {
@@ -1322,183 +1347,95 @@ fn apply_record(state: &mut BrokerState, record: Record) {
     }
 }
 
-fn encode_record(record: &Record) -> Vec<u8> {
-    let mut writer = Writer::default();
-    match record {
-        Record::SessionUpsert { client_id, session } => {
-            writer.u8(SESSION_UPSERT);
-            writer.string(client_id);
-            writer.u32(session.session_expiry_interval);
-            writer.opt_u64(session.expires_at_ms);
-            writer.u16(session.next_packet_id);
-        }
-        Record::SessionDelete { client_id } => {
-            writer.u8(SESSION_DELETE);
-            writer.string(client_id);
-        }
-        Record::SubscriptionUpsert(subscription) => {
-            writer.u8(SUBSCRIPTION_UPSERT);
-            writer.string(&subscription.client_id);
-            writer.string(&subscription.filter);
-            writer.string(&subscription.match_filter);
-            writer.opt_string(subscription.shared_group.as_deref());
-            writer.u8(qos_to_u8(subscription.maximum_qos));
-            writer.bool(subscription.no_local);
-            writer.bool(subscription.retain_as_published);
-            writer.u8(subscription.retain_handling);
-            writer.opt_u32(subscription.subscription_identifier);
-        }
-        Record::SubscriptionDelete { client_id, filter } => {
-            writer.u8(SUBSCRIPTION_DELETE);
-            writer.string(client_id);
-            writer.string(filter);
-        }
-        Record::RetainedUpsert {
-            topic_name,
-            message,
-        } => {
-            writer.u8(RETAINED_UPSERT);
-            writer.string(topic_name);
-            writer.opt_u64(message.expires_at_ms);
-            writer.bytes(&encode_retained(message));
-        }
-        Record::RetainedDelete { topic_name } => {
-            writer.u8(RETAINED_DELETE);
-            writer.string(topic_name);
-        }
-        Record::OfflineReplace { client_id, queue } => {
-            writer.u8(OFFLINE_REPLACE);
-            writer.string(client_id);
-            writer.u32(queue.len() as u32);
-            for pending in queue {
-                writer.opt_u64(pending.expires_at_ms);
-                writer.bytes(&encode_publish(&pending.packet));
-            }
-        }
-        Record::OutboundReplace {
-            client_id,
-            outbound,
-        } => {
-            writer.u8(OUTBOUND_REPLACE);
-            writer.string(client_id);
-            writer.u32(outbound.qos1.len() as u32);
-            for (packet_id, pending) in &outbound.qos1 {
-                writer.u16(*packet_id);
-                writer.opt_u64(pending.expires_at_ms);
-                writer.bytes(&encode_publish(&pending.packet));
-            }
-            writer.u32(outbound.qos2_publish.len() as u32);
-            for (packet_id, pending) in &outbound.qos2_publish {
-                writer.u16(*packet_id);
-                writer.opt_u64(pending.expires_at_ms);
-                writer.bytes(&encode_publish(&pending.packet));
-            }
-            writer.u32(outbound.qos2_pubrel.len() as u32);
-            for packet_id in &outbound.qos2_pubrel {
-                writer.u16(*packet_id);
-            }
-        }
-    }
-    writer.into_inner()
-}
-
-fn decode_record(payload: &[u8]) -> Option<Record> {
+fn decode_v1_record(payload: &[u8]) -> Result<V1Record, String> {
     let mut reader = Reader::new(payload);
-    let tag = reader.u8()?;
-    match tag {
-        SESSION_UPSERT => Some(Record::SessionUpsert {
+    let record = match reader.u8()? {
+        V1_SESSION_UPSERT => V1Record::SessionUpsert {
             client_id: reader.string()?,
             session: SessionSnapshot {
                 session_expiry_interval: reader.u32()?,
                 expires_at_ms: reader.opt_u64()?,
                 next_packet_id: reader.u16()?,
+                next_offline_sequence: 0,
             },
-        }),
-        SESSION_DELETE => Some(Record::SessionDelete {
+        },
+        V1_SESSION_DELETE => V1Record::SessionDelete {
             client_id: reader.string()?,
-        }),
-        SUBSCRIPTION_UPSERT => Some(Record::SubscriptionUpsert(SubscriptionSnapshot {
+        },
+        V1_SUBSCRIPTION_UPSERT => V1Record::SubscriptionUpsert(SubscriptionSnapshot {
             client_id: reader.string()?,
             filter: reader.string()?,
             match_filter: reader.string()?,
             shared_group: reader.opt_string()?,
-            maximum_qos: qos_from_u8(reader.u8()?),
+            maximum_qos: qos_from_u8(reader.u8()?)?,
             no_local: reader.bool()?,
             retain_as_published: reader.bool()?,
             retain_handling: reader.u8()?,
             subscription_identifier: reader.opt_u32()?,
-        })),
-        SUBSCRIPTION_DELETE => Some(Record::SubscriptionDelete {
+        }),
+        V1_SUBSCRIPTION_DELETE => V1Record::SubscriptionDelete {
             client_id: reader.string()?,
             filter: reader.string()?,
-        }),
-        RETAINED_UPSERT => {
+        },
+        V1_RETAINED_UPSERT => {
             let topic_name = reader.string()?;
             let expires_at_ms = reader.opt_u64()?;
-            let mut message = decode_retained(reader.bytes()?)?;
+            let mut message = decode_retained(reader.bytes()?)
+                .ok_or_else(|| "invalid PBIN1 retained packet".to_string())?;
             message.expires_at_ms = expires_at_ms;
-            Some(Record::RetainedUpsert {
+            V1Record::RetainedUpsert {
                 topic_name,
                 message,
-            })
+            }
         }
-        RETAINED_DELETE => Some(Record::RetainedDelete {
+        V1_RETAINED_DELETE => V1Record::RetainedDelete {
             topic_name: reader.string()?,
-        }),
-        OFFLINE_REPLACE => {
+        },
+        V1_OFFLINE_REPLACE => {
             let client_id = reader.string()?;
-            let count = reader.u32()? as usize;
-            let mut queue = Vec::with_capacity(count);
-            for _ in 0..count {
-                let expires_at_ms = reader.opt_u64()?;
-                let packet = decode_publish(reader.bytes()?)?;
-                queue.push(PendingSnapshot {
-                    packet,
-                    expires_at_ms,
-                });
+            let mut queue = Vec::new();
+            for _ in 0..reader.count()? {
+                queue.push(decode_offline_pending(&mut reader)?);
             }
-            Some(Record::OfflineReplace { client_id, queue })
+            V1Record::OfflineReplace { client_id, queue }
         }
-        OUTBOUND_REPLACE => {
+        V1_OUTBOUND_REPLACE => {
             let client_id = reader.string()?;
-            let mut outbound = OutboundSnapshot::default();
-            let qos1_count = reader.u32()? as usize;
-            for _ in 0..qos1_count {
+            let mut outbound = V1OutboundSnapshot::default();
+            for _ in 0..reader.count()? {
                 let packet_id = reader.u16()?;
-                let expires_at_ms = reader.opt_u64()?;
-                let packet = decode_publish(reader.bytes()?)?;
-                outbound.qos1.insert(
-                    packet_id,
-                    PendingSnapshot {
-                        packet,
-                        expires_at_ms,
-                    },
-                );
+                if outbound
+                    .qos1
+                    .insert(packet_id, decode_pending(&mut reader)?)
+                    .is_some()
+                {
+                    return Err("duplicate PBIN1 QoS1 packet identifier".to_string());
+                }
             }
-            let qos2_count = reader.u32()? as usize;
-            for _ in 0..qos2_count {
+            for _ in 0..reader.count()? {
                 let packet_id = reader.u16()?;
-                let expires_at_ms = reader.opt_u64()?;
-                let packet = decode_publish(reader.bytes()?)?;
-                outbound.qos2_publish.insert(
-                    packet_id,
-                    PendingSnapshot {
-                        packet,
-                        expires_at_ms,
-                    },
-                );
+                if outbound
+                    .qos2_publish
+                    .insert(packet_id, decode_pending(&mut reader)?)
+                    .is_some()
+                {
+                    return Err("duplicate PBIN1 QoS2 packet identifier".to_string());
+                }
             }
-            let pubrel_count = reader.u32()? as usize;
-            for _ in 0..pubrel_count {
-                outbound.qos2_pubrel.insert(reader.u16()?);
+            for _ in 0..reader.count()? {
+                if !outbound.qos2_pubrel.insert(reader.u16()?) {
+                    return Err("duplicate PBIN1 PUBREL packet identifier".to_string());
+                }
             }
-            Some(Record::OutboundReplace {
+            V1Record::OutboundReplace {
                 client_id,
                 outbound,
-            })
+            }
         }
-        _ => None,
-    }
+        _ => return Err("unknown PBIN1 record tag".to_string()),
+    };
+    reader.finish()?;
+    Ok(record)
 }
 
 #[derive(Default)]
@@ -1523,6 +1460,14 @@ impl Writer {
         self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 
+    fn u64(&mut self, value: u64) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn len(&mut self, value: usize) {
+        self.u32(u32::try_from(value).expect("PBIN2 collection length"));
+    }
+
     fn opt_u32(&mut self, value: Option<u32>) {
         self.bool(value.is_some());
         if let Some(value) = value {
@@ -1533,7 +1478,7 @@ impl Writer {
     fn opt_u64(&mut self, value: Option<u64>) {
         self.bool(value.is_some());
         if let Some(value) = value {
-            self.bytes.extend_from_slice(&value.to_le_bytes());
+            self.u64(value);
         }
     }
 
@@ -1549,7 +1494,7 @@ impl Writer {
     }
 
     fn bytes(&mut self, value: &[u8]) {
-        self.u32(value.len() as u32);
+        self.len(value.len());
         self.bytes.extend_from_slice(value);
     }
 
@@ -1568,79 +1513,95 @@ impl<'a> Reader<'a> {
         Self { bytes, index: 0 }
     }
 
-    fn u8(&mut self) -> Option<u8> {
-        let value = *self.bytes.get(self.index)?;
+    fn finish(&self) -> Result<(), String> {
+        if self.index == self.bytes.len() {
+            Ok(())
+        } else {
+            Err("PBIN record contains trailing bytes".to_string())
+        }
+    }
+
+    fn count(&mut self) -> Result<usize, String> {
+        let count = self.u32()? as usize;
+        if count > self.bytes.len().saturating_sub(self.index) {
+            return Err("PBIN collection count exceeds frame".to_string());
+        }
+        Ok(count)
+    }
+
+    fn u8(&mut self) -> Result<u8, String> {
+        let value = *self
+            .bytes
+            .get(self.index)
+            .ok_or_else(|| "unexpected end of PBIN record".to_string())?;
         self.index += 1;
-        Some(value)
+        Ok(value)
     }
 
-    fn bool(&mut self) -> Option<bool> {
-        Some(self.u8()? != 0)
-    }
-
-    fn u16(&mut self) -> Option<u16> {
-        let bytes = self.take_array::<2>()?;
-        Some(u16::from_le_bytes(bytes))
-    }
-
-    fn u32(&mut self) -> Option<u32> {
-        let bytes = self.take_array::<4>()?;
-        Some(u32::from_le_bytes(bytes))
-    }
-
-    fn opt_u32(&mut self) -> Option<Option<u32>> {
-        if self.bool()? {
-            Some(Some(self.u32()?))
-        } else {
-            Some(None)
+    fn bool(&mut self) -> Result<bool, String> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err("invalid PBIN boolean".to_string()),
         }
     }
 
-    fn opt_u64(&mut self) -> Option<Option<u64>> {
-        if self.bool()? {
-            let bytes = self.take_array::<8>()?;
-            Some(Some(u64::from_le_bytes(bytes)))
-        } else {
-            Some(None)
-        }
+    fn u16(&mut self) -> Result<u16, String> {
+        Ok(u16::from_le_bytes(self.take_array()?))
     }
 
-    fn string(&mut self) -> Option<String> {
-        String::from_utf8(self.bytes()?.to_vec()).ok()
+    fn u32(&mut self) -> Result<u32, String> {
+        Ok(u32::from_le_bytes(self.take_array()?))
     }
 
-    fn opt_string(&mut self) -> Option<Option<String>> {
-        if self.bool()? {
-            Some(Some(self.string()?))
-        } else {
-            Some(None)
-        }
+    fn u64(&mut self) -> Result<u64, String> {
+        Ok(u64::from_le_bytes(self.take_array()?))
     }
 
-    fn bytes(&mut self) -> Option<&'a [u8]> {
+    fn opt_u32(&mut self) -> Result<Option<u32>, String> {
+        self.bool()?.then(|| self.u32()).transpose()
+    }
+
+    fn opt_u64(&mut self) -> Result<Option<u64>, String> {
+        self.bool()?.then(|| self.u64()).transpose()
+    }
+
+    fn string(&mut self) -> Result<String, String> {
+        String::from_utf8(self.bytes()?.to_vec())
+            .map_err(|_| "PBIN string is not UTF-8".to_string())
+    }
+
+    fn opt_string(&mut self) -> Result<Option<String>, String> {
+        self.bool()?.then(|| self.string()).transpose()
+    }
+
+    fn bytes(&mut self) -> Result<&'a [u8], String> {
         let len = self.u32()? as usize;
         self.take(len)
     }
 
-    fn take_array<const N: usize>(&mut self) -> Option<[u8; N]> {
-        let bytes = self.take(N)?;
-        bytes.try_into().ok()
+    fn take_array<const N: usize>(&mut self) -> Result<[u8; N], String> {
+        self.take(N)?
+            .try_into()
+            .map_err(|_| "unexpected end of PBIN record".to_string())
     }
 
-    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
-        let end = self.index.checked_add(len)?;
-        let bytes = self.bytes.get(self.index..end)?;
+    fn take(&mut self, len: usize) -> Result<&'a [u8], String> {
+        let end = self
+            .index
+            .checked_add(len)
+            .ok_or_else(|| "PBIN record length overflow".to_string())?;
+        let bytes = self
+            .bytes
+            .get(self.index..end)
+            .ok_or_else(|| "unexpected end of PBIN record".to_string())?;
         self.index = end;
-        Some(bytes)
+        Ok(bytes)
     }
 }
 
 fn encode_retained(message: &RetainedMessage) -> Vec<u8> {
-    let packet_id = if message.qos == QoS::AtMostOnce {
-        None
-    } else {
-        Some(1)
-    };
+    let packet_id = (message.qos != QoS::AtMostOnce).then_some(1);
     encode_publish(&PublishPacket {
         dup: false,
         qos: message.qos,
@@ -1663,7 +1624,7 @@ fn decode_retained(packet: &[u8]) -> Option<RetainedMessage> {
     ))
 }
 
-fn encode_publish(packet: &PublishPacket) -> Vec<u8> {
+pub(crate) fn encode_publish(packet: &PublishPacket) -> Vec<u8> {
     let mut codec = MqttCodec::new();
     let mut buffer = BytesMut::new();
     let mut packet = packet.clone();
@@ -1676,10 +1637,13 @@ fn encode_publish(packet: &PublishPacket) -> Vec<u8> {
     buffer.to_vec()
 }
 
-fn decode_publish(packet: &[u8]) -> Option<PublishPacket> {
+pub(crate) fn decode_publish(packet: &[u8]) -> Option<PublishPacket> {
     let mut codec = MqttCodec::new();
     let mut buffer = BytesMut::from(packet);
     let packet = codec.decode(&mut buffer).ok().flatten()?;
+    if !buffer.is_empty() {
+        return None;
+    }
     let MqttPacket::Publish(packet) = packet else {
         return None;
     };
@@ -1694,11 +1658,12 @@ fn qos_to_u8(qos: QoS) -> u8 {
     }
 }
 
-fn qos_from_u8(value: u8) -> QoS {
+fn qos_from_u8(value: u8) -> Result<QoS, String> {
     match value {
-        1 => QoS::AtLeastOnce,
-        2 => QoS::ExactlyOnce,
-        _ => QoS::AtMostOnce,
+        0 => Ok(QoS::AtMostOnce),
+        1 => Ok(QoS::AtLeastOnce),
+        2 => Ok(QoS::ExactlyOnce),
+        _ => Err("invalid PBIN QoS".to_string()),
     }
 }
 
@@ -1714,16 +1679,31 @@ fn crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(ErrorKind::InvalidData, message.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::broker::runtime::retained_store::RetainedMessage;
+    use crate::broker::runtime::{message::PendingPublish, subscription_tree::SubscriptionEntry};
+    use rs_netty::codec::SubscriptionOptions;
+
+    const V1_LEGACY_FIXTURE_HEX: &str = concat!(
+        "5042494e310a11000000010500000076616c69643c000000000700a5ae0521",
+        "26000000030500000076616c69640700000076616c69642f23070000007661",
+        "6c69642f230001000000006e0adb4326000000030500000067686f73740700",
+        "000067686f73742f230700000067686f73742f230001000000004127e9dc33",
+        "000000080500000076616c696401000000040000160000003214000b76616c",
+        "69642f746f7069630004006c6976650000000000000000ff9f0f4735000000",
+        "080500000067686f737401000000010000180000003216000b67686f73742f",
+        "746f7069630001006f727068616e000000000000000030ba648f2b00000007",
+        "0500000067686f73740100000000180000003216000b67686f73742f746f70",
+        "69630001006f727068616e6844bc0e",
+    );
 
     fn temp_dir(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "pulse-binary-storage-{name}-{}",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("pulse-pbin2-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         path
     }
@@ -1740,292 +1720,644 @@ mod tests {
         }
     }
 
-    fn wal_epoch_files(dir: &Path) -> Vec<PathBuf> {
-        let mut files = fs::read_dir(dir)
-            .expect("read WAL dir")
-            .map(|entry| entry.expect("dir entry").path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .and_then(wal_epoch_from_file_name)
-                    .is_some()
-            })
-            .collect::<Vec<_>>();
-        files.sort();
-        files
+    fn fixture_bytes() -> Vec<u8> {
+        V1_LEGACY_FIXTURE_HEX
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|digits| u8::from_str_radix(std::str::from_utf8(digits).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    fn state_with_qos1(count: u16) -> BrokerState {
+        let mut state = BrokerState::default();
+        let mut session = SessionEntry::disconnected(60, Some(123));
+        for packet_id in 1..=count {
+            session.outbound_qos1.insert(
+                packet_id,
+                PendingPublish {
+                    packet: PublishPacket {
+                        packet_id: Some(packet_id),
+                        ..publish("devices/qos1", b"payload", QoS::AtLeastOnce)
+                    },
+                    expires_at_ms: None,
+                },
+            );
+        }
+        state
+            .sessions_by_client_id
+            .insert("client".to_string(), session);
+        state
+    }
+
+    fn seed_persistent_state(state: &mut BrokerState) {
+        state.sessions_by_client_id.insert(
+            "client".to_string(),
+            SessionEntry::disconnected(60, Some(u64::MAX)),
+        );
+        let session = state.sessions_by_client_id.get_mut("client").unwrap();
+        session.next_packet_id = 7;
+        session.next_offline_sequence = 4;
+        session.offline_queue.push_back(QueuedPublish {
+            sequence: 3,
+            pending: PendingPublish {
+                packet: publish("devices/offline", b"offline", QoS::AtLeastOnce),
+                expires_at_ms: Some(456),
+            },
+        });
+        session.outbound_qos1.insert(
+            4,
+            PendingPublish {
+                packet: PublishPacket {
+                    packet_id: Some(4),
+                    ..publish("devices/inflight", b"inflight", QoS::AtLeastOnce)
+                },
+                expires_at_ms: Some(789),
+            },
+        );
+        session.outbound_qos2_pubrel.insert(9);
+        state.subscriptions.push(SubscriptionEntry {
+            client_id: "client".to_string(),
+            filter: "devices/#".to_string(),
+            match_filter: "devices/#".to_string(),
+            shared_group: None,
+            options: SubscriptionOptions {
+                maximum_qos: QoS::AtLeastOnce,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+            },
+            subscription_identifier: Some(11),
+        });
+        state.retained.insert(
+            "devices/retained".to_string(),
+            RetainedMessage::new(
+                QoS::AtMostOnce,
+                "devices/retained".to_string(),
+                Vec::new(),
+                Bytes::from_static(b"retained"),
+                Some(999),
+            ),
+        );
+        state.mark_client_reset("client");
+        state.mark_retained_changed("devices/retained");
     }
 
     #[test]
-    fn recovers_sessions_subscriptions_retained_offline_and_outbound() {
+    fn recovers_pbin2_state() {
         let dir = temp_dir("recover");
         {
-            let storage = BinaryStorage::open(&dir, CommitPolicy::Strict).expect("open storage");
-            storage.with_state(&mut |state| {
-                state.sessions_by_client_id.insert(
-                    "client".to_string(),
-                    SessionEntry::disconnected(60, Some(123)),
-                );
-                let session = state
-                    .sessions_by_client_id
-                    .get_mut("client")
-                    .expect("session");
-                session.next_packet_id = 7;
-                session.offline_queue.push_back(PendingPublish {
-                    packet: publish("devices/offline", b"offline", QoS::AtLeastOnce),
-                    expires_at_ms: Some(456),
-                });
-                session.outbound_qos1.insert(
-                    4,
-                    PendingPublish {
-                        packet: publish("devices/inflight", b"inflight", QoS::AtLeastOnce),
-                        expires_at_ms: Some(789),
-                    },
-                );
-                session.outbound_qos2_pubrel.insert(9);
-                state.subscriptions.push(SubscriptionEntry {
-                    client_id: "client".to_string(),
-                    filter: "devices/#".to_string(),
-                    match_filter: "devices/#".to_string(),
-                    shared_group: None,
-                    options: SubscriptionOptions {
-                        maximum_qos: QoS::AtLeastOnce,
-                        no_local: false,
-                        retain_as_published: false,
-                        retain_handling: 0,
-                    },
-                    subscription_identifier: Some(11),
-                });
-                state.retained.insert(
-                    "devices/retained".to_string(),
-                    RetainedMessage::new(
-                        QoS::AtMostOnce,
-                        "devices/retained".to_string(),
-                        Vec::new(),
-                        Bytes::from_static(b"retained"),
-                        Some(999),
-                    ),
-                );
-                state.mark_sessions_changed();
-                state.mark_subscriptions_changed();
-                state.mark_retained_changed();
-                state.mark_offline_changed("client");
-                state.mark_outbound_changed("client");
-            });
+            let storage = BinaryStorage::open(&dir, CommitPolicy::Strict).unwrap();
+            storage.with_state(&mut seed_persistent_state);
         }
-
-        let storage = BinaryStorage::open(&dir, CommitPolicy::Strict).expect("reopen storage");
+        let storage = BinaryStorage::open(&dir, CommitPolicy::Strict).unwrap();
         storage.read_state(&mut |state| {
-            let session = state.sessions_by_client_id.get("client").expect("session");
+            let session = state.sessions_by_client_id.get("client").unwrap();
             assert_eq!(session.next_packet_id, 7);
-            assert_eq!(session.offline_queue.len(), 1);
+            assert_eq!(session.next_offline_sequence, 4);
+            assert_eq!(session.offline_queue.front().unwrap().sequence, 3);
             assert!(session.outbound_qos1.contains_key(&4));
             assert!(session.outbound_qos2_pubrel.contains(&9));
             assert_eq!(state.subscriptions.len(), 1);
-            let retained = state.retained.get("devices/retained").expect("retained");
-            assert_eq!(retained.payload, Bytes::from_static(b"retained"));
-            assert_eq!(retained.expires_at_ms, Some(999));
+            assert!(state.retained.contains_key("devices/retained"));
         });
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn size_trigger_compacts_checkpoint_and_removes_legacy_wal() {
-        let dir = temp_dir("size-compact");
-        {
-            let storage = BinaryStorage::open_with_options(
-                &dir,
-                CommitPolicy::Strict,
-                WalCompactConfig {
-                    max_bytes: MAGIC.len() as u64,
-                    interval_ms: 0,
-                },
-            )
-            .expect("open storage");
-            storage.with_state(&mut |state| {
-                state
-                    .sessions_by_client_id
-                    .insert("client".to_string(), SessionEntry::disconnected(60, None));
-                state.mark_sessions_changed();
-            });
+    fn v2_unknown_tag_and_complete_crc_failure_are_rejected() {
+        let dir = temp_dir("strict-corruption");
+        let storage = BinaryStorage::open(&dir, CommitPolicy::Strict).unwrap();
+        drop(storage);
+        let manifest = read_manifest(&dir.join(MANIFEST_FILE_NAME)).unwrap();
+        let wal = dir.join(manifest.active_log);
 
-            assert!(dir.join(MANIFEST_FILE_NAME).exists());
-            assert!(dir.join(CHECKPOINT_FILE_NAME).exists());
-            assert!(!dir.join(LOG_FILE_NAME).exists());
-            assert_eq!(wal_epoch_files(&dir).len(), 1);
-        }
+        let payload = [99u8];
+        let mut file = OpenOptions::new().append(true).open(&wal).unwrap();
+        file.write_all(&(payload.len() as u32).to_le_bytes())
+            .unwrap();
+        file.write_all(&payload).unwrap();
+        file.write_all(&crc32(&payload).to_le_bytes()).unwrap();
+        drop(file);
+        assert!(BinaryStorage::open(&dir, CommitPolicy::Strict).is_err());
 
-        let storage = BinaryStorage::open(&dir, CommitPolicy::Strict).expect("reopen storage");
-        storage.read_state(&mut |state| {
-            assert!(state.sessions_by_client_id.contains_key("client"));
+        let _ = fs::remove_dir_all(&dir);
+        let storage = BinaryStorage::open(&dir, CommitPolicy::Strict).unwrap();
+        drop(storage);
+        let manifest = read_manifest(&dir.join(MANIFEST_FILE_NAME)).unwrap();
+        let wal = dir.join(manifest.active_log);
+        let patch = StoragePatch::Retained(RetainedPatch {
+            topic_name: "missing".to_string(),
+            message: None,
         });
+        let payload = encode_patch(&patch);
+        let mut file = OpenOptions::new().append(true).open(&wal).unwrap();
+        file.write_all(&(payload.len() as u32).to_le_bytes())
+            .unwrap();
+        file.write_all(&payload).unwrap();
+        file.write_all(&0u32.to_le_bytes()).unwrap();
+        drop(file);
+        assert!(BinaryStorage::open(&dir, CommitPolicy::Strict).is_err());
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn time_trigger_compacts_only_after_a_new_wal_write() {
-        let dir = temp_dir("time-compact");
-        let compact = WalCompactConfig {
-            max_bytes: 0,
-            interval_ms: 1,
-        };
-        {
-            let _storage = BinaryStorage::open_with_options(&dir, CommitPolicy::Strict, compact)
-                .expect("open storage");
-            thread::sleep(Duration::from_millis(2));
-            assert!(!dir.join(MANIFEST_FILE_NAME).exists());
-        }
+    fn pbin2_rejects_trailing_bytes_in_nested_mqtt_packet() {
+        let message = RetainedMessage::new(
+            QoS::AtMostOnce,
+            "devices/trailing".to_string(),
+            Vec::new(),
+            Bytes::from_static(b"payload"),
+            None,
+        );
+        let mut mqtt_packet = encode_retained(&message);
+        mqtt_packet.push(0);
 
-        {
-            let storage = BinaryStorage::open_with_options(&dir, CommitPolicy::Strict, compact)
-                .expect("reopen storage");
-            thread::sleep(Duration::from_millis(2));
-            storage.with_state(&mut |state| {
-                state
-                    .sessions_by_client_id
-                    .insert("client".to_string(), SessionEntry::disconnected(60, None));
-                state.mark_sessions_changed();
-            });
-            assert!(dir.join(MANIFEST_FILE_NAME).exists());
-            assert!(dir.join(CHECKPOINT_FILE_NAME).exists());
-        }
-        let _ = fs::remove_dir_all(dir);
+        let mut writer = Writer::default();
+        writer.u8(RETAINED_PATCH);
+        writer.string("devices/trailing");
+        writer.bool(true);
+        writer.opt_u64(None);
+        writer.bytes(&mqtt_packet);
+
+        assert!(decode_patch(&writer.into_inner()).is_err());
     }
 
     #[test]
-    fn compact_recovery_restores_checkpoint_and_active_wal_records() {
-        let dir = temp_dir("checkpoint-active-recover");
+    fn active_wal_allows_only_physical_tail() {
+        let dir = temp_dir("physical-tail");
         {
-            let storage = BinaryStorage::open_with_options(
-                &dir,
-                CommitPolicy::Strict,
-                WalCompactConfig {
-                    max_bytes: MAGIC.len() as u64,
-                    interval_ms: 0,
-                },
-            )
-            .expect("open storage");
-            storage.with_state(&mut |state| {
-                state
-                    .sessions_by_client_id
-                    .insert("client".to_string(), SessionEntry::disconnected(60, None));
-                state.mark_sessions_changed();
-            });
+            let storage = BinaryStorage::open(&dir, CommitPolicy::Strict).unwrap();
+            storage.with_state(&mut seed_persistent_state);
         }
-
-        {
-            let storage = BinaryStorage::open_with_options(
-                &dir,
-                CommitPolicy::Strict,
-                WalCompactConfig {
-                    max_bytes: 0,
-                    interval_ms: 0,
-                },
-            )
-            .expect("reopen storage");
-            storage.with_state(&mut |state| {
-                state.subscriptions.push(SubscriptionEntry {
-                    client_id: "client".to_string(),
-                    filter: "devices/#".to_string(),
-                    match_filter: "devices/#".to_string(),
-                    shared_group: None,
-                    options: SubscriptionOptions {
-                        maximum_qos: QoS::AtLeastOnce,
-                        no_local: false,
-                        retain_as_published: false,
-                        retain_handling: 0,
-                    },
-                    subscription_identifier: None,
-                });
-                state.mark_subscriptions_changed();
-            });
-        }
-
-        let storage = BinaryStorage::open(&dir, CommitPolicy::Strict).expect("recover storage");
-        storage.read_state(&mut |state| {
-            assert!(state.sessions_by_client_id.contains_key("client"));
-            assert_eq!(state.subscriptions.len(), 1);
-        });
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn startup_cleans_tmp_and_unreferenced_epoch_files() {
-        let dir = temp_dir("cleanup");
-        {
-            let storage = BinaryStorage::open_with_options(
-                &dir,
-                CommitPolicy::Strict,
-                WalCompactConfig {
-                    max_bytes: MAGIC.len() as u64,
-                    interval_ms: 0,
-                },
-            )
-            .expect("open storage");
-            storage.with_state(&mut |state| {
-                state
-                    .sessions_by_client_id
-                    .insert("client".to_string(), SessionEntry::disconnected(60, None));
-                state.mark_sessions_changed();
-            });
-        }
-        fs::write(dir.join("broker.checkpoint.tmp"), b"junk").expect("write tmp checkpoint");
-        fs::write(dir.join("broker.manifest.tmp"), b"junk").expect("write tmp manifest");
-        fs::write(dir.join(LOG_FILE_NAME), MAGIC).expect("write stale legacy WAL");
-        fs::write(wal_epoch_path(&dir, 999), MAGIC).expect("write orphan WAL");
-
-        let _storage = BinaryStorage::open(&dir, CommitPolicy::Strict).expect("reopen storage");
-        assert!(!dir.join("broker.checkpoint.tmp").exists());
-        assert!(!dir.join("broker.manifest.tmp").exists());
-        assert!(!dir.join(LOG_FILE_NAME).exists());
-        assert!(!wal_epoch_path(&dir, 999).exists());
-        assert_eq!(wal_epoch_files(&dir).len(), 1);
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn ignores_corrupt_tail() {
-        let dir = temp_dir("corrupt-tail");
-        {
-            let storage = BinaryStorage::open(&dir, CommitPolicy::Strict).expect("open storage");
-            storage.with_state(&mut |state| {
-                state
-                    .sessions_by_client_id
-                    .insert("client".to_string(), SessionEntry::disconnected(60, None));
-                state.mark_sessions_changed();
-            });
-        }
-
-        let path = dir.join(LOG_FILE_NAME);
-        let mut file = OpenOptions::new()
+        let manifest = read_manifest(&dir.join(MANIFEST_FILE_NAME)).unwrap();
+        let wal = dir.join(manifest.active_log);
+        OpenOptions::new()
             .append(true)
-            .open(&path)
-            .expect("append log");
-        file.write_all(&[7, 0, 0, 0, 1, 2]).expect("write junk");
-
-        let storage = BinaryStorage::open(&dir, CommitPolicy::Strict).expect("reopen storage");
+            .open(&wal)
+            .unwrap()
+            .write_all(&[12, 0, 0])
+            .unwrap();
+        {
+            let storage = BinaryStorage::open(&dir, CommitPolicy::Strict).unwrap();
+            storage.with_state(&mut |state| {
+                state.retained.insert(
+                    "after/tail".to_string(),
+                    RetainedMessage::new(
+                        QoS::AtMostOnce,
+                        "after/tail".to_string(),
+                        Vec::new(),
+                        Bytes::from_static(b"ok"),
+                        None,
+                    ),
+                );
+                state.mark_retained_changed("after/tail");
+            });
+        }
+        let storage = BinaryStorage::open(&dir, CommitPolicy::Strict).unwrap();
         storage.read_state(&mut |state| {
+            assert!(state.retained.contains_key("after/tail"));
             assert!(state.sessions_by_client_id.contains_key("client"));
         });
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn fast_policy_flushes_background_writer_on_drop() {
-        let dir = temp_dir("fast-drop");
+    fn active_wal_accepts_every_final_frame_truncation_but_rejects_middle_corruption() {
+        let dir = temp_dir("active-truncation-matrix");
+        fs::create_dir_all(&dir).unwrap();
+        let complete_path = dir.join("complete.wal");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&complete_path)
+            .unwrap();
+        file.write_all(V2_MAGIC).unwrap();
+        let first = StoragePatch::Retained(RetainedPatch {
+            topic_name: "matrix/first".to_string(),
+            message: Some(RetainedMessage::new(
+                QoS::AtMostOnce,
+                "matrix/first".to_string(),
+                Vec::new(),
+                Bytes::from_static(b"first"),
+                None,
+            )),
+        });
+        let second = StoragePatch::Retained(RetainedPatch {
+            topic_name: "matrix/second".to_string(),
+            message: Some(RetainedMessage::new(
+                QoS::AtMostOnce,
+                "matrix/second".to_string(),
+                Vec::new(),
+                Bytes::from_static(b"second"),
+                None,
+            )),
+        });
+        let first_len = write_patches(&mut file, std::slice::from_ref(&first)).unwrap();
+        write_patches(&mut file, std::slice::from_ref(&second)).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let complete = fs::read(&complete_path).unwrap();
+        let first_end = V2_MAGIC.len() + first_len as usize;
+        let truncated_path = dir.join("truncated.wal");
+        for cut in 0..V2_MAGIC.len() {
+            fs::write(&truncated_path, &complete[..cut]).unwrap();
+            assert!(
+                replay_v2(&truncated_path, ReplayMode::AllowPhysicalTail).is_err(),
+                "active WAL accepted an incomplete header at byte {cut}"
+            );
+        }
+        for cut in V2_MAGIC.len()..complete.len() {
+            fs::write(&truncated_path, &complete[..cut]).unwrap();
+            let projection = replay_v2(&truncated_path, ReplayMode::AllowPhysicalTail)
+                .unwrap_or_else(|error| panic!("active WAL truncation at {cut}: {error}"));
+            assert_eq!(
+                projection.retained.contains_key("matrix/first"),
+                cut >= first_end
+            );
+            assert!(!projection.retained.contains_key("matrix/second"));
+        }
+
+        let mut corrupted = complete;
+        corrupted[V2_MAGIC.len() + 4] ^= 0x7f;
+        fs::write(&truncated_path, corrupted).unwrap();
+        assert!(replay_v2(&truncated_path, ReplayMode::AllowPhysicalTail).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pbin2_rejects_unknown_client_patch_version_with_valid_crc() {
+        let dir = temp_dir("unknown-patch-version");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("unknown-version.wal");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(V2_MAGIC).unwrap();
+        let mut payload = encode_patch(&StoragePatch::Client(ClientPatch::delete(
+            "client".to_string(),
+        )));
+        payload[1] = CLIENT_PATCH_VERSION + 1;
+        write_frame(&mut file, &payload).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        assert!(replay_v2(&path, ReplayMode::AllowPhysicalTail).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn compaction_uses_generation_scoped_files() {
+        let dir = temp_dir("compact");
+        let storage = BinaryStorage::open_with_options(
+            &dir,
+            CommitPolicy::Strict,
+            WalCompactConfig {
+                max_bytes: V2_MAGIC.len() as u64,
+                interval_ms: 0,
+            },
+        )
+        .unwrap();
+        storage.with_state(&mut seed_persistent_state);
+        drop(storage);
+        let manifest = read_manifest(&dir.join(MANIFEST_FILE_NAME)).unwrap();
+        assert_eq!(manifest.version, 2);
+        assert!(manifest.checkpoint.starts_with(V2_CHECKPOINT_PREFIX));
+        assert!(manifest.active_log.starts_with(V2_WAL_PREFIX));
+        assert!(dir.join(&manifest.checkpoint).is_file());
+        assert!(dir.join(&manifest.active_log).is_file());
+        assert!(!dir.join(LEGACY_LOG_FILE_NAME).exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn qos1_ack_patch_size_does_not_depend_on_remaining_inflight() {
+        let patch_len = |count: u16| {
+            let mut state = state_with_qos1(count);
+            let projection = PersistentProjection::from_state(&state);
+            state
+                .sessions_by_client_id
+                .get_mut("client")
+                .unwrap()
+                .outbound_qos1
+                .remove(&1);
+            let patches = prepare_patches(
+                &projection,
+                &state,
+                &[
+                    crate::broker::runtime::session_registry::PersistenceChange::ClientChanged(
+                        "client".to_string(),
+                    ),
+                ],
+            );
+            assert_eq!(patches.len(), 1);
+            encode_patch(&patches[0]).len()
+        };
+        let one_remaining = patch_len(2);
+        let thousand_remaining = patch_len(1_001);
+        assert_eq!(one_remaining, thousand_remaining);
+        assert!(one_remaining < 64);
+    }
+
+    #[test]
+    fn offline_queue_drain_writes_linear_patch_bytes() {
+        let drain_bytes =
+            |count: u64| {
+                let mut state = BrokerState::default();
+                let mut session = SessionEntry::disconnected(60, Some(u64::MAX));
+                session.next_offline_sequence = count;
+                for sequence in 0..count {
+                    session.offline_queue.push_back(QueuedPublish {
+                        sequence,
+                        pending: PendingPublish {
+                            packet: publish("devices/offline", b"payload", QoS::AtLeastOnce),
+                            expires_at_ms: None,
+                        },
+                    });
+                }
+                state
+                    .sessions_by_client_id
+                    .insert("client".to_string(), session);
+                let mut projection = PersistentProjection::from_state(&state);
+                let mut total_bytes = 0;
+                let mut patch_bytes = None;
+
+                for _ in 0..count {
+                    state
+                        .sessions_by_client_id
+                        .get_mut("client")
+                        .unwrap()
+                        .offline_queue
+                        .pop_front()
+                        .unwrap();
+                    let patches = prepare_patches(
+                    &projection,
+                    &state,
+                    &[crate::broker::runtime::session_registry::PersistenceChange::ClientChanged(
+                        "client".to_string(),
+                    )],
+                );
+                    assert_eq!(patches.len(), 1);
+                    let encoded_len = encode_patch(&patches[0]).len();
+                    assert_eq!(*patch_bytes.get_or_insert(encoded_len), encoded_len);
+                    total_bytes += encoded_len;
+                    projection.apply_patch(&patches[0]).unwrap();
+                }
+                (total_bytes, patch_bytes.unwrap())
+            };
+
+        let (one_hundred_total, patch_bytes) = drain_bytes(100);
+        let (one_thousand_total, _) = drain_bytes(1_000);
+        assert_eq!(one_hundred_total, patch_bytes * 100);
+        assert_eq!(one_thousand_total, patch_bytes * 1_000);
+        assert!(patch_bytes < 64);
+    }
+
+    #[test]
+    fn client_frames_are_sorted_by_client_id() {
+        let mut state = BrokerState::default();
+        state
+            .sessions_by_client_id
+            .insert("zeta".to_string(), SessionEntry::disconnected(60, Some(1)));
+        state
+            .sessions_by_client_id
+            .insert("alpha".to_string(), SessionEntry::disconnected(60, Some(1)));
+        let patches = prepare_patches(
+            &PersistentProjection::default(),
+            &state,
+            &[
+                crate::broker::runtime::session_registry::PersistenceChange::ClientReset(
+                    "zeta".to_string(),
+                ),
+                crate::broker::runtime::session_registry::PersistenceChange::ClientReset(
+                    "alpha".to_string(),
+                ),
+            ],
+        );
+        let client_ids = patches
+            .iter()
+            .map(|patch| match patch {
+                StoragePatch::Client(patch) => patch.client_id.as_str(),
+                StoragePatch::Retained(_) => panic!("unexpected retained patch"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(client_ids, ["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn checkpoint_rejects_every_truncation() {
+        let dir = temp_dir("checkpoint-truncation");
         {
-            let storage = BinaryStorage::open(&dir, CommitPolicy::Fast).expect("open storage");
+            let storage = BinaryStorage::open_with_options(
+                &dir,
+                CommitPolicy::Strict,
+                WalCompactConfig {
+                    max_bytes: V2_MAGIC.len() as u64,
+                    interval_ms: 0,
+                },
+            )
+            .unwrap();
+            storage.with_state(&mut seed_persistent_state);
+        }
+        let manifest = read_manifest(&dir.join(MANIFEST_FILE_NAME)).unwrap();
+        let checkpoint = fs::read(dir.join(manifest.checkpoint)).unwrap();
+        let cut_path = dir.join("truncated-checkpoint");
+        for cut in 0..checkpoint.len() {
+            fs::write(&cut_path, &checkpoint[..cut]).unwrap();
+            assert!(
+                replay_v2(&cut_path, ReplayMode::Strict).is_err(),
+                "checkpoint truncation at byte {cut} was accepted"
+            );
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn migrates_fixed_pbin1_legacy_and_drops_orphans() {
+        let dir = temp_dir("v1-legacy-migration");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(LEGACY_LOG_FILE_NAME), fixture_bytes()).unwrap();
+
+        let storage = BinaryStorage::open(&dir, CommitPolicy::Strict).unwrap();
+        storage.read_state(&mut |state| {
+            let session = state.sessions_by_client_id.get("valid").unwrap();
+            assert!(session.outbound_qos1.contains_key(&4));
+            assert_eq!(state.subscriptions.len(), 1);
+            assert_eq!(state.subscriptions[0].client_id, "valid");
+            assert!(!state.sessions_by_client_id.contains_key("ghost"));
+        });
+        drop(storage);
+
+        let manifest = read_manifest(&dir.join(MANIFEST_FILE_NAME)).unwrap();
+        assert_eq!(manifest.version, 2);
+        assert!(!dir.join(LEGACY_LOG_FILE_NAME).exists());
+        let projection = replay_v2(&dir.join(manifest.checkpoint), ReplayMode::Strict).unwrap();
+        assert_eq!(projection.clients.len(), 1);
+        assert!(projection.clients.contains_key("valid"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn migrates_large_pbin1_orphan_outbound_without_checkpointing_payload() {
+        const ORPHAN_QOS1_COUNT: u16 = 22_566;
+
+        let dir = temp_dir("v1-large-orphan-migration");
+        fs::create_dir_all(&dir).unwrap();
+        let legacy_path = dir.join(LEGACY_LOG_FILE_NAME);
+        let encoded_packet = encode_publish(&PublishPacket {
+            dup: false,
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            topic_name: "orphan/qos1".to_string(),
+            packet_id: Some(1),
+            properties: Vec::new(),
+            payload: Bytes::from(vec![b'x'; 905]),
+        });
+        let mut payload = Writer::default();
+        payload.u8(V1_OUTBOUND_REPLACE);
+        payload.string("orphan");
+        payload.len(usize::from(ORPHAN_QOS1_COUNT));
+        for packet_id in 1..=ORPHAN_QOS1_COUNT {
+            payload.u16(packet_id);
+            payload.opt_u64(None);
+            payload.bytes(&encoded_packet);
+        }
+        payload.len(0);
+        payload.len(0);
+        let payload = payload.into_inner();
+        let mut legacy = File::create(&legacy_path).unwrap();
+        legacy.write_all(V1_MAGIC).unwrap();
+        write_frame(&mut legacy, &payload).unwrap();
+        legacy.sync_all().unwrap();
+        drop(legacy);
+        assert!(fs::metadata(&legacy_path).unwrap().len() > 20_000_000);
+
+        let storage = BinaryStorage::open(&dir, CommitPolicy::Strict).unwrap();
+        storage.read_state(&mut |state| {
+            assert!(state.sessions_by_client_id.is_empty());
+        });
+        drop(storage);
+
+        let manifest = read_manifest(&dir.join(MANIFEST_FILE_NAME)).unwrap();
+        let checkpoint_path = dir.join(manifest.checkpoint);
+        let projection = replay_v2(&checkpoint_path, ReplayMode::Strict).unwrap();
+        assert!(projection.clients.is_empty());
+        assert!(fs::metadata(checkpoint_path).unwrap().len() < 64);
+        assert!(!legacy_path.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn migrates_fixed_pbin1_manifest_layout() {
+        let dir = temp_dir("v1-manifest-migration");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(LEGACY_CHECKPOINT_FILE_NAME), fixture_bytes()).unwrap();
+        fs::write(dir.join(legacy_wal_file_name(5)), V1_MAGIC).unwrap();
+        fs::write(
+            dir.join(MANIFEST_FILE_NAME),
+            concat!(
+                "version=1\n",
+                "checkpoint=broker.checkpoint\n",
+                "active_log=broker.binlog.5\n",
+                "active_epoch=5\n"
+            ),
+        )
+        .unwrap();
+
+        let storage = BinaryStorage::open(&dir, CommitPolicy::Strict).unwrap();
+        storage.read_state(&mut |state| {
+            assert!(state.sessions_by_client_id.contains_key("valid"));
+            assert!(!state.sessions_by_client_id.contains_key("ghost"));
+        });
+        drop(storage);
+        assert_eq!(
+            read_manifest(&dir.join(MANIFEST_FILE_NAME))
+                .unwrap()
+                .version,
+            2
+        );
+        assert!(!dir.join(LEGACY_CHECKPOINT_FILE_NAME).exists());
+        assert!(!dir.join(legacy_wal_file_name(5)).exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn transient_client_is_absent_from_compacted_checkpoint() {
+        let dir = temp_dir("transient-checkpoint");
+        {
+            let storage = BinaryStorage::open_with_options(
+                &dir,
+                CommitPolicy::Strict,
+                WalCompactConfig {
+                    max_bytes: V2_MAGIC.len() as u64,
+                    interval_ms: 0,
+                },
+            )
+            .unwrap();
+            storage.with_state(&mut |state| {
+                let mut session = SessionEntry::disconnected(0, None);
+                for packet_id in 1..=1_000 {
+                    session.outbound_qos1.insert(
+                        packet_id,
+                        PendingPublish {
+                            packet: PublishPacket {
+                                packet_id: Some(packet_id),
+                                ..publish("transient", b"payload", QoS::AtLeastOnce)
+                            },
+                            expires_at_ms: None,
+                        },
+                    );
+                }
+                state
+                    .sessions_by_client_id
+                    .insert("transient".to_string(), session);
+                state.mark_client_reset("transient");
+            });
+        }
+        let manifest = read_manifest(&dir.join(MANIFEST_FILE_NAME)).unwrap();
+        let projection = replay_v2(&dir.join(manifest.checkpoint), ReplayMode::Strict).unwrap();
+        assert!(!projection.clients.contains_key("transient"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recovered_session_deadline_is_persisted_once() {
+        let dir = temp_dir("persist-recovered-deadline");
+        {
+            let storage = BinaryStorage::open(&dir, CommitPolicy::Strict).unwrap();
             storage.with_state(&mut |state| {
                 state
                     .sessions_by_client_id
-                    .insert("client".to_string(), SessionEntry::disconnected(60, None));
-                state.mark_sessions_changed();
+                    .insert("finite".to_string(), SessionEntry::disconnected(60, None));
+                state.mark_client_reset("finite");
             });
         }
 
-        let storage = BinaryStorage::open(&dir, CommitPolicy::Strict).expect("reopen storage");
-        storage.read_state(&mut |state| {
-            assert!(state.sessions_by_client_id.contains_key("client"));
-        });
+        let first_deadline = {
+            let storage = BinaryStorage::open(&dir, CommitPolicy::Strict).unwrap();
+            let mut deadline = None;
+            storage.read_state(&mut |state| {
+                deadline = state.sessions_by_client_id["finite"].expires_at_ms;
+            });
+            deadline.expect("recovered deadline")
+        };
+        let first_manifest = read_manifest(&dir.join(MANIFEST_FILE_NAME)).unwrap();
+
+        std::thread::sleep(Duration::from_millis(2));
+        let second_deadline = {
+            let storage = BinaryStorage::open(&dir, CommitPolicy::Strict).unwrap();
+            let mut deadline = None;
+            storage.read_state(&mut |state| {
+                deadline = state.sessions_by_client_id["finite"].expires_at_ms;
+            });
+            deadline.expect("stable recovered deadline")
+        };
+        let second_manifest = read_manifest(&dir.join(MANIFEST_FILE_NAME)).unwrap();
+
+        assert_eq!(second_deadline, first_deadline);
+        assert_eq!(second_manifest.active_epoch, first_manifest.active_epoch);
         let _ = fs::remove_dir_all(dir);
     }
 }

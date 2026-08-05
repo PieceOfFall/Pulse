@@ -16,9 +16,12 @@ pub(in crate::broker) fn retained_for_subscription(
     config: &BrokerConfig,
 ) -> Vec<Delivery> {
     let now_ms = now_ms();
-    let retained = state
+    let (retained, removed_topics) = state
         .retained
         .matching_valid_filter(&subscription.match_filter, now_ms);
+    for topic_name in removed_topics {
+        state.mark_retained_changed(topic_name);
+    }
 
     let Some(connection_id) = state.connection_by_client_id.get(&subscription.client_id) else {
         return Vec::new();
@@ -67,7 +70,7 @@ pub(in crate::broker) fn retained_for_subscription(
 
         let expires_at_ms = message.expires_at_ms;
         let packet = publish_packet(message.as_ref());
-        let delivery = delivery_for_client(
+        let outcome = delivery_for_client(
             session,
             target.clone(),
             &packet,
@@ -77,17 +80,16 @@ pub(in crate::broker) fn retained_for_subscription(
             subscription.subscription_identifier,
             config.max_offline_queue_len,
         );
-        if effective_qos(packet.qos, subscription.options.maximum_qos) != QoS::AtMostOnce {
+        if outcome.state_changed {
             qos_state_changed = true;
         }
-        if let Some(delivery) = delivery {
+        if let Some(delivery) = outcome.delivery {
             deliveries.push(delivery);
         }
     }
 
     if qos_state_changed {
-        state.mark_outbound_changed(subscription.client_id.clone());
-        state.mark_offline_changed(subscription.client_id.clone());
+        state.mark_client_changed_if_durable(subscription.client_id.clone());
     }
     deliveries
 }

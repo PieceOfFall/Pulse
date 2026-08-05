@@ -40,6 +40,7 @@ pub struct MqttHandler {
     keep_alive: Option<KeepAliveState>,
     retransmit: Option<JoinHandle<()>>,
     topic_aliases: TopicAliases,
+    session_expiry_interval: u32,
 }
 
 struct KeepAliveState {
@@ -63,6 +64,7 @@ impl MqttHandler {
             keep_alive: None,
             retransmit: None,
             topic_aliases: TopicAliases::new(topic_alias_maximum),
+            session_expiry_interval: 0,
         }
     }
 
@@ -230,13 +232,16 @@ impl Handler<MqttPacket> for MqttHandler {
 
                 let assigned_client_id = packet.client_id.is_empty();
                 let connection_id = self.broker_connection_id(ctx.id());
+                let options =
+                    ConnectOptions::from_properties(packet.clean_start, &packet.properties);
+                self.session_expiry_interval = options.session_expiry_interval;
                 let outcome = self.broker.connect(
                     connection_id,
                     packet.client_id,
                     ctx.channel(),
                     packet.will,
                     authentication.principal,
-                    ConnectOptions::from_properties(packet.clean_start, &packet.properties),
+                    options,
                 );
                 if let Some(replaced_channel) = outcome.replaced_channel {
                     metrics::connection_closed("session_replaced");
@@ -279,11 +284,29 @@ impl Handler<MqttPacket> for MqttHandler {
                 self.disconnect(ctx, reason).await
             }
             MqttPacket::PingReq => ctx.write_and_flush(MqttPacket::PingResp.into()).await,
-            MqttPacket::Disconnect(_) => {
+            MqttPacket::Disconnect(packet) => {
+                let session_expiry_interval =
+                    match disconnect_session_expiry_interval(&packet.properties) {
+                        Ok(session_expiry_interval) => session_expiry_interval,
+                        Err(reason_code) => {
+                            return self.disconnect_without_will(ctx, reason_code).await;
+                        }
+                    };
+                if self.session_expiry_interval == 0
+                    && session_expiry_interval.is_some_and(|interval| interval != 0)
+                {
+                    return self
+                        .disconnect_without_will(ctx, protocol::PROTOCOL_ERROR)
+                        .await;
+                }
                 self.stop_keep_alive();
                 self.stop_retransmit();
                 let connection_id = self.broker_connection_id(ctx.id());
-                if self.broker.remove_connection(connection_id).is_some() {
+                if self
+                    .broker
+                    .remove_connection_with_session_expiry(connection_id, session_expiry_interval)
+                    .is_some()
+                {
                     metrics::connection_closed("client_disconnect");
                 }
                 self.connection_ids.remove(ctx.id());
@@ -541,6 +564,20 @@ fn validate_connect(packet: &rs_netty::codec::ConnectPacket) -> Option<u8> {
     }
 
     None
+}
+
+fn disconnect_session_expiry_interval(
+    properties: &[MqttProperty],
+) -> std::result::Result<Option<u32>, u8> {
+    let mut session_expiry_interval = None;
+    for property in properties {
+        if let MqttProperty::SessionExpiryInterval(value) = property
+            && session_expiry_interval.replace(*value).is_some()
+        {
+            return Err(protocol::PROTOCOL_ERROR);
+        }
+    }
+    Ok(session_expiry_interval)
 }
 
 fn suback_write(packet: SubAckPacket) -> BrokerWrite {

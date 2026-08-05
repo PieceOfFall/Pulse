@@ -57,7 +57,7 @@ pub(in crate::broker) fn deliveries_for_publish(
                         maximum_packet_size: client.maximum_packet_size,
                     };
                     let session = state.sessions_by_client_id.get_mut(&sub.client_id)?;
-                    let delivery = delivery_for_client(
+                    let outcome = delivery_for_client(
                         session,
                         target,
                         packet,
@@ -67,15 +67,15 @@ pub(in crate::broker) fn deliveries_for_publish(
                         sub.subscription_identifier,
                         config.max_offline_queue_len,
                     );
-                    if effective_qos(packet.qos, sub.options.maximum_qos) != QoS::AtMostOnce {
-                        state.mark_outbound_changed(sub.client_id.clone());
-                        state.mark_offline_changed(sub.client_id.clone());
+                    if outcome.state_changed {
+                        state.mark_client_changed_if_durable(sub.client_id.clone());
                     }
-                    delivery
+                    outcome.delivery
                 }
                 None => {
-                    queue_offline_publish(state, &sub, packet, config.max_offline_queue_len);
-                    state.mark_offline_changed(sub.client_id.clone());
+                    if queue_offline_publish(state, &sub, packet, config.max_offline_queue_len) {
+                        state.mark_client_changed_if_durable(sub.client_id.clone());
+                    }
                     None
                 }
             },

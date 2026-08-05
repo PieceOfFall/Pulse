@@ -123,21 +123,17 @@ impl Broker {
         connection_id: u64,
         packet_id: u16,
     ) -> Option<Vec<Delivery>> {
-        let outcome = self.with_transient_state(|state| {
+        self.with_state(|state| {
             let client_id = state
                 .clients_by_connection
                 .get(&connection_id)
                 .map(|client| client.client_id.clone())?;
             let session = state.sessions_by_client_id.get_mut(&client_id)?;
-            let removed = session.outbound_qos1.remove(&packet_id).is_some();
-            removed.then_some((client_id, !session.offline_queue.is_empty()))
-        })?;
-
-        if outcome.1 {
-            Some(self.with_state(|state| queued_deliveries_for_client(state, &outcome.0)))
-        } else {
-            Some(Vec::new())
-        }
+            session.outbound_qos1.remove(&packet_id)?;
+            let deliveries = queued_deliveries_for_client(state, &client_id);
+            state.mark_client_changed_if_durable(client_id);
+            Some(deliveries)
+        })
     }
 
     pub(in crate::broker) fn receive_outbound_qos2(
@@ -145,7 +141,7 @@ impl Broker {
         connection_id: u64,
         packet_id: u16,
     ) -> Option<Vec<Delivery>> {
-        let outcome = self.with_transient_state(|state| {
+        self.with_state(|state| {
             let client_id = state
                 .clients_by_connection
                 .get(&connection_id)
@@ -154,17 +150,13 @@ impl Broker {
 
             if session.outbound_qos2_publish.remove(&packet_id).is_some() {
                 session.outbound_qos2_pubrel.insert(packet_id);
-                Some((client_id, !session.offline_queue.is_empty()))
+                let deliveries = queued_deliveries_for_client(state, &client_id);
+                state.mark_client_changed_if_durable(client_id);
+                Some(deliveries)
             } else {
                 None
             }
-        })?;
-
-        if outcome.1 {
-            Some(self.with_state(|state| queued_deliveries_for_client(state, &outcome.0)))
-        } else {
-            Some(Vec::new())
-        }
+        })
     }
 
     pub(in crate::broker) fn packet_exceeds_server_maximum(&self, packet: &MqttPacket) -> bool {
@@ -177,7 +169,7 @@ impl Broker {
         connection_id: u64,
         packet_id: u16,
     ) -> bool {
-        self.with_transient_state(|state| {
+        self.with_state(|state| {
             let Some(client_id) = state
                 .clients_by_connection
                 .get(&connection_id)
@@ -185,10 +177,14 @@ impl Broker {
             else {
                 return false;
             };
-            state
+            let removed = state
                 .sessions_by_client_id
                 .get_mut(&client_id)
-                .is_some_and(|session| session.outbound_qos2_pubrel.remove(&packet_id))
+                .is_some_and(|session| session.outbound_qos2_pubrel.remove(&packet_id));
+            if removed {
+                state.mark_client_changed_if_durable(client_id);
+            }
+            removed
         })
     }
 

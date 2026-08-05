@@ -45,6 +45,9 @@ pub(super) fn decode_retained(packet: &[u8]) -> Option<RetainedMessage> {
     let mut codec = MqttCodec::new();
     let mut buffer = BytesMut::from(packet);
     let packet = codec.decode(&mut buffer).ok().flatten()?;
+    if !buffer.is_empty() {
+        return None;
+    }
     let MqttPacket::Publish(packet) = packet else {
         return None;
     };
@@ -62,6 +65,9 @@ pub(super) fn decode_publish(packet: &[u8]) -> Option<PublishPacket> {
     let mut codec = MqttCodec::new();
     let mut buffer = BytesMut::from(packet);
     let packet = codec.decode(&mut buffer).ok().flatten()?;
+    if !buffer.is_empty() {
+        return None;
+    }
     let MqttPacket::Publish(packet) = packet else {
         return None;
     };

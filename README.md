@@ -132,6 +132,12 @@ slow_consumer_policy = "throttle" # throttle, disconnect, or queue-offline
 The matching CLI flags are `--worker-threads`, `--storage-engine`, `--wal-dir`,
 `--storage-commit-policy`, and `--slow-consumer-policy`.
 
+Pulse writes new WAL directories in the PBIN2 format. Existing PBIN1 WALs are
+upgraded atomically the first time they are opened and the migration is
+one-way: after the version 2 manifest is installed, Pulse will not fall back to
+legacy files. Back up the WAL directory before upgrading if you may need to
+run an older Pulse binary again.
+
 TLS can also be enabled without editing the TOML file:
 
 ```sh

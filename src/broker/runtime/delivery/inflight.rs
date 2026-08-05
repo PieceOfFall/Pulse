@@ -19,10 +19,9 @@ pub(in crate::broker) fn redeliveries_for_client(
     state: &mut BrokerState,
     client_id: &str,
 ) -> Vec<Delivery> {
-    let Some(connection_id) = state.connection_by_client_id.get(client_id) else {
+    let Some(connection_id) = state.connection_by_client_id.get(client_id).copied() else {
         return Vec::new();
     };
-    let connection_id = *connection_id;
     let Some(client) = state.clients_by_connection.get(&connection_id) else {
         return Vec::new();
     };
@@ -34,6 +33,8 @@ pub(in crate::broker) fn redeliveries_for_client(
     };
 
     let now_ms = now_ms();
+    let qos1_count = session.outbound_qos1.len();
+    let qos2_count = session.outbound_qos2_publish.len();
     session
         .outbound_qos1
         .retain(|_, pending| !is_message_expired(pending.expires_at_ms, now_ms));
@@ -58,13 +59,33 @@ pub(in crate::broker) fn redeliveries_for_client(
         })
         .collect();
 
-    redeliveries.extend(flush_queued_for_session(
+    redeliveries.extend(
+        session
+            .outbound_qos2_pubrel
+            .iter()
+            .map(|packet_id| Delivery {
+                connection_id,
+                channel: channel.clone(),
+                packet: MqttPacket::PubRel(AckPacket::new(*packet_id, crate::protocol::SUCCESS))
+                    .into(),
+            }),
+    );
+
+    let (queued, queue_changed) = flush_queued_for_session(
         session,
         connection_id,
         channel,
         receive_maximum,
         maximum_packet_size,
-    ));
+    );
+    redeliveries.extend(queued);
+
+    let state_changed = qos1_count != session.outbound_qos1.len()
+        || qos2_count != session.outbound_qos2_publish.len()
+        || queue_changed;
+    if state_changed {
+        state.mark_client_changed_if_durable(client_id.to_string());
+    }
 
     redeliveries
 }
@@ -73,10 +94,9 @@ pub(in crate::broker) fn queued_deliveries_for_client(
     state: &mut BrokerState,
     client_id: &str,
 ) -> Vec<Delivery> {
-    let Some(connection_id) = state.connection_by_client_id.get(client_id) else {
+    let Some(connection_id) = state.connection_by_client_id.get(client_id).copied() else {
         return Vec::new();
     };
-    let connection_id = *connection_id;
     let Some(client) = state.clients_by_connection.get(&connection_id) else {
         return Vec::new();
     };
@@ -87,13 +107,17 @@ pub(in crate::broker) fn queued_deliveries_for_client(
         return Vec::new();
     };
 
-    flush_queued_for_session(
+    let (deliveries, state_changed) = flush_queued_for_session(
         session,
         connection_id,
         channel,
         receive_maximum,
         maximum_packet_size,
-    )
+    );
+    if state_changed {
+        state.mark_client_changed_if_durable(client_id.to_string());
+    }
+    deliveries
 }
 
 pub(in crate::broker) fn retransmissions_for_connection(
@@ -108,6 +132,8 @@ pub(in crate::broker) fn retransmissions_for_connection(
     let session = state.sessions_by_client_id.get_mut(&client_id)?;
 
     let now_ms = now_ms();
+    let qos1_count = session.outbound_qos1.len();
+    let qos2_count = session.outbound_qos2_publish.len();
     session
         .outbound_qos1
         .retain(|_, pending| !is_message_expired(pending.expires_at_ms, now_ms));
@@ -144,7 +170,18 @@ pub(in crate::broker) fn retransmissions_for_connection(
             }),
     );
 
+    let state_changed = qos1_count != session.outbound_qos1.len()
+        || qos2_count != session.outbound_qos2_publish.len();
+    if state_changed {
+        state.mark_client_changed_if_durable(client_id);
+    }
+
     Some(deliveries)
+}
+
+pub(super) struct DeliveryForClientOutcome {
+    pub(super) delivery: Option<Delivery>,
+    pub(super) state_changed: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -157,15 +194,18 @@ pub(super) fn delivery_for_client(
     expires_at_ms: Option<u64>,
     subscription_identifier: Option<u32>,
     max_offline_queue_len: usize,
-) -> Option<Delivery> {
+) -> DeliveryForClientOutcome {
     let now_ms = now_ms();
     if is_message_expired(expires_at_ms, now_ms) {
-        return None;
+        return DeliveryForClientOutcome {
+            delivery: None,
+            state_changed: false,
+        };
     }
 
     let qos = effective_qos(packet.qos, maximum_qos);
     if qos != QoS::AtMostOnce && inflight_count(session) >= usize::from(target.receive_maximum) {
-        queue_pending_publish(
+        let state_changed = queue_pending_publish(
             session,
             packet,
             qos,
@@ -174,7 +214,10 @@ pub(super) fn delivery_for_client(
             subscription_identifier,
             max_offline_queue_len,
         );
-        return None;
+        return DeliveryForClientOutcome {
+            delivery: None,
+            state_changed,
+        };
     }
 
     if qos == QoS::AtMostOnce
@@ -183,7 +226,10 @@ pub(super) fn delivery_for_client(
             target.maximum_packet_size,
         )
     {
-        return None;
+        return DeliveryForClientOutcome {
+            delivery: None,
+            state_changed: false,
+        };
     }
 
     let packet_id = match qos {
@@ -199,7 +245,10 @@ pub(super) fn delivery_for_client(
                 subscription_identifier,
             );
             if !fits_maximum_packet_size(&publish, target.maximum_packet_size) {
-                return None;
+                return DeliveryForClientOutcome {
+                    delivery: None,
+                    state_changed: true,
+                };
             }
             session.outbound_qos1.insert(
                 packet_id,
@@ -221,7 +270,10 @@ pub(super) fn delivery_for_client(
                 subscription_identifier,
             );
             if !fits_maximum_packet_size(&publish, target.maximum_packet_size) {
-                return None;
+                return DeliveryForClientOutcome {
+                    delivery: None,
+                    state_changed: true,
+                };
             }
             session.outbound_qos2_publish.insert(
                 packet_id,
@@ -234,19 +286,22 @@ pub(super) fn delivery_for_client(
         }
     };
 
-    Some(Delivery {
-        connection_id: target.connection_id,
-        channel: target.channel,
-        packet: MqttPacket::Publish(pending_publish(
-            packet,
-            qos,
-            retain,
-            packet_id,
-            false,
-            subscription_identifier,
-        ))
-        .into(),
-    })
+    DeliveryForClientOutcome {
+        delivery: Some(Delivery {
+            connection_id: target.connection_id,
+            channel: target.channel,
+            packet: MqttPacket::Publish(pending_publish(
+                packet,
+                qos,
+                retain,
+                packet_id,
+                false,
+                subscription_identifier,
+            ))
+            .into(),
+        }),
+        state_changed: qos != QoS::AtMostOnce,
+    }
 }
 
 fn flush_queued_for_session(
@@ -255,13 +310,16 @@ fn flush_queued_for_session(
     channel: Channel<BrokerWrite>,
     receive_maximum: u16,
     maximum_packet_size: u32,
-) -> Vec<Delivery> {
+) -> (Vec<Delivery>, bool) {
     let mut deliveries = Vec::new();
+    let mut state_changed = false;
     let now_ms = now_ms();
     while inflight_count(session) < usize::from(receive_maximum) {
-        let Some(pending) = session.offline_queue.pop_front() else {
+        let Some(queued) = session.offline_queue.pop_front() else {
             break;
         };
+        state_changed = true;
+        let pending = queued.pending;
         if is_message_expired(pending.expires_at_ms, now_ms) {
             continue;
         }
@@ -315,7 +373,7 @@ fn flush_queued_for_session(
         });
     }
 
-    deliveries
+    (deliveries, state_changed)
 }
 
 fn next_packet_id(session: &mut SessionEntry) -> u16 {

@@ -32,7 +32,6 @@ impl Broker {
             };
             let client_id = client.client_id.clone();
             let principal = client.principal.clone();
-            let persistent_session = client.persistent_session;
             let mut subscription_count = client.subscription_count;
 
             let mut reason_codes = Vec::with_capacity(packet.subscriptions.len());
@@ -77,9 +76,7 @@ impl Broker {
                     existing_index,
                 );
                 let stored = state.subscriptions[upsert.index].clone();
-                if persistent_session {
-                    state.mark_subscriptions_changed();
-                }
+                state.mark_client_changed_if_durable(client_id.clone());
                 reason_codes.push(protocol::granted_qos_code(stored.options.maximum_qos));
                 if upsert.inserted {
                     inserted_count += 1;
@@ -125,10 +122,10 @@ impl Broker {
         packet: UnsubscribePacket,
     ) -> UnsubAckPacket {
         self.with_state(|state| {
-            if let Some((client_id, persistent_session)) = state
+            if let Some(client_id) = state
                 .clients_by_connection
                 .get(&connection_id)
-                .map(|client| (client.client_id.clone(), client.persistent_session))
+                .map(|client| client.client_id.clone())
             {
                 let subscription_count = state.subscriptions.len();
                 for filter in &packet.topic_filters {
@@ -142,9 +139,7 @@ impl Broker {
                         client.subscription_count =
                             client.subscription_count.saturating_sub(removed_count);
                     }
-                    if persistent_session {
-                        state.mark_subscriptions_changed();
-                    }
+                    state.mark_client_changed_if_durable(client_id);
                 }
             }
 

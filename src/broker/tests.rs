@@ -1,4 +1,8 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use bytes::{Buf, Bytes, BytesMut};
 use rs_netty::{
@@ -17,7 +21,8 @@ use tokio::{
 };
 
 use super::{
-    Broker, BrokerLife, ConnectionIdAllocator, MqttHandler, WebSocketMqttHandler,
+    Broker, BrokerLife, CommitPolicy, ConnectionIdAllocator, MqttHandler, WalCompactConfig,
+    WebSocketMqttHandler,
     runtime::{
         auth::{AuthAclConfig, AuthAction, AuthConfig, AuthUserConfig, ConfiguredAuthenticator},
         config::{
@@ -1859,6 +1864,809 @@ async fn sqlite_broker_recovers_outbound_inflight_after_restart() -> rs_netty::R
 }
 
 #[tokio::test]
+async fn sqlite_disconnect_expiry_zero_deletes_persistent_session() -> rs_netty::Result<()> {
+    let path = temp_sqlite_path("disconnect-expiry-zero");
+    cleanup_sqlite_path(&path);
+
+    let broker =
+        TestBroker::start_with_broker(Broker::with_sqlite(&path).expect("sqlite broker")).await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry(
+            "sqlite-expiry-zero-subscriber",
+            true,
+            60,
+        ))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+    subscriber
+        .subscribe(1, "devices/sqlite-expiry-zero", QoS::AtLeastOnce)
+        .await?;
+
+    let mut publisher = broker.connect("sqlite-expiry-zero-publisher").await?;
+    publisher
+        .write(publish(
+            "devices/sqlite-expiry-zero",
+            QoS::AtLeastOnce,
+            Some(1),
+            "must-be-deleted",
+        ))
+        .await?;
+    publisher.expect_puback(1).await?;
+    let pending = subscriber
+        .expect_publish("expected outbound publish before deleting the session")
+        .await?;
+    assert_eq!(pending.payload, Bytes::from_static(b"must-be-deleted"));
+
+    subscriber.write(disconnect_with_session_expiry(0)).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+    drop(publisher);
+    broker.shutdown().await?;
+
+    let broker =
+        TestBroker::start_with_broker(Broker::with_sqlite(&path).expect("sqlite broker")).await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry(
+            "sqlite-expiry-zero-subscriber",
+            false,
+            60,
+        ))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+    subscriber
+        .expect_no_packet(Duration::from_millis(150))
+        .await?;
+
+    let mut publisher = broker
+        .connect("sqlite-expiry-zero-publisher-after-restart")
+        .await?;
+    publisher
+        .write(publish(
+            "devices/sqlite-expiry-zero",
+            QoS::AtLeastOnce,
+            Some(2),
+            "must-not-match-deleted-subscription",
+        ))
+        .await?;
+    publisher.expect_puback(2).await?;
+    subscriber
+        .expect_no_packet(Duration::from_millis(150))
+        .await?;
+    subscriber.write(disconnect_with_session_expiry(0)).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+
+    drop(publisher);
+    broker.shutdown().await?;
+    cleanup_sqlite_path(&path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_expiry_zero_reconnect_stays_out_of_persistent_projection() -> rs_netty::Result<()> {
+    let path = temp_sqlite_path("expiry-zero-reconnect");
+    cleanup_sqlite_path(&path);
+    let client_id = "sqlite-expiry-zero-reconnect";
+    let topic = "devices/sqlite-expiry-zero-reconnect";
+
+    let broker =
+        TestBroker::start_with_broker(Broker::with_sqlite(&path).expect("sqlite broker")).await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry(client_id, true, 60))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+    subscriber.subscribe(1, topic, QoS::AtLeastOnce).await?;
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry(client_id, false, 0))
+        .await?;
+    subscriber.expect_connack_session_present(true).await?;
+
+    let mut publisher = broker
+        .connect("sqlite-expiry-zero-reconnect-publisher")
+        .await?;
+    publisher
+        .write(publish(topic, QoS::AtLeastOnce, Some(1), "transient"))
+        .await?;
+    publisher.expect_puback(1).await?;
+    let transient = subscriber
+        .expect_publish("expected resumed in-memory subscription")
+        .await?;
+    assert_eq!(transient.payload, Bytes::from_static(b"transient"));
+
+    {
+        let connection = rusqlite::Connection::open(&path).expect("inspect sqlite projection");
+        for table in [
+            "sessions",
+            "subscriptions",
+            "offline_queue",
+            "outbound_inflight",
+            "outbound_pubrel",
+        ] {
+            let count: i64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE client_id = ?1"),
+                    [client_id],
+                    |row| row.get(0),
+                )
+                .expect("count transient projection rows");
+            assert_eq!(count, 0, "{table} persisted an expiry-zero client");
+        }
+    }
+
+    subscriber
+        .write(MqttPacket::PubAck(AckPacket::new(
+            transient.packet_id.expect("transient packet id"),
+            protocol::SUCCESS,
+        )))
+        .await?;
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+    drop(publisher);
+    broker.shutdown().await?;
+
+    let broker =
+        TestBroker::start_with_broker(Broker::with_sqlite(&path).expect("sqlite broker")).await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry(client_id, false, 60))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+
+    broker.shutdown().await?;
+    cleanup_sqlite_path(&path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn disconnect_cannot_increase_zero_session_expiry() -> rs_netty::Result<()> {
+    let broker = TestBroker::start().await?;
+    let mut client = broker.open_client().await?;
+    client
+        .write(connect_with_session_expiry(
+            "disconnect-expiry-protocol-error",
+            true,
+            0,
+        ))
+        .await?;
+    client.expect_connack_session_present(false).await?;
+
+    client.write(disconnect_with_session_expiry(60)).await?;
+    client
+        .expect_disconnect_reason(protocol::PROTOCOL_ERROR)
+        .await?;
+    client.expect_closed(Duration::from_millis(200)).await?;
+
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn sqlite_qos1_ack_and_queue_handoff_survive_restart() -> rs_netty::Result<()> {
+    let path = temp_sqlite_path("qos1-ack-handoff-contract");
+    cleanup_sqlite_path(&path);
+
+    qos1_ack_queue_handoff_restart_contract(
+        || Broker::with_sqlite(&path).expect("sqlite broker"),
+        "sqlite-qos1-contract-subscriber",
+        "sqlite-qos1-contract-publisher",
+        "devices/sqlite-qos1-contract",
+    )
+    .await?;
+
+    cleanup_sqlite_path(&path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_qos2_pubrec_and_pubcomp_survive_restart() -> rs_netty::Result<()> {
+    let path = temp_sqlite_path("qos2-transition-contract");
+    cleanup_sqlite_path(&path);
+
+    qos2_restart_contract(
+        || {
+            Broker::with_sqlite_and_config(&path, persistence_contract_config())
+                .expect("sqlite broker")
+        },
+        "sqlite-qos2-contract-subscriber",
+        "sqlite-qos2-contract-publisher",
+        "devices/sqlite-qos2-contract",
+    )
+    .await?;
+
+    cleanup_sqlite_path(&path);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires PULSE_TEST_MYSQL_URL"]
+async fn mysql_qos1_ack_and_queue_handoff_survive_restart() -> rs_netty::Result<()> {
+    let Ok(url) = std::env::var("PULSE_TEST_MYSQL_URL") else {
+        eprintln!("PULSE_TEST_MYSQL_URL is not set; skipping MySQL protocol contract");
+        return Ok(());
+    };
+    let suffix = unique_test_suffix();
+    let subscriber_id = format!("mysql-qos1-contract-subscriber-{suffix}");
+    let publisher_id = format!("mysql-qos1-contract-publisher-{suffix}");
+    let topic = format!("devices/mysql-qos1-contract/{suffix}");
+
+    qos1_ack_queue_handoff_restart_contract(
+        || {
+            Broker::with_mysql_and_config(&url, BrokerConfig::default())
+                .expect("MySQL protocol contract broker")
+        },
+        &subscriber_id,
+        &publisher_id,
+        &topic,
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires PULSE_TEST_MYSQL_URL"]
+async fn mysql_qos2_pubrec_and_pubcomp_survive_restart() -> rs_netty::Result<()> {
+    let Ok(url) = std::env::var("PULSE_TEST_MYSQL_URL") else {
+        eprintln!("PULSE_TEST_MYSQL_URL is not set; skipping MySQL protocol contract");
+        return Ok(());
+    };
+    let suffix = unique_test_suffix();
+    let subscriber_id = format!("mysql-qos2-contract-subscriber-{suffix}");
+    let publisher_id = format!("mysql-qos2-contract-publisher-{suffix}");
+    let topic = format!("devices/mysql-qos2-contract/{suffix}");
+
+    qos2_restart_contract(
+        || {
+            Broker::with_mysql_and_config(&url, persistence_contract_config())
+                .expect("MySQL protocol contract broker")
+        },
+        &subscriber_id,
+        &publisher_id,
+        &topic,
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires PULSE_TEST_MYSQL_URL"]
+async fn mysql_lifecycle_projection_contract() -> rs_netty::Result<()> {
+    use mysql::{params, prelude::Queryable};
+
+    let Ok(url) = std::env::var("PULSE_TEST_MYSQL_URL") else {
+        eprintln!("PULSE_TEST_MYSQL_URL is not set; skipping MySQL lifecycle contract");
+        return Ok(());
+    };
+    let suffix = unique_test_suffix();
+    let clean_client_id = format!("mysql-clean-start-{suffix}");
+    let expiring_client_id = format!("mysql-session-expiry-{suffix}");
+    let downgraded_client_id = format!("mysql-expiry-zero-downgrade-{suffix}");
+    let transient_client_id = format!("mysql-transient-{suffix}");
+    let publisher_id = format!("mysql-lifecycle-publisher-{suffix}");
+    let clean_topic = format!("devices/mysql-clean-start/{suffix}");
+    let expiring_topic = format!("devices/mysql-session-expiry/{suffix}");
+    let downgraded_topic = format!("devices/mysql-expiry-zero/{suffix}");
+    let transient_topic = format!("devices/mysql-transient/{suffix}");
+    let retained_topic = format!("devices/mysql-retained-expiry/{suffix}");
+
+    let broker = TestBroker::start_with_broker(
+        Broker::with_mysql_and_config(&url, persistence_contract_config())
+            .expect("MySQL lifecycle contract broker"),
+    )
+    .await?;
+
+    let mut clean_client = broker.open_client().await?;
+    clean_client
+        .write(connect_with_session_expiry(&clean_client_id, true, 60))
+        .await?;
+    clean_client.expect_connack_session_present(false).await?;
+    clean_client
+        .subscribe(1, &clean_topic, QoS::AtLeastOnce)
+        .await?;
+    clean_client.write(disconnect_success()).await?;
+    clean_client
+        .expect_closed(Duration::from_millis(200))
+        .await?;
+
+    let mut expiring_client = broker.open_client().await?;
+    expiring_client
+        .write(connect_with_session_expiry(&expiring_client_id, true, 1))
+        .await?;
+    expiring_client
+        .expect_connack_session_present(false)
+        .await?;
+    expiring_client
+        .subscribe(1, &expiring_topic, QoS::AtLeastOnce)
+        .await?;
+    expiring_client.write(disconnect_success()).await?;
+    expiring_client
+        .expect_closed(Duration::from_millis(200))
+        .await?;
+
+    let mut downgraded_client = broker.open_client().await?;
+    downgraded_client
+        .write(connect_with_session_expiry(&downgraded_client_id, true, 60))
+        .await?;
+    downgraded_client
+        .expect_connack_session_present(false)
+        .await?;
+    downgraded_client
+        .subscribe(1, &downgraded_topic, QoS::AtLeastOnce)
+        .await?;
+    downgraded_client.write(disconnect_success()).await?;
+    downgraded_client
+        .expect_closed(Duration::from_millis(200))
+        .await?;
+
+    let mut downgraded_client = broker.open_client().await?;
+    downgraded_client
+        .write(connect_with_session_expiry(&downgraded_client_id, false, 0))
+        .await?;
+    downgraded_client
+        .expect_connack_session_present(true)
+        .await?;
+
+    let mut transient_client = broker.open_client().await?;
+    transient_client
+        .write(connect_with_session_expiry(&transient_client_id, true, 0))
+        .await?;
+    transient_client
+        .expect_connack_session_present(false)
+        .await?;
+    transient_client
+        .subscribe(1, &transient_topic, QoS::AtLeastOnce)
+        .await?;
+
+    let mut publisher = broker.open_client().await?;
+    publisher
+        .write(connect_with_session_expiry(&publisher_id, true, 0))
+        .await?;
+    publisher.expect_connack_session_present(false).await?;
+    publisher
+        .write(publish(
+            &downgraded_topic,
+            QoS::AtLeastOnce,
+            Some(1),
+            "downgraded-live",
+        ))
+        .await?;
+    publisher.expect_puback(1).await?;
+    let downgraded_publish = downgraded_client
+        .expect_publish("expected live publish for expiry-zero downgraded session")
+        .await?;
+    assert_eq!(
+        downgraded_publish.payload,
+        Bytes::from_static(b"downgraded-live")
+    );
+
+    publisher
+        .write(publish(
+            &transient_topic,
+            QoS::AtLeastOnce,
+            Some(2),
+            "transient-live",
+        ))
+        .await?;
+    publisher.expect_puback(2).await?;
+    let transient_publish = transient_client
+        .expect_publish("expected live publish for transient session")
+        .await?;
+    assert_eq!(
+        transient_publish.payload,
+        Bytes::from_static(b"transient-live")
+    );
+
+    publisher
+        .write(publish_with_message_expiry(
+            &retained_topic,
+            QoS::AtLeastOnce,
+            Some(3),
+            "expires",
+            true,
+            1,
+        ))
+        .await?;
+    publisher.expect_puback(3).await?;
+
+    {
+        let pool = mysql::Pool::new(url.as_str()).expect("open MySQL inspection pool");
+        let mut connection = pool.get_conn().expect("get MySQL inspection connection");
+        for client_id in [&downgraded_client_id, &transient_client_id, &publisher_id] {
+            for table in [
+                "sessions",
+                "subscriptions",
+                "offline_queue",
+                "outbound_inflight",
+                "outbound_pubrel",
+            ] {
+                let count: Option<u64> = connection
+                    .exec_first(
+                        format!("SELECT COUNT(*) FROM {table} WHERE client_id = :client_id"),
+                        params! { "client_id" => client_id },
+                    )
+                    .expect("inspect transient MySQL projection rows");
+                assert_eq!(
+                    count,
+                    Some(0),
+                    "{table} persisted temporary client {client_id}"
+                );
+            }
+        }
+        let retained_count: Option<u64> = connection
+            .exec_first(
+                "SELECT COUNT(*) FROM retained_messages WHERE topic_name = :topic_name",
+                params! { "topic_name" => &retained_topic },
+            )
+            .expect("inspect retained MySQL row");
+        assert_eq!(retained_count, Some(1));
+    }
+
+    downgraded_client
+        .write(MqttPacket::PubAck(AckPacket::new(
+            downgraded_publish
+                .packet_id
+                .expect("downgraded publish packet id"),
+            protocol::SUCCESS,
+        )))
+        .await?;
+    transient_client
+        .write(MqttPacket::PubAck(AckPacket::new(
+            transient_publish
+                .packet_id
+                .expect("transient publish packet id"),
+            protocol::SUCCESS,
+        )))
+        .await?;
+    downgraded_client.write(disconnect_success()).await?;
+    downgraded_client
+        .expect_closed(Duration::from_millis(200))
+        .await?;
+    transient_client.write(disconnect_success()).await?;
+    transient_client
+        .expect_closed(Duration::from_millis(200))
+        .await?;
+    publisher.write(disconnect_success()).await?;
+    publisher.expect_closed(Duration::from_millis(200)).await?;
+    broker.shutdown().await?;
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let broker = TestBroker::start_with_broker(
+        Broker::with_mysql_and_config(&url, persistence_contract_config())
+            .expect("reopen MySQL lifecycle contract broker"),
+    )
+    .await?;
+
+    let mut clean_client = broker.open_client().await?;
+    clean_client
+        .write(connect_with_session_expiry(&clean_client_id, true, 60))
+        .await?;
+    clean_client.expect_connack_session_present(false).await?;
+
+    let mut expiring_client = broker.open_client().await?;
+    expiring_client
+        .write(connect_with_session_expiry(&expiring_client_id, false, 60))
+        .await?;
+    expiring_client
+        .expect_connack_session_present(false)
+        .await?;
+
+    let mut downgraded_client = broker.open_client().await?;
+    downgraded_client
+        .write(connect_with_session_expiry(
+            &downgraded_client_id,
+            false,
+            60,
+        ))
+        .await?;
+    downgraded_client
+        .expect_connack_session_present(false)
+        .await?;
+
+    let mut transient_client = broker.open_client().await?;
+    transient_client
+        .write(connect_with_session_expiry(&transient_client_id, false, 60))
+        .await?;
+    transient_client
+        .expect_connack_session_present(false)
+        .await?;
+
+    let mut publisher = broker
+        .connect(&format!("mysql-lifecycle-restart-publisher-{suffix}"))
+        .await?;
+    for (packet_id, topic) in [
+        (1, clean_topic.as_str()),
+        (2, expiring_topic.as_str()),
+        (3, downgraded_topic.as_str()),
+        (4, transient_topic.as_str()),
+    ] {
+        publisher
+            .write(publish(
+                topic,
+                QoS::AtLeastOnce,
+                Some(packet_id),
+                "must-not-deliver",
+            ))
+            .await?;
+        publisher.expect_puback(packet_id).await?;
+    }
+    clean_client
+        .expect_no_packet(Duration::from_millis(150))
+        .await?;
+    expiring_client
+        .expect_no_packet(Duration::from_millis(150))
+        .await?;
+    downgraded_client
+        .expect_no_packet(Duration::from_millis(150))
+        .await?;
+    transient_client
+        .expect_no_packet(Duration::from_millis(150))
+        .await?;
+
+    let mut retained_subscriber = broker
+        .connect(&format!("mysql-retained-subscriber-{suffix}"))
+        .await?;
+    retained_subscriber
+        .subscribe(1, &retained_topic, QoS::AtMostOnce)
+        .await?;
+    retained_subscriber
+        .expect_no_packet(Duration::from_millis(150))
+        .await?;
+    {
+        let pool = mysql::Pool::new(url.as_str()).expect("open MySQL inspection pool");
+        let mut connection = pool.get_conn().expect("get MySQL inspection connection");
+        let retained_count: Option<u64> = connection
+            .exec_first(
+                "SELECT COUNT(*) FROM retained_messages WHERE topic_name = :topic_name",
+                params! { "topic_name" => &retained_topic },
+            )
+            .expect("inspect expired retained MySQL row");
+        assert_eq!(retained_count, Some(0));
+    }
+
+    for client in [
+        &mut clean_client,
+        &mut expiring_client,
+        &mut downgraded_client,
+        &mut transient_client,
+    ] {
+        client.write(disconnect_with_session_expiry(0)).await?;
+        client.expect_closed(Duration::from_millis(200)).await?;
+    }
+    publisher.write(disconnect_success()).await?;
+    publisher.expect_closed(Duration::from_millis(200)).await?;
+    retained_subscriber.write(disconnect_success()).await?;
+    retained_subscriber
+        .expect_closed(Duration::from_millis(200))
+        .await?;
+    broker.shutdown().await
+}
+
+#[tokio::test]
+async fn binary_qos1_ack_and_queue_handoff_survive_restart() -> rs_netty::Result<()> {
+    let dir = temp_wal_dir("qos1-ack-handoff");
+    cleanup_wal_dir(&dir);
+
+    let broker = TestBroker::start_with_broker(binary_test_broker(&dir)).await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_properties(
+            "binary-qos1-subscriber",
+            true,
+            vec![
+                MqttProperty::SessionExpiryInterval(60),
+                MqttProperty::ReceiveMaximum(1),
+            ],
+        ))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+    subscriber
+        .subscribe(1, "devices/binary-qos1", QoS::AtLeastOnce)
+        .await?;
+
+    let mut publisher = broker.connect("binary-qos1-publisher").await?;
+    publisher
+        .write(publish(
+            "devices/binary-qos1",
+            QoS::AtLeastOnce,
+            Some(1),
+            "first",
+        ))
+        .await?;
+    publisher.expect_puback(1).await?;
+    publisher
+        .write(publish(
+            "devices/binary-qos1",
+            QoS::AtLeastOnce,
+            Some(2),
+            "second",
+        ))
+        .await?;
+    publisher.expect_puback(2).await?;
+
+    let first = subscriber
+        .expect_publish("expected first binary qos1 delivery")
+        .await?;
+    assert_eq!(first.payload, Bytes::from_static(b"first"));
+    subscriber
+        .expect_no_packet(Duration::from_millis(100))
+        .await?;
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+    drop(publisher);
+    broker.shutdown().await?;
+
+    let broker = TestBroker::start_with_broker(binary_test_broker(&dir)).await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_properties(
+            "binary-qos1-subscriber",
+            false,
+            vec![
+                MqttProperty::SessionExpiryInterval(60),
+                MqttProperty::ReceiveMaximum(1),
+            ],
+        ))
+        .await?;
+    subscriber.expect_connack_session_present(true).await?;
+    let first = subscriber
+        .expect_publish("expected recovered first binary qos1 delivery")
+        .await?;
+    assert!(first.dup);
+    assert_eq!(first.payload, Bytes::from_static(b"first"));
+    subscriber
+        .write(MqttPacket::PubAck(AckPacket::new(
+            first.packet_id.expect("qos1 packet id"),
+            protocol::SUCCESS,
+        )))
+        .await?;
+    let second = subscriber
+        .expect_publish("expected atomic queue handoff to second delivery")
+        .await?;
+    assert!(!second.dup);
+    assert_eq!(second.payload, Bytes::from_static(b"second"));
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+    broker.shutdown().await?;
+
+    let broker = TestBroker::start_with_broker(binary_test_broker(&dir)).await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_properties(
+            "binary-qos1-subscriber",
+            false,
+            vec![
+                MqttProperty::SessionExpiryInterval(60),
+                MqttProperty::ReceiveMaximum(1),
+            ],
+        ))
+        .await?;
+    subscriber.expect_connack_session_present(true).await?;
+    let second = subscriber
+        .expect_publish("expected only recovered second binary qos1 delivery")
+        .await?;
+    assert!(second.dup);
+    assert_eq!(second.payload, Bytes::from_static(b"second"));
+    subscriber
+        .write(MqttPacket::PubAck(AckPacket::new(
+            second.packet_id.expect("qos1 packet id"),
+            protocol::SUCCESS,
+        )))
+        .await?;
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+    broker.shutdown().await?;
+
+    let broker = TestBroker::start_with_broker(binary_test_broker(&dir)).await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry(
+            "binary-qos1-subscriber",
+            false,
+            60,
+        ))
+        .await?;
+    subscriber.expect_connack_session_present(true).await?;
+    subscriber
+        .expect_no_packet(Duration::from_millis(150))
+        .await?;
+    broker.shutdown().await?;
+
+    cleanup_wal_dir(&dir);
+    Ok(())
+}
+
+#[tokio::test]
+async fn binary_qos2_pubrec_and_pubcomp_survive_restart() -> rs_netty::Result<()> {
+    let dir = temp_wal_dir("qos2-transitions");
+    cleanup_wal_dir(&dir);
+
+    let broker = TestBroker::start_with_broker(binary_test_broker(&dir)).await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry(
+            "binary-qos2-subscriber",
+            true,
+            60,
+        ))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+    subscriber
+        .subscribe(1, "devices/binary-qos2", QoS::ExactlyOnce)
+        .await?;
+
+    let mut publisher = broker.connect("binary-qos2-publisher").await?;
+    publisher
+        .write(publish(
+            "devices/binary-qos2",
+            QoS::ExactlyOnce,
+            Some(9),
+            "exactly-once",
+        ))
+        .await?;
+    publisher.expect_pubrec(9).await?;
+    publisher
+        .write(MqttPacket::PubRel(AckPacket::new(9, protocol::SUCCESS)))
+        .await?;
+    publisher.expect_pubcomp(9).await?;
+
+    let publish = subscriber
+        .expect_publish("expected initial binary qos2 delivery")
+        .await?;
+    let packet_id = publish.packet_id.expect("qos2 packet id");
+    subscriber
+        .write(MqttPacket::PubRec(AckPacket::new(
+            packet_id,
+            protocol::SUCCESS,
+        )))
+        .await?;
+    subscriber.expect_pubrel(packet_id).await?;
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+    drop(publisher);
+    broker.shutdown().await?;
+
+    let broker = TestBroker::start_with_broker(binary_test_broker(&dir)).await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry(
+            "binary-qos2-subscriber",
+            false,
+            60,
+        ))
+        .await?;
+    subscriber.expect_connack_session_present(true).await?;
+    subscriber.expect_pubrel(packet_id).await?;
+    subscriber
+        .write(MqttPacket::PubComp(AckPacket::new(
+            packet_id,
+            protocol::SUCCESS,
+        )))
+        .await?;
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+    broker.shutdown().await?;
+
+    let broker = TestBroker::start_with_broker(binary_test_broker(&dir)).await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry(
+            "binary-qos2-subscriber",
+            false,
+            60,
+        ))
+        .await?;
+    subscriber.expect_connack_session_present(true).await?;
+    subscriber
+        .expect_no_packet(Duration::from_millis(150))
+        .await?;
+    broker.shutdown().await?;
+
+    cleanup_wal_dir(&dir);
+    Ok(())
+}
+
+#[tokio::test]
 async fn qos1_publish_is_delivered_with_qos1_and_acknowledged() -> rs_netty::Result<()> {
     let broker = TestBroker::start().await?;
     let mut subscriber = broker.connect("subscriber").await?;
@@ -2313,6 +3121,274 @@ fn cleanup_sqlite_path(path: &std::path::Path) {
     let _ = std::fs::remove_file(path.with_extension("db-shm"));
 }
 
+fn temp_wal_dir(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("pulse-{name}-{}", std::process::id()))
+}
+
+fn cleanup_wal_dir(path: &Path) {
+    if path.exists() {
+        std::fs::remove_dir_all(path).expect("remove temporary binary storage directory");
+    }
+}
+
+fn binary_test_broker(dir: &Path) -> Broker {
+    Broker::with_binary_auth_and_config(
+        dir,
+        CommitPolicy::Strict,
+        WalCompactConfig {
+            max_bytes: u64::MAX,
+            interval_ms: u64::MAX,
+        },
+        BrokerConfig::default(),
+        Arc::new(ConfiguredAuthenticator::default()),
+    )
+    .expect("binary broker")
+}
+
+async fn qos1_ack_queue_handoff_restart_contract(
+    mut broker_factory: impl FnMut() -> Broker,
+    subscriber_id: &str,
+    publisher_id: &str,
+    topic: &str,
+) -> rs_netty::Result<()> {
+    let broker = TestBroker::start_with_broker(broker_factory()).await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_properties(
+            subscriber_id,
+            true,
+            vec![
+                MqttProperty::SessionExpiryInterval(60),
+                MqttProperty::ReceiveMaximum(1),
+            ],
+        ))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+    subscriber.subscribe(1, topic, QoS::AtLeastOnce).await?;
+
+    let mut publisher = broker.connect(publisher_id).await?;
+    publisher
+        .write(publish(topic, QoS::AtLeastOnce, Some(1), "first"))
+        .await?;
+    publisher.expect_puback(1).await?;
+    publisher
+        .write(publish(topic, QoS::AtLeastOnce, Some(2), "second"))
+        .await?;
+    publisher.expect_puback(2).await?;
+
+    let first = subscriber
+        .expect_publish("expected initial qos1 contract delivery")
+        .await?;
+    assert_eq!(first.payload, Bytes::from_static(b"first"));
+    subscriber
+        .expect_no_packet(Duration::from_millis(100))
+        .await?;
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+    drop(publisher);
+    broker.shutdown().await?;
+
+    let broker = TestBroker::start_with_broker(broker_factory()).await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_properties(
+            subscriber_id,
+            false,
+            vec![
+                MqttProperty::SessionExpiryInterval(60),
+                MqttProperty::ReceiveMaximum(1),
+            ],
+        ))
+        .await?;
+    subscriber.expect_connack_session_present(true).await?;
+    let first = subscriber
+        .expect_publish("expected recovered first qos1 contract delivery")
+        .await?;
+    assert!(first.dup);
+    assert_eq!(first.payload, Bytes::from_static(b"first"));
+    subscriber
+        .write(MqttPacket::PubAck(AckPacket::new(
+            first.packet_id.expect("qos1 packet id"),
+            protocol::SUCCESS,
+        )))
+        .await?;
+    let second = subscriber
+        .expect_publish("expected atomic qos1 queue handoff")
+        .await?;
+    assert!(!second.dup);
+    assert_eq!(second.payload, Bytes::from_static(b"second"));
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+    broker.shutdown().await?;
+
+    let broker = TestBroker::start_with_broker(broker_factory()).await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_properties(
+            subscriber_id,
+            false,
+            vec![
+                MqttProperty::SessionExpiryInterval(60),
+                MqttProperty::ReceiveMaximum(1),
+            ],
+        ))
+        .await?;
+    subscriber.expect_connack_session_present(true).await?;
+    let second = subscriber
+        .expect_publish("expected only recovered second qos1 contract delivery")
+        .await?;
+    assert!(second.dup);
+    assert_eq!(second.payload, Bytes::from_static(b"second"));
+    subscriber
+        .write(MqttPacket::PubAck(AckPacket::new(
+            second.packet_id.expect("qos1 packet id"),
+            protocol::SUCCESS,
+        )))
+        .await?;
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+    broker.shutdown().await?;
+
+    let broker = TestBroker::start_with_broker(broker_factory()).await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry(subscriber_id, false, 60))
+        .await?;
+    subscriber.expect_connack_session_present(true).await?;
+    subscriber
+        .expect_no_packet(Duration::from_millis(150))
+        .await?;
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+
+    remove_persistent_contract_session(&broker, subscriber_id).await?;
+    broker.shutdown().await
+}
+
+async fn qos2_restart_contract(
+    mut broker_factory: impl FnMut() -> Broker,
+    subscriber_id: &str,
+    publisher_id: &str,
+    topic: &str,
+) -> rs_netty::Result<()> {
+    let broker = TestBroker::start_with_broker(broker_factory()).await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry(subscriber_id, true, 60))
+        .await?;
+    subscriber.expect_connack_session_present(false).await?;
+    subscriber.subscribe(1, topic, QoS::ExactlyOnce).await?;
+
+    let mut publisher = broker.connect(publisher_id).await?;
+    publisher
+        .write(publish(topic, QoS::ExactlyOnce, Some(9), "exactly-once"))
+        .await?;
+    publisher.expect_pubrec(9).await?;
+    publisher
+        .write(MqttPacket::PubRel(AckPacket::new(9, protocol::SUCCESS)))
+        .await?;
+    publisher.expect_pubcomp(9).await?;
+
+    let publish = subscriber
+        .expect_publish("expected initial qos2 contract delivery")
+        .await?;
+    let packet_id = publish.packet_id.expect("qos2 packet id");
+    subscriber
+        .write(MqttPacket::PubRec(AckPacket::new(
+            packet_id,
+            protocol::SUCCESS,
+        )))
+        .await?;
+    subscriber.expect_pubrel(packet_id).await?;
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+    drop(publisher);
+    broker.shutdown().await?;
+
+    let broker = TestBroker::start_with_broker(broker_factory()).await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry(subscriber_id, false, 60))
+        .await?;
+    subscriber.expect_connack_session_present(true).await?;
+    expect_pubrel_within(
+        &mut subscriber,
+        packet_id,
+        "recovered qos2 PUBREL should arrive",
+    )
+    .await?;
+    subscriber
+        .write(MqttPacket::PubComp(AckPacket::new(
+            packet_id,
+            protocol::SUCCESS,
+        )))
+        .await?;
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+    broker.shutdown().await?;
+
+    let broker = TestBroker::start_with_broker(broker_factory()).await?;
+    let mut subscriber = broker.open_client().await?;
+    subscriber
+        .write(connect_with_session_expiry(subscriber_id, false, 60))
+        .await?;
+    subscriber.expect_connack_session_present(true).await?;
+    subscriber
+        .expect_no_packet(Duration::from_millis(150))
+        .await?;
+    subscriber.write(disconnect_success()).await?;
+    subscriber.expect_closed(Duration::from_millis(200)).await?;
+
+    remove_persistent_contract_session(&broker, subscriber_id).await?;
+    broker.shutdown().await
+}
+
+async fn expect_pubrel_within(
+    client: &mut TestClient,
+    packet_id: u16,
+    timeout_message: &str,
+) -> rs_netty::Result<()> {
+    let packet = tokio::time::timeout(Duration::from_secs(1), client.read())
+        .await
+        .expect(timeout_message)?;
+    assert!(matches!(
+        packet,
+        MqttPacket::PubRel(ack) if ack.packet_id == packet_id
+    ));
+    Ok(())
+}
+
+async fn remove_persistent_contract_session(
+    broker: &TestBroker,
+    client_id: &str,
+) -> rs_netty::Result<()> {
+    let mut cleanup = broker.open_client().await?;
+    cleanup
+        .write(connect_with_session_expiry(client_id, true, 0))
+        .await?;
+    cleanup.expect_connack_session_present(false).await?;
+    cleanup.write(disconnect_success()).await?;
+    cleanup.expect_closed(Duration::from_millis(200)).await
+}
+
+fn unique_test_suffix() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    )
+}
+
+fn persistence_contract_config() -> BrokerConfig {
+    BrokerConfig {
+        inflight_retransmit_interval_ms: 50,
+        ..BrokerConfig::default()
+    }
+}
+
 fn auth_broker(mut acl: Vec<AuthAclConfig>, mut extra_users: Vec<AuthUserConfig>) -> Broker {
     let mut users = vec![AuthUserConfig {
         username: "alice".to_string(),
@@ -2710,6 +3786,13 @@ fn disconnect_success() -> MqttPacket {
     MqttPacket::Disconnect(rs_netty::codec::DisconnectPacket {
         reason_code: protocol::SUCCESS,
         properties: Vec::new(),
+    })
+}
+
+fn disconnect_with_session_expiry(session_expiry_interval: u32) -> MqttPacket {
+    MqttPacket::Disconnect(rs_netty::codec::DisconnectPacket {
+        reason_code: protocol::SUCCESS,
+        properties: vec![MqttProperty::SessionExpiryInterval(session_expiry_interval)],
     })
 }
 

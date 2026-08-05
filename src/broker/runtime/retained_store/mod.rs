@@ -224,8 +224,8 @@ impl RetainedStore {
             .map(|(topic_name, message)| (topic_name, message.as_ref()))
     }
 
-    pub(in crate::broker) fn expire(&mut self, now_ms: u64) -> bool {
-        let mut removed_any = false;
+    pub(in crate::broker) fn expire(&mut self, now_ms: u64) -> Vec<String> {
+        let mut removed_topics = Vec::new();
         while let Some(Reverse(expiry)) = self.expirations.peek() {
             if expiry.expires_at_ms > now_ms {
                 break;
@@ -238,15 +238,15 @@ impl RetainedStore {
                 .is_some_and(|message| message.expires_at_ms == Some(expiry.expires_at_ms))
             {
                 self.remove(&expiry.topic_name);
-                removed_any = true;
+                removed_topics.push(expiry.topic_name);
             }
         }
-        removed_any
+        removed_topics
     }
 
     #[cfg(test)]
     pub(in crate::broker) fn matching(&mut self, filter: &str, now_ms: u64) -> RetainedMatches {
-        self.expire(now_ms);
+        let _ = self.expire(now_ms);
         let filter = protocol::shared_subscription_filter(filter).unwrap_or(filter);
         if !protocol::is_valid_topic_filter(filter) {
             return RetainedMatches::Empty;
@@ -259,9 +259,12 @@ impl RetainedStore {
         &mut self,
         filter: &str,
         now_ms: u64,
-    ) -> RetainedMatches {
-        self.expire(now_ms);
-        self.matching_valid_filter_after_expire(filter)
+    ) -> (RetainedMatches, Vec<String>) {
+        let removed_topics = self.expire(now_ms);
+        (
+            self.matching_valid_filter_after_expire(filter),
+            removed_topics,
+        )
     }
 
     fn matching_valid_filter_after_expire(&self, filter: &str) -> RetainedMatches {
@@ -389,7 +392,7 @@ pub(in crate::broker) fn retain_publish(
     let expires_at_ms = message_expires_at_ms(packet, now_ms);
     if packet.payload.is_empty() || is_message_expired(expires_at_ms, now_ms) {
         if state.retained.remove(&packet.topic_name).is_some() {
-            state.mark_retained_changed();
+            state.mark_retained_changed(packet.topic_name.clone());
         }
     } else if can_store_retained(&state.retained, packet, config) {
         state.retained.insert(
@@ -402,7 +405,7 @@ pub(in crate::broker) fn retain_publish(
                 expires_at_ms,
             ),
         );
-        state.mark_retained_changed();
+        state.mark_retained_changed(packet.topic_name.clone());
     }
 }
 
@@ -431,7 +434,10 @@ mod tests {
     use rs_netty::codec::{PublishPacket, QoS};
 
     use super::{RetainedMessage, RetainedStore, retain_publish};
-    use crate::broker::runtime::{config::BrokerConfig, session_registry::BrokerState};
+    use crate::broker::runtime::{
+        config::BrokerConfig,
+        session_registry::{BrokerState, PersistenceChange},
+    };
 
     fn message(topic_name: &str, payload: &'static [u8]) -> RetainedMessage {
         RetainedMessage::new(
@@ -496,7 +502,9 @@ mod tests {
         store.insert("devices/expiring".to_string(), retained);
 
         assert_eq!(store.matching("devices/#", 9).len(), 1);
-        assert!(store.matching("devices/#", 10).is_empty());
+        let (matches, removed_topics) = store.matching_valid_filter("devices/#", 10);
+        assert!(matches.is_empty());
+        assert_eq!(removed_topics, vec!["devices/expiring".to_string()]);
         assert_eq!(store.len(), 0);
         assert_eq!(store.payload_bytes(), 0);
     }
@@ -525,6 +533,12 @@ mod tests {
         );
 
         assert!(state.retained.get("devices/delete").is_none());
+        assert_eq!(
+            state.take_persistence_changes(),
+            vec![PersistenceChange::RetainedTopic(
+                "devices/delete".to_string()
+            )]
+        );
     }
 
     #[test]

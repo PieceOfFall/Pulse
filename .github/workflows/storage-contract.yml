@@ -1,0 +1,54 @@
+name: Storage contracts
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  rust-tests:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run test suite
+        run: cargo test --locked
+
+  mysql-storage-contract:
+    runs-on: ubuntu-22.04
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: pulse_test
+          MYSQL_USER: pulse
+          MYSQL_PASSWORD: pulse
+          MYSQL_ROOT_PASSWORD: pulse
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping --host=127.0.0.1 --user=root --password=pulse"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=12
+    env:
+      PULSE_TEST_MYSQL_URL: mysql://pulse:pulse@127.0.0.1:3306/pulse_test
+      PULSE_TEST_MYSQL_ADMIN_URL: mysql://root:pulse@127.0.0.1:3306
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run MySQL storage contracts
+        run: |
+          cargo test --locked mysql_patch_contract -- --ignored --nocapture
+          cargo test --locked mysql_qos1_ack_and_queue_handoff_survive_restart -- --ignored --nocapture
+          cargo test --locked mysql_qos2_pubrec_and_pubcomp_survive_restart -- --ignored --nocapture
+          cargo test --locked mysql_lifecycle_projection_contract -- --ignored --nocapture
+          cargo test --locked mysql_legacy_schema_migration_contract -- --ignored --nocapture

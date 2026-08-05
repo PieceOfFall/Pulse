@@ -45,15 +45,15 @@ impl Broker {
         self.with_state(|state| {
             state.expire_sessions(now_ms());
             let had_session = state.sessions_by_client_id.contains_key(&client_id);
+            let had_durable_session = state.is_client_durable(&client_id);
             if options.clean_start {
                 let removed_session = state.sessions_by_client_id.remove(&client_id).is_some();
                 let subscription_count = state.subscriptions.len();
                 state.subscriptions.retain(|sub| sub.client_id != client_id);
-                if removed_session {
-                    state.mark_sessions_changed();
-                }
-                if state.subscriptions.len() != subscription_count {
-                    state.mark_subscriptions_changed();
+                if had_durable_session
+                    && (removed_session || state.subscriptions.len() != subscription_count)
+                {
+                    state.mark_client_reset(client_id.clone());
                 }
             }
 
@@ -71,8 +71,7 @@ impl Broker {
                 None
             };
 
-            let persistent_session =
-                options.session_expiry_interval != 0 || (!options.clean_start && had_session);
+            let persistent_session = options.session_expiry_interval != 0;
             let subscription_count = state
                 .subscriptions
                 .iter()
@@ -99,12 +98,11 @@ impl Broker {
             );
             let keep_alive_deadline_ms = client.keep_alive_deadline_ms.clone();
             state.clients_by_connection.insert(connection_id, client);
-            let redeliveries = redeliveries_for_client(state, &client_id);
-            if persistent_session {
-                state.mark_sessions_changed();
-                state.mark_offline_changed(client_id.clone());
-                state.mark_outbound_changed(client_id.clone());
+            if had_durable_session && !persistent_session {
+                state.mark_client_reset(client_id.clone());
             }
+            let redeliveries = redeliveries_for_client(state, &client_id);
+            state.mark_client_changed_if_durable(client_id.clone());
 
             ConnectOutcome {
                 client_id,
@@ -120,7 +118,21 @@ impl Broker {
         &self,
         connection_id: u64,
     ) -> Option<RemoveConnectionOutcome> {
+        self.remove_connection_with_session_expiry(connection_id, None)
+    }
+
+    pub(in crate::broker) fn remove_connection_with_session_expiry(
+        &self,
+        connection_id: u64,
+        session_expiry_interval: Option<u32>,
+    ) -> Option<RemoveConnectionOutcome> {
         let outcome = self.with_state(|state| {
+            if let Some(session_expiry_interval) = session_expiry_interval {
+                state
+                    .clients_by_connection
+                    .get_mut(&connection_id)?
+                    .session_expiry_interval = session_expiry_interval;
+            }
             let client = state.remove_connection_state(connection_id, false)?;
             state.connection_by_client_id.remove(&client.client_id);
             Some(RemoveConnectionOutcome {
